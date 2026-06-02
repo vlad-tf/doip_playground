@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DoIP EdgeNode — Network Diagram</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 24px;
+      gap: 40px;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      color: #94a3b8;
+      text-transform: uppercase;
+    }
+
+    /* ── Main topology row ── */
+    .topology {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      width: 100%;
+      max-width: 1000px;
+    }
+
+    /* ── Node boxes ── */
+    .node {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .node-box {
+      border-radius: 14px;
+      padding: 20px 26px;
+      min-width: 190px;
+      text-align: center;
+      border: 2px solid;
+      position: relative;
+    }
+
+    .node-label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .node-name {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 14px;
+    }
+
+    .iface {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      text-align: left;
+      margin-bottom: 6px;
+    }
+
+    .iface-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      flex-shrink: 0;
+      margin-top: 1px;
+      letter-spacing: 0.06em;
+    }
+
+    .iface-info { font-size: 12px; line-height: 1.5; }
+    .iface-ip   { font-family: 'Courier New', monospace; font-size: 12px; color: #94a3b8; }
+
+    /* Tester */
+    .tester .node-box {
+      background: #1e293b;
+      border-color: #3b82f6;
+    }
+    .tester .node-label { color: #60a5fa; }
+    .tester .node-name  { color: #93c5fd; }
+    .tester .iface-badge { background: #1d4ed8; color: #bfdbfe; }
+
+    /* EdgeNode */
+    .edgenode .node-box {
+      background: #1a1f2e;
+      border-color: #a855f7;
+      min-width: 240px;
+      padding: 22px 28px;
+    }
+    .edgenode .node-label { color: #c084fc; }
+    .edgenode .node-name  { color: #d8b4fe; }
+    .eth0-badge { background: #6d28d9; color: #e9d5ff; }
+    .eth1-badge { background: #7c3aed; color: #ede9fe; }
+
+    /* ECU */
+    .ecu .node-box {
+      background: #1a2e1a;
+      border-color: #22c55e;
+    }
+    .ecu .node-label { color: #4ade80; }
+    .ecu .node-name  { color: #86efac; }
+    .ecu .iface-badge { background: #15803d; color: #bbf7d0; }
+
+    /* ── Link connectors ── */
+    .link {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 0 8px;
+    }
+
+    .link-line {
+      width: 100%;
+      height: 3px;
+      border-radius: 2px;
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+
+    .link-line::before, .link-line::after {
+      content: '';
+      position: absolute;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      top: 50%;
+      transform: translateY(-50%);
+    }
+    .link-line::before { left: 0; }
+    .link-line::after  { right: 0; }
+
+    .link-ipv4 .link-line  { background: linear-gradient(90deg, #3b82f6, #a855f7); }
+    .link-ipv4 .link-line::before { background: #3b82f6; }
+    .link-ipv4 .link-line::after  { background: #a855f7; }
+
+    .link-ipv6 .link-line  { background: linear-gradient(90deg, #a855f7, #22c55e); }
+    .link-ipv6 .link-line::before { background: #a855f7; }
+    .link-ipv6 .link-line::after  { background: #22c55e; }
+
+    .link-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #64748b;
+    }
+
+    .link-ports {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+    }
+
+    .port-pill {
+      font-size: 10px;
+      font-family: 'Courier New', monospace;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .port-tcp  { background: #1e3a5f; color: #7dd3fc; border: 1px solid #2563eb44; }
+    .port-udp  { background: #2d1f3d; color: #c4b5fd; border: 1px solid #7c3aed44; }
+    .port-tls  { background: #2d1a1a; color: #fca5a5; border: 1px solid #dc262644; }
+
+    /* ── Port table ── */
+    .tables {
+      display: flex;
+      gap: 24px;
+      width: 100%;
+      max-width: 1000px;
+      flex-wrap: wrap;
+    }
+
+    .table-card {
+      flex: 1;
+      min-width: 280px;
+      background: #1e293b;
+      border-radius: 12px;
+      border: 1px solid #334155;
+      overflow: hidden;
+    }
+
+    .table-card h3 {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 12px 16px;
+      background: #0f172a;
+      color: #94a3b8;
+      border-bottom: 1px solid #334155;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    th {
+      text-align: left;
+      padding: 8px 16px;
+      color: #64748b;
+      font-weight: 600;
+      font-size: 11px;
+      background: #0f172a;
+      border-bottom: 1px solid #1e293b;
+    }
+
+    td {
+      padding: 8px 16px;
+      border-bottom: 1px solid #1e293b22;
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    td:first-child { font-family: 'Courier New', monospace; color: #94a3b8; }
+
+    .badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .badge-tcp  { background: #1e3a5f; color: #7dd3fc; }
+    .badge-udp  { background: #2d1f3d; color: #c4b5fd; }
+    .badge-tls  { background: #2d1a1a; color: #fca5a5; }
+
+    /* ── Config mapping ── */
+    .config-card {
+      width: 100%;
+      max-width: 1000px;
+      background: #0f172a;
+      border-radius: 12px;
+      border: 1px solid #334155;
+      padding: 20px 24px;
+    }
+
+    .config-card h3 {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #64748b;
+      margin-bottom: 16px;
+    }
+
+    .config-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 40px;
+    }
+
+    .config-row {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .config-key {
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      color: #c084fc;
+      flex-shrink: 0;
+    }
+
+    .config-val {
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      color: #34d399;
+    }
+
+    .config-comment {
+      font-size: 11px;
+      color: #475569;
+      margin-left: 4px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>DoIP EdgeNode — Network Topology</h1>
+
+  <!-- ── Main topology ── -->
+  <div class="topology">
+
+    <!-- Tester -->
+    <div class="node tester">
+      <div class="node-box">
+        <div class="node-label">Tester</div>
+        <div class="node-name">PC / Laptop</div>
+        <div class="iface">
+          <span class="iface-badge">NIC</span>
+          <div>
+            <div class="iface-info">Ethernet</div>
+            <div class="iface-ip">192.168.1.100</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Link: Tester ↔ EdgeNode -->
+    <div class="link link-ipv4">
+      <div class="link-line"></div>
+      <div class="link-label">IPv4 · eth0</div>
+      <div class="link-ports">
+        <span class="port-pill port-tcp">TCP 13400 plain</span>
+        <span class="port-pill port-tls">TCP 3496 TLS 1.3</span>
+        <span class="port-pill port-udp">UDP 13400 announce</span>
+      </div>
+    </div>
+
+    <!-- EdgeNode -->
+    <div class="node edgenode">
+      <div class="node-box">
+        <div class="node-label">EdgeNode</div>
+        <div class="node-name">Raspberry Pi 4</div>
+        <div class="iface">
+          <span class="iface-badge eth0-badge">eth0</span>
+          <div>
+            <div class="iface-info">Tester-facing</div>
+            <div class="iface-ip">192.168.1.1</div>
+          </div>
+        </div>
+        <div class="iface">
+          <span class="iface-badge eth1-badge">eth1</span>
+          <div>
+            <div class="iface-info">ECU-facing (IVN)</div>
+            <div class="iface-ip">fe80::1234:5678<br>:9abc:def0</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Link: EdgeNode ↔ ECU -->
+    <div class="link link-ipv6">
+      <div class="link-line"></div>
+      <div class="link-label">IPv6 link-local · eth1</div>
+      <div class="link-ports">
+        <span class="port-pill port-tcp">TCP 13400 plain</span>
+        <span class="port-pill port-tls">TCP 3496 TLS 1.3</span>
+      </div>
+    </div>
+
+    <!-- ECU -->
+    <div class="node ecu">
+      <div class="node-box">
+        <div class="node-label">ECU</div>
+        <div class="node-name">Gateway ECU</div>
+        <div class="iface">
+          <span class="iface-badge">IVN</span>
+          <div>
+            <div class="iface-info">In-Vehicle Network</div>
+            <div class="iface-ip">fe80::aabb:ccdd<br>:eeff:0011%eth1</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Port tables ── -->
+  <div class="tables">
+
+    <div class="table-card">
+      <h3>Tester → EdgeNode (IPv4)</h3>
+      <table>
+        <tr><th>Port</th><th>Proto</th><th>Purpose</th></tr>
+        <tr><td>13400</td><td><span class="badge badge-tcp">TCP</span></td><td>DoIP plain-text</td></tr>
+        <tr><td>3496</td> <td><span class="badge badge-tls">TLS</span></td><td>DoIP over TLS 1.3</td></tr>
+        <tr><td>13400</td><td><span class="badge badge-udp">UDP</span></td><td>Vehicle Announcement / ID</td></tr>
+      </table>
+    </div>
+
+    <div class="table-card">
+      <h3>EdgeNode → ECU (IPv6 link-local)</h3>
+      <table>
+        <tr><th>Port</th><th>Proto</th><th>Purpose</th></tr>
+        <tr><td>13400</td><td><span class="badge badge-tcp">TCP</span></td><td>DoIP plain-text</td></tr>
+        <tr><td>3496</td> <td><span class="badge badge-tls">TLS</span></td><td>DoIP over TLS 1.3</td></tr>
+      </table>
+    </div>
+
+    <div class="table-card">
+      <h3>DoIP Logical Addresses</h3>
+      <table>
+        <tr><th>Address</th><th>Role</th></tr>
+        <tr><td>0x0E00</td><td>Tester logical address</td></tr>
+        <tr><td>0x0001</td><td>ECU logical address</td></tr>
+      </table>
+    </div>
+
+  </div>
+
+  <!-- ── Config mapping ── -->
+  <div class="config-card">
+    <h3>config.yaml mapping</h3>
+    <div class="config-grid">
+      <div class="config-row">
+        <span class="config-key">network.tester_interface</span>
+        <span class="config-val">"eth0"</span>
+        <span class="config-comment">← Pi interface toward tester</span>
+      </div>
+      <div class="config-row">
+        <span class="config-key">network.ecu_interface</span>
+        <span class="config-val">"eth1"</span>
+        <span class="config-comment">← Pi interface toward ECU</span>
+      </div>
+      <div class="config-row">
+        <span class="config-key">network.tester_ipv4</span>
+        <span class="config-val">"192.168.1.1"</span>
+        <span class="config-comment">← Pi's own IP on eth0 (bind address)</span>
+      </div>
+      <div class="config-row">
+        <span class="config-key">routing_table.ecu_ipv6</span>
+        <span class="config-val">"fe80::aabb:ccdd:eeff:0011"</span>
+        <span class="config-comment">← ECU link-local address</span>
+      </div>
+      <div class="config-row">
+        <span class="config-key">ports.doip_plain</span>
+        <span class="config-val">13400</span>
+        <span class="config-comment">← plain TCP, both sides</span>
+      </div>
+      <div class="config-row">
+        <span class="config-key">ports.doip_tls</span>
+        <span class="config-val">3496</span>
+        <span class="config-comment">← TLS TCP, both sides</span>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
