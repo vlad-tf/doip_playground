@@ -1,0 +1,91 @@
+network:
+  tester_interface: "eth0"
+  tester_ipv4: "192.168.1.1"
+  ecu_interface: "eth1"
+
+ports:
+  doip_plain: 13400
+  doip_tls: 3496
+
+tls:
+  server_cert: "certs/edgenode-server.crt"
+  server_key:  "certs/edgenode-server.key"
+  client_cert: "certs/edgenode-client.crt"
+  client_key:  "certs/edgenode-client.key"
+  ca_cert:     "certs/ca.crt"
+  mutual_tls:  true
+  # TLS 1.3 only — no fallback to 1.2
+  tls_version: "TLSv1.3"
+  # Cipher preference order (TLS 1.3 suites)
+  cipher_suites:
+    - "TLS_AES_128_GCM_SHA256"
+    - "TLS_AES_256_GCM_SHA384"
+    - "TLS_CHACHA20_POLY1305_SHA256"
+
+doip:
+  vin:       "1HGBH41JXMN109186"   # 17-char VIN
+  eid:       "AABBCCDDEEFF"        # 6-byte entity ID (12 hex chars)
+  gid:       "000000000000"        # 6-byte group ID (12 hex chars)
+  node_type:         0x01          # DoIP node type: 0x01 = gateway
+  node_logical_addr: 0x0000       # EdgeNode's own logical address (used in UDP announcements)
+  power_mode: 0x01                 # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
+  max_payload_bytes: 4096          # reject DoIP payloads larger than this
+
+timers:
+  t_tcp_initial_inactivity_s: 2
+  t_tcp_general_inactivity_s: 300
+  alive_check_interval_ms: 500
+
+udp:
+  announce_count:    3
+  announce_interval_ms: 500
+
+routing_table:
+  - tester_logical_addr: 0x0E00
+    ecu_logical_addr:    0x0001
+    ecu_ipv6:            "fe80::1"
+    ecu_interface:       "eth1"
+    ecu_port_plain:      13400
+    ecu_port_tls:        3496
+    ecu_sni:             ""        # leave empty to omit SNI
+
+middleware:
+  - type: LoggerMiddleware
+    log_path: "logs/doip.log"
+    hex_dump: true
+
+  - type: DropMiddleware
+    enabled: false
+    drop_rate: 0.0
+    match:
+      direction: "tester_to_ecu"
+
+  - type: DelayMiddleware
+    enabled: false
+    delay_ms: 0
+    jitter_ms: 0
+
+  - type: CorruptMiddleware
+    enabled: false
+    byte_offset: null
+    flip_mask: 0x01
+
+  - type: ReplayMiddleware
+    enabled: false
+    record: false
+    replay_count: 1
+
+  - type: AddressMiddleware
+    enabled: false
+    src_override: null
+    tgt_override: null
+
+  - type: HeaderFaultMiddleware
+    enabled: false
+    fault: "wrong_version"
+    direction: "tester_to_ecu"
+    inject_on_nth: 1
+
+  - type: TLSFaultMiddleware
+    enabled: false
+    fault: "wrong_cipher"   # parsed and stored, not yet acted on
