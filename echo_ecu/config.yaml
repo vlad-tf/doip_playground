@@ -1,0 +1,19 @@
+listen:
+  host:      "::"       # bind to all IPv6 interfaces; set to "fe80::..." for link-local only
+  port:      13400      # plain DoIP port (match EdgeNode ecu_port_plain in routing table)
+  interface: "eth0"     # interface connected to the RPi eth1 network
+                        # used for: multicast group join, outgoing announcement interface,
+                        # and IPv6 scope_id when binding to a link-local address
+
+doip:
+  ecu_logical_addr:  0x0001   # must match ecu_logical_addr in EdgeNode routing table
+  node_type:         0x01     # 0x01 = gateway
+  power_mode:        0x01     # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
+  max_payload_bytes: 4096
+  vin:  "1HGBH41JXMN109186"   # 17-char VIN included in Vehicle Announcement
+  eid:  "AABBCCDDEEFF"        # 6-byte Entity ID (12 hex chars)
+  gid:  "000000000000"        # 6-byte Group ID  (12 hex chars)
+
+udp:
+  announce_count:       3     # number of Vehicle Announcements sent on startup
+  announce_interval_ms: 500   # interval between announcements (ms)
