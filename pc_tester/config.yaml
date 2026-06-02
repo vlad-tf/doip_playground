@@ -1,0 +1,8 @@
+target:
+  host:      "10.250.250.11"  # EdgeNode tester-facing IPv4 address (eth0)
+  port:      13400            # plain DoIP port (use 3496 for TLS — not yet supported)
+  timeout_s: 5.0              # seconds to wait for each response
+
+doip:
+  tester_logical_addr: 0x0E00   # logical address this tester presents to the EdgeNode
+  ecu_logical_addr:    0x0001   # logical address of the target ECU
