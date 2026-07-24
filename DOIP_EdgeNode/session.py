@@ -345,8 +345,7 @@ class DoIPSession:
                         "evicting it and accepting new connection %s",
                         existing.peer, self._peer,
                     )
-                    await existing._cleanup()
-                    self._registry.unregister(src_addr)
+                    existing.evict()  # synchronous — no CancelledError propagation
 
         # ---------------------------------------------------------------------
         self.tester_logical_addr = src_addr
@@ -429,6 +428,43 @@ class DoIPSession:
             self._alive_probe_pending = False
             self._alive_probe_event = None
 
+    def evict(self) -> None:
+        """
+        Non-blocking eviction of this session by a competing session.
+
+        WHY non-blocking (not async):
+          Calling `await existing._cleanup()` from within the new session's
+          _handle_routing_activation() causes a CancelledError propagation bug:
+          if the old session's inactivity task is mid-cleanup, cancelling it
+          injects CancelledError into `await self.writer.wait_closed()` inside
+          _cleanup().  Because CancelledError is a BaseException, it is NOT
+          caught by `except Exception: pass`, and propagates up through
+          `await existing._cleanup()` into the new session's context, causing
+          the new session's run() to exit.
+
+        Fix:
+          evict() is synchronous.  It cancels timers and closes the writer
+          (which causes the old session's reader to raise IncompleteReadError
+          on its next read).  The old session's run() finally block then
+          calls _cleanup() in its own context — no cross-session awaiting.
+        """
+        if self._initial_timer_task and not self._initial_timer_task.done():
+            self._initial_timer_task.cancel()
+        if self._inactivity_task and not self._inactivity_task.done():
+            self._inactivity_task.cancel()
+        try:
+            self.writer.close()
+        except Exception:
+            pass
+        # Unregister immediately so the registry is clean before the new
+        # session registers itself.
+        if self._registry is not None and self.tester_logical_addr is not None:
+            self._registry.unregister(self.tester_logical_addr)
+        logger.info(
+            "DoIPSession: evicted session for %s (SA=0x%04X)",
+            self._peer, self.tester_logical_addr or 0,
+        )
+
     async def _handle_entity_status(self) -> None:
         """
         Respond to Entity Status Request (0x4001).
@@ -453,14 +489,103 @@ class DoIPSession:
         await self._send_raw(self._build_frame(PT_POWER_MODE_RESPONSE, payload))
         logger.debug("DoIPSession: sent Power Mode Response to %s", self._peer)
 
+    def _build_uds_response(self, uds: bytes) -> bytes:
+        """
+        Build a UDS response payload for a self-addressed Diagnostic Message.
+
+        Handled requests:
+          0x22 F1 90  ReadDataByIdentifier — VIN
+                      → 0x62 F1 90 + 17-byte VIN from config
+
+        All other requests:
+          → positive response SID (SID | 0x40) + echo sub-bytes + 4 random bytes
+        """
+        import os
+
+        if len(uds) >= 3 and uds[0] == 0x22 and uds[1] == 0xF1 and uds[2] == 0x90:
+            # ReadDataByIdentifier — VIN (ISO 14229-1 §B.4)
+            vin_bytes = self.config.doip.vin.encode("ascii")[:17].ljust(17, b"\x00")
+            return b"\x62\xF1\x90" + vin_bytes
+
+        # Generic: echo with reply bit + random trailer
+        if uds:
+            return bytes([uds[0] | 0x40]) + uds[1:] + os.urandom(4)
+        return os.urandom(4)
+
+    async def _handle_self_diagnostic(self, pkt) -> None:
+        """
+        Handle a Diagnostic Message addressed to the EdgeNode itself
+        (target_address == config.doip.node_logical_addr).
+
+        The EdgeNode responds as if it were a simple ECU:
+          1. Positive ACK (0x8002)
+          2. Diagnostic Message (0x8001) with src/tgt swapped and a
+             UDS response built by _build_uds_response().
+
+        Supported UDS services:
+          22 F1 90  ReadDataByIdentifier — VIN  → 62 F1 90 + <VIN>
+          any other → SID|0x40 + echo + 4 random bytes
+
+        This is useful for verifying DoIP connectivity to the EdgeNode itself
+        without needing a downstream ECU.
+        """
+        # Read addresses directly from raw bytes — Scapy ConditionalFields
+        # for source_address / target_address are unreliable via getattr.
+        # DoIP frame layout: 8-byte header | 2-byte SA | 2-byte TA | UDS
+        raw_bytes = bytes(pkt)
+        src = int.from_bytes(raw_bytes[8:10], "big")  if len(raw_bytes) >= 10 else (self.tester_logical_addr or 0x0E00)
+        tgt = int.from_bytes(raw_bytes[10:12], "big") if len(raw_bytes) >= 12 else self.config.doip.node_logical_addr
+        uds = raw_bytes[12:] if len(raw_bytes) > 12 else b""
+
+        logger.info(
+            "DoIPSession: self-diagnostic from 0x%04X → 0x%04X  UDS: %s",
+            src, tgt,
+            uds.hex(" ").upper() if uds else "(empty)",
+        )
+
+        # 1. Positive ACK
+        ack_payload = (
+            tgt.to_bytes(2, "big")   # src of response = EdgeNode addr
+            + src.to_bytes(2, "big") # tgt of response = tester addr
+            + b"\x00"                # ack_code 0x00 = OK
+        )
+        await self._send_raw(self._build_frame(PT_DIAGNOSTIC_POSITIVE_ACK, ack_payload))
+
+        # 2. UDS response
+        response_uds = self._build_uds_response(uds)
+        diag_payload = (
+            tgt.to_bytes(2, "big")   # src = EdgeNode
+            + src.to_bytes(2, "big") # tgt = tester
+            + response_uds
+        )
+        await self._send_raw(self._build_frame(PT_DIAGNOSTIC_MESSAGE, diag_payload))
+        logger.debug(
+            "DoIPSession: sent self-diagnostic response  UDS: %s",
+            response_uds.hex(" ").upper(),
+        )
+
     async def _handle_diagnostic(self, pkt) -> None:
         """
         Process a Diagnostic Message:
+        0. If target_address == node_logical_addr: respond locally (self-echo)
         1. Run through middleware chain (tester_to_ecu direction)
         2. If not dropped: ensure ECU connection, forward
         3. Read ECU response, run through middleware chain (ecu_to_tester)
         4. Relay response back to tester
         """
+        # --- Self-addressed diagnostic: EdgeNode responds directly -----------
+        # Read target_address directly from raw bytes (bytes 10-11 of the DoIP
+        # frame) rather than via Scapy's getattr().  Scapy's ConditionalField
+        # for target_address can return None even on valid Diagnostic Messages,
+        # causing the self-check to silently fail and the message to be routed.
+        raw_bytes = bytes(pkt)
+        if len(raw_bytes) >= 12:
+            tgt = int.from_bytes(raw_bytes[10:12], "big")
+            if tgt == self.config.doip.node_logical_addr:
+                await self._handle_self_diagnostic(pkt)
+                return
+        # ---------------------------------------------------------------------
+
         try:
             processed = await self.middleware_chain.run(pkt, "tester_to_ecu", self)
         except DoIPFaultInjectionError as exc:
@@ -488,21 +613,39 @@ class DoIPSession:
             await self._send_diag_nack(0x03)
             return
 
-        # Receive ECU response
+        # Receive ECU response(s).
+        # ECUs typically send two frames per diagnostic request:
+        #   1. Diagnostic Positive ACK (0x8002) — forward immediately
+        #   2. Diagnostic Message (0x8001)       — the actual UDS response
+        # Read the first frame; if it is a Positive ACK, read one more.
         try:
             ecu_raw = await self._ecu_conn.recv()
         except Exception as exc:
             logger.error("DoIPSession: ECU recv error: %s", exc)
             return
 
-        ecu_pkt = self._dissect(ecu_raw)
+        await self._relay_ecu_frame(ecu_raw)
 
-        # Run response through middleware (ecu_to_tester)
+        # Check if this was an ACK — if so, wait for the follow-up response.
+        if (len(ecu_raw) >= 4
+                and int.from_bytes(ecu_raw[2:4], "big") == PT_DIAGNOSTIC_POSITIVE_ACK):
+            try:
+                ecu_raw2 = await asyncio.wait_for(
+                    self._ecu_conn.recv(), timeout=2.0
+                )
+                await self._relay_ecu_frame(ecu_raw2)
+            except asyncio.TimeoutError:
+                logger.warning("DoIPSession: timeout waiting for diagnostic response after ACK")
+            except Exception as exc:
+                logger.error("DoIPSession: ECU recv error (follow-up): %s", exc)
+
+    async def _relay_ecu_frame(self, ecu_raw: bytes) -> None:
+        """Run one ECU frame through the ecu_to_tester middleware and send to tester."""
+        ecu_pkt = self._dissect(ecu_raw)
         try:
             resp = await self.middleware_chain.run(ecu_pkt, "ecu_to_tester", self)
         except DoIPFaultInjectionError:
-            resp = ecu_pkt  # fault injection on ecu→tester path: send anyway
-
+            resp = ecu_pkt
         if resp is not None:
             await self._send_raw(bytes(resp))
 
@@ -595,14 +738,14 @@ class DoIPSession:
 
         Payload (ISO 13400-2, 13 bytes):
           bytes 0-1: tester logical address
-          bytes 2-3: EdgeNode logical address (0x0000 for gateway PoC)
+          bytes 2-3: EdgeNode logical address (from config.doip.node_logical_addr)
           byte  4:   response code
           bytes 5-8: reserved (0x00000000)
           bytes 9-12: OEM-specific (0x00000000)
         """
         payload = (
             tester_addr.to_bytes(2, "big")
-            + b"\x00\x00"         # EdgeNode logical address
+            + self.config.doip.node_logical_addr.to_bytes(2, "big")
             + bytes([response_code])
             + b"\x00\x00\x00\x00"  # reserved
             + b"\x00\x00\x00\x00"  # OEM-specific

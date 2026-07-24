@@ -1,0 +1,20 @@
+# DoIP Echo ECU — Docker configuration
+# Mounted at /app/config.yaml in the doip-echonode container.
+# Only attached to the IPv6 backend network, so its single interface is eth0.
+listen:
+  host:      "::"       # bind all IPv6 interfaces (V6ONLY)
+  port:      13400
+  interface: "eth0"     # backend interface toward the EdgeNode
+
+doip:
+  ecu_logical_addr:  0x0001
+  node_type:         0x01
+  power_mode:        0x01
+  max_payload_bytes: 4096
+  vin:  "1HGBH41JXMN109186"
+  eid:  "AABBCCDDEEFF"
+  gid:  "000000000000"
+
+udp:
+  announce_count:       3
+  announce_interval_ms: 500

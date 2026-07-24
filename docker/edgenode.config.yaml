@@ -1,0 +1,94 @@
+# DoIP EdgeNode — Docker configuration
+# Mounted at /app/config.yaml in the doip-edgenode container.
+#
+# eth0 = frontend network (IPv4) toward PC-Tester / external test containers
+# eth1 = backend  network (IPv6) toward the Echo ECU
+network:
+  tester_interface: "eth0"
+  tester_ipv4: "172.30.100.10"   # static IPv4 on doip_frontend (must match compose)
+  ecu_interface: "eth1"          # backend interface toward the Echo ECU
+
+ports:
+  doip_plain: 13400
+  doip_tls: 3496
+
+tls:
+  server_cert: "certs/edgenode-server.crt"
+  server_key:  "certs/edgenode-server.key"
+  client_cert: "certs/edgenode-client.crt"
+  client_key:  "certs/edgenode-client.key"
+  ca_cert:     "certs/ca.crt"
+  mutual_tls:  true
+  tls_version: "TLSv1.3"
+  cipher_suites:
+    - "TLS_AES_128_GCM_SHA256"
+    - "TLS_AES_256_GCM_SHA384"
+    - "TLS_CHACHA20_POLY1305_SHA256"
+
+doip:
+  vin:       "1HGBH41JXMN109186"
+  eid:       "AABBCCDDEEFF"
+  gid:       "000000000000"
+  node_type:         0x01
+  node_logical_addr: 0x0000
+  power_mode: 0x01
+  max_payload_bytes: 4096
+
+timers:
+  t_tcp_initial_inactivity_s: 2
+  t_tcp_general_inactivity_s: 300
+  alive_check_interval_ms: 500
+
+udp:
+  announce_count:    3
+  announce_interval_ms: 500
+
+routing_table:
+  - tester_logical_addr: 0x0E00
+    ecu_logical_addr:    0x0001
+    ecu_ipv6:            "fd2e:646f:6970::2"   # Echo ECU static IPv6 on doip_backend
+    ecu_interface:       "eth1"
+    ecu_port_plain:      13400
+    ecu_port_tls:        3496
+    ecu_sni:             ""
+
+middleware:
+  - type: LoggerMiddleware
+    log_path: "/app/logs/doip.log"
+    hex_dump: true
+
+  - type: DropMiddleware
+    enabled: false
+    drop_rate: 0.0
+    match:
+      direction: "tester_to_ecu"
+
+  - type: DelayMiddleware
+    enabled: false
+    delay_ms: 0
+    jitter_ms: 0
+
+  - type: CorruptMiddleware
+    enabled: false
+    byte_offset: null
+    flip_mask: 0x01
+
+  - type: ReplayMiddleware
+    enabled: false
+    record: false
+    replay_count: 1
+
+  - type: AddressMiddleware
+    enabled: false
+    src_override: null
+    tgt_override: null
+
+  - type: HeaderFaultMiddleware
+    enabled: false
+    fault: "wrong_version"
+    direction: "tester_to_ecu"
+    inject_on_nth: 1
+
+  - type: TLSFaultMiddleware
+    enabled: false
+    fault: "wrong_cipher"

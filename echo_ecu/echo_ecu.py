@@ -85,6 +85,11 @@ PTYPE_NAMES = {
 # IPv6 DoIP multicast group (all-nodes link-local) used for announcements
 _DOIP_MCAST_ADDR = "ff02::1"
 
+# Timeout for the Alive Check probe used during SA-conflict resolution.
+# Defined here (module scope) so it is available when ECUSession is defined —
+# it is referenced as a default argument in ECUSession.probe_alive().
+_ALIVE_PROBE_TIMEOUT_S = 0.5
+
 # ---------------------------------------------------------------------------
 # UDP announcement payload
 # ---------------------------------------------------------------------------
@@ -376,6 +381,21 @@ class ECUSession:
     # Handlers
     # -----------------------------------------------------------------------
 
+    def evict(self) -> None:
+        """
+        Non-blocking eviction — cancel timers, close writer, unregister.
+        The session's run() finally block handles the rest in its own context.
+        See DoIPSession.evict() in session.py for the full explanation of why
+        this must be synchronous (CancelledError propagation bug).
+        """
+        try:
+            self._writer.close()
+        except Exception:
+            pass
+        if self._registry is not None and self.tester_addr is not None:
+            self._registry.unregister(self.tester_addr)
+        logger.info("ECUSession: evicted session for %s", self._peer)
+
     async def probe_alive(self, timeout: float = _ALIVE_PROBE_TIMEOUT_S) -> bool:
         """
         Send an Alive Check Request to the connected EdgeNode and wait for
@@ -462,11 +482,7 @@ class ECUSession:
                         "Existing session %s did not respond — evicting it",
                         existing._peer,
                     )
-                    try:
-                        existing._writer.close()
-                    except Exception:
-                        pass
-                    self._registry.unregister(src_addr)
+                    existing.evict()  # synchronous — no CancelledError propagation
         # ---------------------------------------------------------------------
 
         self.tester_addr = src_addr
@@ -484,6 +500,30 @@ class ECUSession:
         await self._send(_build(PT_ROUTING_ACT_RESPONSE, resp_payload))
         logger.debug("Sent Routing Activation Response (success) to %s", self._peer)
 
+    def _build_uds_response(self, uds: bytes) -> bytes:
+        """
+        Build a UDS response payload.
+
+        Handled requests:
+          0x22 F1 90  ReadDataByIdentifier — VIN
+                      → 0x62 F1 90 + 17-byte VIN from config
+
+        All other requests:
+          → positive response SID (SID | 0x40) + echo sub-bytes + 4 random bytes
+        """
+        import os
+
+        if len(uds) >= 3 and uds[0] == 0x22 and uds[1] == 0xF1 and uds[2] == 0x90:
+            # ReadDataByIdentifier — VIN (ISO 14229-1 §B.4)
+            vin_str = str(self._config.get("doip", {}).get("vin", "00000000000000000"))
+            vin_bytes = vin_str.encode("ascii")[:17].ljust(17, b"\x00")
+            return b"\x62\xF1\x90" + vin_bytes
+
+        # Generic: echo with reply bit + random trailer
+        if uds:
+            return bytes([uds[0] | 0x40]) + uds[1:] + os.urandom(4)
+        return os.urandom(4)
+
     async def _handle_diagnostic(self, payload: bytes) -> None:
         """
         Diagnostic Message (0x8001).
@@ -491,8 +531,10 @@ class ECUSession:
 
         Responds with:
           1. Positive ACK (0x8002)  — acknowledges receipt
-          2. Echo Diagnostic Message (0x8001)  — UDS payload echoed back,
-             src/tgt swapped to simulate an ECU response.
+          2. Diagnostic Message (0x8001) with src/tgt swapped and a
+             UDS response from _build_uds_response():
+               22 F1 90  → 62 F1 90 + VIN (17 bytes from config)
+               any other → SID|0x40 + echo sub-bytes + 4 random bytes
         """
         if not self.activated:
             logger.warning("Diagnostic Message before activation — ignoring")
@@ -516,22 +558,13 @@ class ECUSession:
         await self._send(_build(PT_DIAGNOSTIC_POSITIVE_ACK, ack_payload))
         logger.debug("Sent Positive ACK to %s", self._peer)
 
-        # 2. Echo response: swap src/tgt, echo UDS bytes back with reply flag.
-        # UDS positive responses have bit 6 set in the service ID byte
-        # (response SID = request SID | 0x40, e.g. 0x10 → 0x50).
-        # Without this, Wireshark and UDS tools interpret the echo as a second
-        # request rather than a response.
-        if uds:
-            response_uds = bytes([uds[0] | 0x40]) + uds[1:]
-        else:
-            response_uds = uds
+        # 2. UDS response: swap src/tgt, build proper response via _build_uds_response
+        response_uds = self._build_uds_response(uds)
         echo_payload = struct.pack("!HH", tgt, src) + response_uds
         await self._send(_build(PT_DIAGNOSTIC_MESSAGE, echo_payload))
         logger.debug(
-            "Sent echo Diagnostic Message (UDS SID 0x%02X → 0x%02X) to %s",
-            uds[0] if uds else 0,
-            (uds[0] | 0x40) if uds else 0,
-            self._peer,
+            "Sent Diagnostic response  UDS: %s  to %s",
+            _fmt_hex(response_uds), self._peer,
         )
 
     async def _handle_alive_check(self) -> None:
@@ -590,9 +623,6 @@ class ECUSessionRegistry:
 
     def lookup(self, logical_addr: int) -> "ECUSession | None":
         return self._sessions.get(logical_addr)
-
-
-_ALIVE_PROBE_TIMEOUT_S = 0.5
 
 
 class EchoECUServer:

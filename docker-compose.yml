@@ -1,0 +1,102 @@
+# DoIP test stack: PC-Tester <-> EdgeNode <-> EchoNode
+#
+#   PC-Tester  --(IPv4, doip_frontend)-->  EdgeNode  --(IPv6, doip_backend)-->  EchoNode
+#
+# Networks use dedicated, non-overlapping ranges so they don't clash with the
+# real bench networks (10.250.250.0/24, 192.168.1.0/24) or the default Docker
+# bridge (172.17.0.0/16):
+#
+#   doip_frontend : 172.30.100.0/24   (IPv4)   tester side
+#   doip_backend  : fd2e:646f:6970::/64 (IPv6 ULA) + 172.30.101.0/24 (aux)  ECU side
+#
+# Both networks are created with fixed names so a SEPARATE compose project
+# (e.g. your DoIP Tests) can attach to them as `external`. See docker/README.md.
+
+services:
+  doip-echonode:
+    build:
+      context: ./echo_ecu
+      dockerfile: ../docker/echonode.Dockerfile
+      args:
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    image: doip-echonode:latest
+    container_name: doip-echonode
+    hostname: doip-echonode
+    networks:
+      doip_backend:
+        ipv6_address: fd2e:646f:6970::2
+    volumes:
+      - ./docker/echonode.config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+
+  doip-edgenode:
+    build:
+      context: ./doip_edgenode
+      dockerfile: ../docker/edgenode.Dockerfile
+      args:
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    image: doip-edgenode:latest
+    container_name: doip-edgenode
+    hostname: doip-edgenode
+    networks:
+      doip_frontend:
+        ipv4_address: 172.30.100.10
+        priority: 1000          # -> becomes eth0 (tester-facing)
+      doip_backend:
+        ipv6_address: fd2e:646f:6970::10
+        priority: 900           # -> becomes eth1 (ECU-facing)
+    volumes:
+      - ./docker/edgenode.config.yaml:/app/config.yaml:ro
+      - ./docker/edgenode-entrypoint.sh:/usr/local/bin/edgenode-entrypoint.sh:ro
+      - ./docker/logs:/app/logs
+    # Auto-detect the real backend (IPv6) interface at startup, since Docker
+    # names interfaces by network name alphabetically, not by `priority`.
+    entrypoint: ["sh", "/usr/local/bin/edgenode-entrypoint.sh"]
+    depends_on:
+      - doip-echonode
+    restart: unless-stopped
+
+  doip-pc-tester:
+    build:
+      context: ./pc_tester
+      dockerfile: ../docker/pctester.Dockerfile
+      args:
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    image: doip-pc-tester:latest
+    container_name: doip-pc-tester
+    networks:
+      doip_frontend:
+        ipv4_address: 172.30.100.20
+    volumes:
+      - ./docker/pctester.config.yaml:/app/config.yaml:ro
+    depends_on:
+      - doip-edgenode
+    stdin_open: true            # keep STDIN open for the interactive REPL
+    tty: true
+    restart: on-failure         # retry connect until the EdgeNode is ready
+
+networks:
+  doip_frontend:
+    name: doip_frontend         # fixed name -> attachable from other projects
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.100.0/24
+          gateway: 172.30.100.1
+
+  doip_backend:
+    name: doip_backend          # fixed name -> attachable from other projects
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd2e:646f:6970::/64
+          gateway: fd2e:646f:6970::1
+        - subnet: 172.30.101.0/24
+          gateway: 172.30.101.1

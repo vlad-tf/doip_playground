@@ -1,0 +1,10 @@
+# DoIP PC Tester — Docker configuration
+# Mounted at /app/config.yaml in the doip-pc-tester container.
+target:
+  host:      "172.30.100.10"  # EdgeNode tester-facing IPv4 (doip_frontend)
+  port:      13400            # plain DoIP
+  timeout_s: 5.0
+
+doip:
+  tester_logical_addr: 0x0E00
+  ecu_logical_addr:    0x0001
