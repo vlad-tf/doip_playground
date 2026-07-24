@@ -12,7 +12,10 @@ venv/
 .DS_Store
 
 # Runtime artifacts (keep the empty dirs via .gitkeep)
-DOIP_EdgeNode/logs/*
-DOIP_EdgeNode/certs/*
-!DOIP_EdgeNode/logs/.gitkeep
-!DOIP_EdgeNode/certs/.gitkeep
+doip_edgenode/logs/*
+doip_edgenode/certs/*
+!doip_edgenode/logs/.gitkeep
+!doip_edgenode/certs/.gitkeep
+
+# Local-only diagram files
+diagram/
