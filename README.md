@@ -513,3 +513,10 @@ sudo pip3 install pyyaml --break-system-packages   # Raspberry Pi
 | No certificate revocation (CRL/OCSP) | Planned for post-PoC |
 | Config reload requires restart | No SIGHUP hot-reload |
 | TLS fault injection is a placeholder | `TLSFaultMiddleware` passes through unchanged |
+
+## License
+
+This project is licensed under the Apache License, Version 2.0.
+See the [LICENSE](./LICENSE) file for details.
+
+Copyright © 2026 Vladislav Vostrykh, Technica Engineering GmbH. All rights reserved under the terms of the license above.
