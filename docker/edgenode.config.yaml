@@ -43,10 +43,21 @@ udp:
   announce_count:    3
   announce_interval_ms: 500
 
+# Routing is resolved by TESTER logical address and the first match wins, so each
+# backend ECU needs its own tester address:
+#   activate with SA 0x0E00 -> Echo ECU     activate with SA 0x0E01 -> TestEcu
 routing_table:
   - tester_logical_addr: 0x0E00
     ecu_logical_addr:    0x0001
     ecu_ipv6:            "fd2e:646f:6970::2"   # Echo ECU static IPv6 on doip_backend
+    ecu_interface:       "eth1"
+    ecu_port_plain:      13400
+    ecu_port_tls:        3496
+    ecu_sni:             ""
+
+  - tester_logical_addr: 0x0E01
+    ecu_logical_addr:    0x0002
+    ecu_ipv6:            "fd2e:646f:6970::3"   # TestEcu static IPv6 on doip_backend
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
     ecu_port_tls:        3496

@@ -4,13 +4,22 @@
 
 A Raspberry Pi 4 sits between a PC-based tester and a real (or simulated) ECU and acts as a transparent DoIP proxy. You can inject faults, log every frame, delay or corrupt messages, and replay diagnostics — all without modifying the tester or the ECU.
 
-This repository contains three tools:
+This repository contains four tools:
 
 | Component | Location | Runs on |
 |---|---|---|
 | **EdgeNode** | `doip_edgenode/` | Raspberry Pi 4 |
-| **Echo ECU** | `echo_ecu/` | Linux machine (simulates the ECU) |
+| **Echo ECU** | `echo_ecu/` | Linux machine (simulates the ECU — fixed echo) |
+| **TestEcu** | `test_ecu/` | Linux machine (simulates the ECU — **pluggable UDS logic**) |
 | **PC Tester** | `pc_tester/` | Windows or Linux PC |
+
+**Echo ECU or TestEcu?** The Echo ECU answers every UDS request with a canned echo and
+one hardcoded VIN. TestEcu speaks real UDS — sessions, security access, negative
+response codes — and lets you supply the business logic as a YAML table of data
+identifiers, as Python plugins, or both. Use the Echo ECU when you only need something
+on the far end of the wire; use TestEcu when the tester under test actually cares what
+the ECU says. See [section 2b](#2b--testecu-setup-pluggable-ecu-simulator) and
+[`test_ecu/README.md`](test_ecu/README.md).
 
 ---
 
@@ -232,6 +241,107 @@ Press Ctrl+C to stop.
 
 ---
 
+## 2b — TestEcu setup (pluggable ECU simulator)
+
+TestEcu is a drop-in alternative to the Echo ECU that implements a real UDS server and
+lets other people plug their own business logic into it. Same DoIP layer, same config
+schema for `listen` / `doip` / `udp`; the difference is everything above the transport.
+
+### 2b.1 Install dependencies
+
+```bash
+cd test_ecu
+pip3 install pyyaml          # that is the entire dependency list
+```
+
+No UDS library is involved. `py-uds` lists server simulation as *planned* and has no
+DoIP transport; `udsoncan` is client-oriented. The UDS layer here is stdlib.
+
+### 2b.2 Edit the configuration
+
+`test_ecu/config.yaml` keeps the familiar sections and adds three more:
+
+```yaml
+doip:
+  ecu_logical_addr: 0x0002        # 0x0001 is the Echo ECU — give TestEcu its own
+
+uds:                              # session/security/timing behaviour and the
+  unknown_service: nrc            # policies for unhandled requests
+  # ...
+
+data_identifiers:                 # static DIDs — no Python needed
+  0xF190: {name: VIN, type: ascii, length: 17, value: "1HGBH41JXMN109186"}
+  0x0100: {name: CalibrationBlock, type: hex, length: 4, value: "DEADBEEF",
+           write: true, write_sessions: [0x03], write_security: 1}
+
+plugins:                          # your business logic
+  modules:
+    - file: "plugins/example_engine.py"
+      params: {idle_rpm: 800}
+```
+
+If you point the EdgeNode at TestEcu, its `routing_table` entry needs
+`ecu_logical_addr: 0x0002` and its own `tester_logical_addr` — the EdgeNode resolves
+routes by tester address and takes the first match, so two ECUs cannot share one.
+
+### 2b.3 Check the configuration
+
+```bash
+python3 -m testecu --config config.yaml --check
+```
+
+This loads the config and every plugin, prints the resolved hook table, and exits
+non-zero on any problem. Run it after editing a plugin — it is much faster than
+finding out over the wire.
+
+### 2b.4 Start TestEcu
+
+```bash
+python3 -m testecu --config config.yaml --log-level INFO
+```
+
+On a developer machine without an `eth0`, use loopback:
+
+```bash
+python3 -m testecu --config config.yaml --host ::1 --interface "" --no-udp
+```
+
+### 2b.5 Try it
+
+```bash
+python3 tools/uds_probe.py --host ::1 --uds "22 F1 90"     # -> 62 F1 90 <VIN>
+python3 tools/uds_probe.py --host ::1 --uds "10 03" --uds "27 01" \
+    --uds "27 02 B4 87 96 E1" --uds "2E 01 00 11 22 33 44" --uds "22 01 00"
+python3 tools/uds_probe.py --host ::1 --uds "31 01 02 03"  # 7F 31 78, then 71 01 02 03 00
+python3 tools/uds_probe.py --host ::1 --uds "99"           # -> 7F 99 11
+```
+
+### 2b.6 Write a plugin
+
+```python
+# test_ecu/plugins/my_ecu.py
+from testecu import Plugin, read_did, write_did, NRC_CONDITIONS_NOT_CORRECT
+
+class MyEcu(Plugin):
+    @read_did(0xF200)
+    def uptime(self, req, ctx):
+        return ctx.data.setdefault("ticks", 0).to_bytes(2, "big")
+
+    @write_did(0xF201)
+    def set_mode(self, value, req, ctx):
+        if value not in (b"\x00", b"\x01"):
+            raise ctx.nrc(NRC_CONDITIONS_NOT_CORRECT, "mode must be 0 or 1")
+        ctx.store.write(0xF201, value)
+        return True
+```
+
+Register it under `plugins.modules` and restart. The full guide — all five decorators,
+the return contract, the precedence rules, and what the core already implements — is in
+[`test_ecu/README.md`](test_ecu/README.md) and
+[`test_ecu/plugins/README.md`](test_ecu/plugins/README.md).
+
+---
+
 ## 3 — PC Tester setup
 
 ### 3.1 Install dependencies
@@ -416,6 +526,20 @@ pip3 install pytest pytest-asyncio --break-system-packages   # first time only
 pytest tests/test_middleware.py -v                            # no Scapy needed
 pytest tests/test_session.py -v                              # Scapy required
 ```
+
+TestEcu has its own suite. It needs nothing but pytest — no Scapy, no pytest-asyncio,
+no network privileges:
+
+```bash
+cd test_ecu
+pip3 install pytest --break-system-packages                  # first time only
+python3 -m pytest tests -v
+```
+
+157 tests covering the config loader, the DID store, the precedence ladder, plugin
+loading and error isolation, every built-in service and NRC path, and an end-to-end run
+over a real IPv6 socket. `tests/test_doip_parity.py` imports `echo_ecu/echo_ecu.py`
+directly and asserts the two DoIP framing implementations stay byte-identical.
 
 ---
 

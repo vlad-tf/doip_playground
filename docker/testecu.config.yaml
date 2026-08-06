@@ -1,0 +1,106 @@
+# DoIP TestEcu — Docker configuration
+# Mounted at /app/config.yaml in the doip-testecu container.
+# Only attached to the IPv6 backend network, so its single interface is eth0.
+#
+# Runs alongside doip-echonode: the echo node keeps 0x0001 / fd2e:646f:6970::2,
+# TestEcu is 0x0002 / fd2e:646f:6970::3.
+listen:
+  host:      "::"       # bind all IPv6 interfaces (V6ONLY)
+  port:      13400
+  interface: "eth0"     # backend interface toward the EdgeNode
+
+doip:
+  ecu_logical_addr:  0x0002
+  node_type:         0x01
+  power_mode:        0x01
+  max_payload_bytes: 4096
+  vin:  "1HGBH41JXMN109186"
+  eid:  "AABBCCDDEEFF"
+  gid:  "000000000000"
+
+udp:
+  enabled:              true
+  announce_count:       3
+  announce_interval_ms: 500
+
+uds:
+  default_session:        0x01
+  s3_server_ms:           5000
+  p2_server_ms:           50
+  p2_star_server_ms:      5000
+  auto_response_pending:  true
+  suppress_pos_rsp_bit:   true
+  functional_addr:        0x1FFF
+  unknown_service:        nrc     # set to `echo` for echo-node-compatible behaviour
+  unknown_did:            nrc
+  on_handler_error:       nrc
+  reset_clears_writes:    true
+  security:
+    enabled:      true
+    seed:         "11223344"
+    algorithm:    xor
+    key:          "A5A5A5A5"
+    max_attempts: 3
+
+# Auto-discovery from the mounted directory: drop a .py in and restart the
+# container — no rebuild.  Point the volume at your own directory in
+# docker-compose.yml to use plugins from outside this repo.
+plugins:
+  strict: false
+  path:
+    - "/app/plugins"
+  modules: []
+
+data_identifiers:
+  0xF190:
+    name:   VIN
+    type:   ascii
+    length: 17
+    value:  "1HGBH41JXMN109186"
+    read:   true
+
+  0xF186:
+    name: ActiveDiagnosticSession
+    type: dynamic
+
+  0xF187:
+    name:   SparePartNumber
+    type:   ascii
+    length: 10
+    value:  "TE-0001-A "
+
+  0xF18C:
+    name:   ECUSerialNumber
+    type:   ascii
+    length: 8
+    value:  "TESTECU1"
+
+  0x0100:
+    name:   CalibrationBlock
+    type:   hex
+    length: 4
+    value:  "DEADBEEF"
+    read:   true
+    write:  true
+    write_sessions: [0x03]
+    write_security: 1
+
+  0x0200:
+    name:   CoolantTemperature
+    type:   uint
+    length: 1
+    value:  85
+
+  0xF1A0:
+    name:     AlwaysBusy
+    type:     hex
+    value:    "00"
+    read_nrc: 0x22
+
+routines:
+  0x0201:
+    name:     LampTest
+    sessions: [0x03]
+    start:    "00"
+    stop:     "00"
+    results:  "0001"
