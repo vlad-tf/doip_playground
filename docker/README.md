@@ -1,22 +1,38 @@
 # DoIP stack in Docker
 
-Runs the three components in two isolated networks:
+Runs the four components in two isolated networks:
 
 ```
                  doip_frontend (IPv4)            doip_backend (IPv6)
- PC-Tester  ───────────────────────────►  EdgeNode  ───────────────────────►  EchoNode
- 172.30.100.20                            172.30.100.10        fd2e:646f:6970::10 / ::2
+ PC-Tester  ───────────────────────────►  EdgeNode  ─────┬─────────────────►  EchoNode
+ 172.30.100.20                            172.30.100.10  │   fd2e:646f:6970::10 / ::2
+                                                         └─────────────────►  TestEcu
+                                                                     fd2e:646f:6970::3
 ```
 
-| Component | Container | Frontend (IPv4) | Backend (IPv6) | Ports |
-|---|---|---|---|---|
-| EdgeNode | `doip-edgenode` | `172.30.100.10` (eth0) | `fd2e:646f:6970::10` (eth1) | 13400/tcp, 3496/tcp, 13400/udp |
-| EchoNode | `doip-echonode` | — | `fd2e:646f:6970::2` | 13400/tcp, 13400/udp |
-| PC-Tester | `doip-pc-tester` | `172.30.100.20` | — | — |
+| Component | Container | Frontend (IPv4) | Backend (IPv6) | Logical addr | Ports |
+|---|---|---|---|---|---|
+| EdgeNode | `doip-edgenode` | `172.30.100.10` (eth0) | `fd2e:646f:6970::10` (eth1) | — | 13400/tcp, 3496/tcp, 13400/udp |
+| EchoNode | `doip-echonode` | — | `fd2e:646f:6970::2` | `0x0001` | 13400/tcp, 13400/udp |
+| TestEcu | `doip-testecu` | — | `fd2e:646f:6970::3` | `0x0002` | 13400/tcp, 13400/udp |
+| PC-Tester | `doip-pc-tester` | `172.30.100.20` | — | — | — |
 
 The tester talks DoIP plain (TCP 13400) to the EdgeNode over IPv4. The EdgeNode
-proxies to the EchoNode over IPv6. TLS (3496) is exposed but not yet negotiated
+proxies to a backend ECU over IPv6. TLS (3496) is exposed but not yet negotiated
 (PoC — see the repo README §10).
+
+**Which ECU you reach is decided by the tester logical address.** The EdgeNode resolves
+routes with `lookup_by_tester_addr()` and takes the first match, so each backend ECU has
+its own tester SA in `docker/edgenode.config.yaml`:
+
+| Activate with SA | Reaches | ECU logical addr |
+|---|---|---|
+| `0x0E00` | `doip-echonode` | `0x0001` |
+| `0x0E01` | `doip-testecu` | `0x0002` |
+
+To point the bundled tester at TestEcu, set both lines in `docker/pctester.config.yaml`
+to `tester_logical_addr: 0x0E01` / `ecu_logical_addr: 0x0002` and
+`docker compose restart doip-pc-tester`.
 
 ## Address ranges (chosen to avoid overlap)
 
@@ -65,6 +81,34 @@ Stop:
 ```bash
 docker compose down
 ```
+
+## Loading your own plugins into TestEcu
+
+`doip-testecu` mounts a plugin directory read-only at `/app/plugins` and loads every
+`*.py` in it at startup (sorted, files starting with `_` skipped). No rebuild is needed
+— drop a file in and restart the container:
+
+```bash
+cp my_ecu.py test_ecu/plugins/
+docker compose restart doip-testecu
+docker compose logs doip-testecu | head -20     # the resolved hook table is at INFO
+```
+
+To use a plugin directory outside this repo, repoint the volume in `docker-compose.yml`:
+
+```yaml
+  doip-testecu:
+    volumes:
+      - ./docker/testecu.config.yaml:/app/config.yaml:ro
+      - /path/to/my_plugins:/app/plugins:ro
+```
+
+A plugin that fails to import is logged with a full traceback and skipped — the ECU
+still starts and still serves everything else. Set `plugins.strict: true` in
+`docker/testecu.config.yaml` if you would rather the container refuse to start.
+
+`docker/testecu.config.yaml` also holds the static `data_identifiers:` table, so simple
+canned values need no Python at all. See [`../test_ecu/README.md`](../test_ecu/README.md).
 
 ## Running your DoIP Tests project against this stack
 
@@ -135,3 +179,7 @@ names instead of hardcoded IPs.
 - EdgeNode frame logs are written to `docker/logs/doip.log` on the host.
 - `priority` on the EdgeNode networks pins the tester side to `eth0` and the ECU
   side to `eth1`, matching `ecu_interface: eth1` in `edgenode.config.yaml`.
+- Both ECUs send UDP Vehicle Announcements to `ff02::1` on the backend network, so a
+  tester doing vehicle discovery there will see two entities (`0x0001` and `0x0002`).
+- `doip-echonode` and `doip-testecu` are independent: stopping one does not affect the
+  other, and TestEcu changes never touch `echo_ecu/`.

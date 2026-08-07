@@ -1,0 +1,8 @@
+# TestEcu runtime dependency — that is the whole list.
+# No UDS library: py-uds has no server simulation and no DoIP transport, and
+# udsoncan is client-oriented.  The Docker image installs PyYAML via apt
+# (python3-yaml) so the build stays pip-free behind a corporate proxy.
+pyyaml>=6.0
+
+# Development only:
+#   pip3 install --user pytest pytest-asyncio

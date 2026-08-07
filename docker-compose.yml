@@ -1,6 +1,15 @@
-# DoIP test stack: PC-Tester <-> EdgeNode <-> EchoNode
+# DoIP test stack: PC-Tester <-> EdgeNode <-> EchoNode / TestEcu
 #
 #   PC-Tester  --(IPv4, doip_frontend)-->  EdgeNode  --(IPv6, doip_backend)-->  EchoNode
+#                                                                           \-> TestEcu
+#
+# Two ECUs sit on the backend network:
+#   doip-echonode  fd2e:646f:6970::2  logical 0x0001  — fixed echo, unchanged
+#   doip-testecu   fd2e:646f:6970::3  logical 0x0002  — pluggable UDS simulator
+#
+# The EdgeNode picks a route by TESTER logical address (first match wins), so each
+# ECU needs its own tester address in edgenode.config.yaml:
+#   SA 0x0E00 -> echonode (0x0001)   SA 0x0E01 -> testecu (0x0002)
 #
 # Networks use dedicated, non-overlapping ranges so they don't clash with the
 # real bench networks (10.250.250.0/24, 192.168.1.0/24) or the default Docker
@@ -31,6 +40,28 @@ services:
       - ./docker/echonode.config.yaml:/app/config.yaml:ro
     restart: unless-stopped
 
+  doip-testecu:
+    build:
+      context: ./test_ecu
+      dockerfile: ../docker/testecu.Dockerfile
+      args:
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: ${NO_PROXY:-}
+    image: doip-testecu:latest
+    container_name: doip-testecu
+    hostname: doip-testecu
+    networks:
+      doip_backend:
+        ipv6_address: fd2e:646f:6970::3
+    volumes:
+      - ./docker/testecu.config.yaml:/app/config.yaml:ro
+      # Your business logic.  Every *.py here is loaded at startup — drop a file
+      # in and `docker compose restart doip-testecu`, no rebuild needed.
+      # Point this at a directory outside the repo to use your own plugins.
+      - ./test_ecu/plugins:/app/plugins:ro
+    restart: unless-stopped
+
   doip-edgenode:
     build:
       context: ./doip_edgenode
@@ -58,6 +89,7 @@ services:
     entrypoint: ["sh", "/usr/local/bin/edgenode-entrypoint.sh"]
     depends_on:
       - doip-echonode
+      - doip-testecu
     restart: unless-stopped
 
   doip-pc-tester:

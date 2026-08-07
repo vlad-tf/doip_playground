@@ -5,6 +5,10 @@ target:
   port:      13400            # plain DoIP
   timeout_s: 5.0
 
+# Which backend ECU this tester talks to is decided by tester_logical_addr:
+#   0x0E00 + 0x0001 -> doip-echonode (fixed echo)
+#   0x0E01 + 0x0002 -> doip-testecu  (pluggable UDS simulator)
+# Swap both lines together and restart the container to switch targets.
 doip:
   tester_logical_addr: 0x0E00
   ecu_logical_addr:    0x0001

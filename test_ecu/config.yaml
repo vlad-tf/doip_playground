@@ -1,0 +1,153 @@
+# ---------------------------------------------------------------------------
+# TestEcu — extensible DoIP/UDS ECU simulator
+#
+# The `listen`, `doip` and `udp` sections are the same schema as
+# echo_ecu/config.yaml.  Everything below `uds:` is new.
+#
+# See README.md for the plugin guide and the full option reference.
+# ---------------------------------------------------------------------------
+
+listen:
+  host:      "::"       # bind to all IPv6 interfaces; set to "fe80::..." for link-local only
+  port:      13400      # plain DoIP port (match the EdgeNode routing table)
+  interface: "eth0"     # used for the multicast join, outgoing announcements,
+                        # and the IPv6 scope_id when binding a link-local address
+
+doip:
+  ecu_logical_addr:  0x0002   # must match ecu_logical_addr in the EdgeNode routing table
+  node_type:         0x01     # 0x01 = gateway
+  power_mode:        0x01     # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
+  max_payload_bytes: 4096
+  vin:  "1HGBH41JXMN109186"   # 17-char VIN included in Vehicle Announcements
+  eid:  "AABBCCDDEEFF"        # 6-byte Entity ID (12 hex chars)
+  gid:  "000000000000"        # 6-byte Group ID  (12 hex chars)
+
+udp:
+  enabled:              true  # false (or --no-udp) skips the announcer entirely
+  announce_count:       3     # Vehicle Announcements sent on startup
+  announce_interval_ms: 500
+
+# ---------------------------------------------------------------------------
+# UDS behaviour
+# ---------------------------------------------------------------------------
+uds:
+  default_session:        0x01   # session entered at connect and after ECUReset
+  sessions:               [0x01, 0x02, 0x03, 0x04]   # accepted by 0x10
+  s3_server_ms:           5000   # non-default session falls back after this
+  p2_server_ms:           50     # emit 7F xx 78 if a handler takes longer
+  p2_star_server_ms:      5000   # and again every 90% of this afterwards
+  auto_response_pending:  true   # false = never emit 0x78 automatically
+  suppress_pos_rsp_bit:   true   # honour sub-function bit 7 (e.g. 3E 80)
+  functional_addr:        0x1FFF # target address treated as a functional request
+
+  # What to do when nothing handles a request:
+  unknown_service:        nrc    # nrc -> 7F <sid> 11 | echo -> SID|0x40 + body | silent
+  unknown_did:            nrc    # nrc -> 7F <sid> 31 | echo -> the DID itself  | silent
+  on_handler_error:       nrc    # nrc -> 7F <sid> 22 | fallthrough | silent
+
+  reset_clears_writes:    true   # ECUReset restores the DID defaults below
+
+  # SecurityAccess (0x27).  Deliberately trivial — a real seed/key algorithm
+  # belongs in a plugin via @on_service(0x27).  The seed is fixed, never random,
+  # so responses stay reproducible.
+  security:
+    enabled:      true
+    seed:         "11223344"
+    algorithm:    xor          # none | xor | add
+    key:          "A5A5A5A5"   # 27 01 -> 67 01 11 22 33 44 ; key = seed XOR this
+    max_attempts: 3
+
+# ---------------------------------------------------------------------------
+# Plugins — your business logic
+# ---------------------------------------------------------------------------
+plugins:
+  strict: false             # true = a plugin that fails to load aborts startup
+
+  # `path` auto-discovers every *.py in a directory (sorted; _* skipped).  Handy
+  # for "drop a file in and restart", but it cannot pass params — use `modules`
+  # for that.  Do not list the same file in both, or it loads twice.
+  path: []
+  # path:
+  #   - "plugins"
+
+  modules:                  # explicit entries, in order, able to carry params
+    - file: "plugins/example_engine.py"
+      enabled: true
+      priority: 50          # lower runs first; default is the class attribute (100)
+      params:
+        idle_rpm: 800
+        redline:  6500
+
+    - file: "plugins/example_faults.py"
+      enabled: true
+      priority: 10          # runs before EngineEcu
+      params:
+        drop_sids:  []      # e.g. [0x11] to make ECUReset silently disappear
+        stall_sids: []      # e.g. [0x22] to force a 0x78 before the real answer
+
+    # - module: "mycompany.brake_ecu"     # any importable module name
+    #   params: {}
+
+# ---------------------------------------------------------------------------
+# Static data identifiers — no Python needed
+#
+#   type: hex | ascii | uint | dynamic
+#   dynamic = served by the core (0xF186) or by a @read_did plugin handler
+# ---------------------------------------------------------------------------
+data_identifiers:
+
+  0xF190:
+    name:   VIN
+    type:   ascii
+    length: 17
+    value:  "1HGBH41JXMN109186"
+    read:   true
+
+  0xF186:
+    name: ActiveDiagnosticSession
+    type: dynamic             # the core answers with the current session byte
+
+  0xF187:
+    name:   SparePartNumber
+    type:   ascii
+    length: 10
+    value:  "TE-0001-A "
+
+  0xF18C:
+    name:   ECUSerialNumber
+    type:   ascii
+    length: 8
+    value:  "TESTECU1"
+
+  0x0100:
+    name:   CalibrationBlock
+    type:   hex
+    length: 4
+    value:  "DEADBEEF"
+    read:   true
+    write:  true
+    write_sessions: [0x03]    # not writable in the default session -> 7F 2E 31
+    write_security: 1         # needs SecurityAccess level 1       -> 7F 2E 33
+
+  0x0200:
+    name:   CoolantTemperature
+    type:   uint
+    length: 1
+    value:  85
+
+  0xF1A0:
+    name:     AlwaysBusy
+    type:     hex
+    value:    "00"
+    read_nrc: 0x22            # always answers conditionsNotCorrect — for tester tests
+
+# ---------------------------------------------------------------------------
+# Static routines — canned RoutineControl (0x31) responses
+# ---------------------------------------------------------------------------
+routines:
+  0x0201:
+    name:     LampTest
+    sessions: [0x03]
+    start:    "00"            # routineStatusRecord for startRoutine
+    stop:     "00"
+    results:  "0001"
