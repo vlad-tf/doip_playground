@@ -39,6 +39,11 @@ timers:
   t_tcp_general_inactivity_s: 300
   alive_check_interval_ms: 500
 
+  # See doip_edgenode/config.yaml for the full explanation.
+  ecu_response_timeout_s:   2.0    # per-frame wait after the Positive ACK
+  ecu_pending_max_wait_s:   30.0   # whole-exchange cap while the ECU sends 0x78
+  strict_response_matching: true   # drop a response that answers a different SID
+
 udp:
   announce_count:    3
   announce_interval_ms: 500
@@ -58,6 +63,20 @@ routing_table:
   - tester_logical_addr: 0x0E01
     ecu_logical_addr:    0x0002
     ecu_ipv6:            "fd2e:646f:6970::3"   # TestEcu static IPv6 on doip_backend
+    ecu_interface:       "eth1"
+    ecu_port_plain:      13400
+    ecu_port_tls:        3496
+    ecu_sni:             ""
+
+  # Several testers may share one ECU — give each its own tester address and
+  # its own entry.  Each gets an independent TCP session to the ECU, so their
+  # diagnostic session and security level are separate, while the ECU's data
+  # is shared (one ECU).  Two testers must NOT reuse one SA against the same
+  # ECU: that is an ISO 13400-2 §9.3 conflict and the ECU will alive-probe,
+  # then deny or evict.
+  - tester_logical_addr: 0x0E02
+    ecu_logical_addr:    0x0002
+    ecu_ipv6:            "fd2e:646f:6970::3"   # same TestEcu, second tester
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
     ecu_port_tls:        3496

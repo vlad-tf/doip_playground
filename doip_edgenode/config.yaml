@@ -36,6 +36,18 @@ timers:
   t_tcp_general_inactivity_s: 300
   alive_check_interval_ms: 500
 
+  # Wait for one ECU frame after the Diagnostic Positive ACK.
+  ecu_response_timeout_s: 2.0
+  # Total budget for a request the ECU keeps answering with
+  # 7F <sid> 78 (requestCorrectlyReceived-ResponsePending).  A flash routine
+  # can legitimately pend far longer than one P2, so this caps the whole
+  # exchange rather than each frame.  Raise it for long flash sequences.
+  ecu_pending_max_wait_s: 30.0
+  # Drop an ECU response whose service id does not answer the request in
+  # flight.  Set false to forward it anyway (and only log a warning) — useful
+  # when address/corrupt fault injection is deliberately rewriting the SID.
+  strict_response_matching: true
+
 udp:
   announce_count:    3
   announce_interval_ms: 500

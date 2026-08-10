@@ -78,6 +78,17 @@ class TimerConfig:
     t_tcp_initial_inactivity_s: float
     t_tcp_general_inactivity_s: float
     alive_check_interval_ms: int
+    #: How long to wait for one ECU frame after the Diagnostic Positive ACK.
+    ecu_response_timeout_s: float = 2.0
+    #: Total budget for one request when the ECU keeps answering
+    #: requestCorrectlyReceived-ResponsePending (0x78).  A flash routine can
+    #: legitimately pend for far longer than a single P2, so this is the cap
+    #: on the whole exchange, not on each frame.
+    ecu_pending_max_wait_s: float = 30.0
+    #: Drop an ECU response whose service id does not answer the request that
+    #: is in flight.  Without this a desynchronised stream silently delivers a
+    #: well-formed response to the wrong request.
+    strict_response_matching: bool = True
 
 
 @dataclass
@@ -228,6 +239,15 @@ def _load_timers(raw: dict) -> TimerConfig:
         ),
         alive_check_interval_ms=int(
             raw.get("alive_check_interval_ms", 500)
+        ),
+        ecu_response_timeout_s=float(
+            raw.get("ecu_response_timeout_s", 2.0)
+        ),
+        ecu_pending_max_wait_s=float(
+            raw.get("ecu_pending_max_wait_s", 30.0)
+        ),
+        strict_response_matching=bool(
+            raw.get("strict_response_matching", True)
         ),
     )
 

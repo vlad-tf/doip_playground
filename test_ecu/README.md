@@ -9,7 +9,12 @@ exists and still works. TestEcu reuses its (proven) DoIP layer and replaces its 
 canned-echo UDS handler with a real service layer you can extend.
 
 **Dependencies: PyYAML. That is the whole list.** No `udsoncan`, no `py-uds`, no Scapy.
-Python 3.9 or newer.
+
+**Python 3.10+ is the supported floor** — that is Ubuntu 22.04 (the test server) and
+Debian bookworm / Raspberry Pi OS (3.11, the deployment target and the Docker base).
+Tests are run on Linux. The code happens to still import on 3.9 (`from __future__ import
+annotations` throughout), which is convenient on a macOS dev box, but 3.9 is not tested
+and nothing should be held back for it.
 
 ---
 

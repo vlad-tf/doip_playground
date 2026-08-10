@@ -72,14 +72,19 @@ Tester ──RA(0x0E00)──► EdgeNode ──RA(0x0E00)──► ECU
 - Two network interfaces: `eth0` (onboard, tester side) and `eth1` (USB-Ethernet adapter or HAT, ECU/IVN side)
 - Run as root or with `CAP_NET_RAW` + `CAP_NET_BIND_SERVICE`
 
-### Echo ECU (Linux machine)
-- Any Linux machine with Python 3.9+
+### Echo ECU / TestEcu (Linux machine)
+- Any Linux machine with Python 3.10+ (Ubuntu 22.04 and Debian Bookworm both qualify)
 - One network interface connected to the RPi `eth1` network
+- TestEcu needs PyYAML and nothing else; tests additionally need `pytest`
 
 ### PC Tester
 - Windows 10/11 or Linux
-- Python 3.9+
+- Python 3.10+
 - No special privileges needed
+
+> Python 3.10 is the tested floor across the repo — that is what the Linux test server
+> runs, and deployment targets are on 3.11. Much of the code still imports on 3.9, but
+> that is incidental and not verified; write for 3.10+.
 
 ---
 
