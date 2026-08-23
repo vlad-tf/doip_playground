@@ -34,6 +34,7 @@ from testecu.doip import (
     ALIVE_PROBE_TIMEOUT_S,
     NACK_MESSAGE_TOO_LARGE,
     NACK_UNKNOWN_TARGET_ADDRESS,
+    ROUTING_ACT_REQUEST_MIN_LEN,
     PT_ALIVE_CHECK_REQUEST,
     PT_ALIVE_CHECK_RESPONSE,
     PT_DIAGNOSTIC_MESSAGE,
@@ -109,6 +110,7 @@ class EcuSession:
         self._node_type = config.doip.node_type
         self._power_mode = config.doip.power_mode
         self._max_data = config.doip.max_payload_bytes
+        self._tester_addr_range = config.doip.tester_addr_range
 
         #: UDS state for this connection (session, security level, S3 timer)
         self.state = ecu.new_session(str(self._peer))
@@ -251,9 +253,17 @@ class EcuSession:
         ISO 13400-2 §9.3 conflict resolution: if the source address is already
         registered on another socket, alive-probe that socket first —
         responds → deny the new one with 0x03; times out → evict it and accept.
+
+        ISO 13400-2 Table 15: the fixed payload is source address (2) +
+        activation type (1) + reserved (4) = 7 bytes; anything shorter is a
+        malformed frame and must be rejected with Generic NACK 0x04 ("invalid
+        payload length"), not parsed.
         """
-        if len(payload) < 3:
-            logger.warning("Routing Activation Request too short")
+        if len(payload) < ROUTING_ACT_REQUEST_MIN_LEN:
+            logger.warning(
+                "Routing Activation Request too short (%d < %d bytes) — Generic NACK",
+                len(payload), ROUTING_ACT_REQUEST_MIN_LEN,
+            )
             await self._send(build_frame(PT_HEADER_NACK, bytes([0x04])))
             return
 
@@ -264,6 +274,22 @@ class EcuSession:
             "Routing Activation  src=0x%04X  type=0x%02X  from %s",
             src_addr, activation_type, self._peer,
         )
+
+        # ISO 13400-2 Table 13 / Table 48 code 0x00: a source address outside
+        # the tester (client) logical address range is not a valid tester and
+        # must be denied, regardless of any conflict-resolution logic below.
+        low, high = self._tester_addr_range
+        if not (low <= src_addr <= high):
+            logger.warning(
+                "Routing Activation from unknown/out-of-range SA=0x%04X "
+                "(expected 0x%04X-0x%04X) — denying (0x00)",
+                src_addr, low, high,
+            )
+            await self._send(build_frame(
+                PT_ROUTING_ACT_RESPONSE,
+                self._activation_response(src_addr, 0x00),
+            ))
+            return
 
         if self._registry is not None:
             existing = self._registry.lookup(src_addr)

@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from testecu.doip import TESTER_ADDR_RANGE
 from testecu.uds import (
     NRC_NAMES,
     SESSION_DEFAULT,
@@ -128,6 +129,10 @@ class DoipConfig:
     vin: str = "00000000000000000"
     eid: str = "000000000000"
     gid: str = "000000000000"
+    #: Accepted tester (client) logical address range for Routing Activation
+    #: (ISO 13400-2 Table 13). A source address outside this range is denied
+    #: with response code 0x00 ("unknown source address").
+    tester_addr_range: tuple = TESTER_ADDR_RANGE
 
 
 @dataclass
@@ -269,6 +274,21 @@ def _load_doip(raw: dict) -> DoipConfig:
     if not 0 <= cfg.ecu_logical_addr <= 0xFFFF:
         raise ConfigError("doip.ecu_logical_addr: 0x%X is not a 16-bit address"
                           % cfg.ecu_logical_addr)
+
+    if "tester_addr_range" in section:
+        bounds = _to_int_list(section["tester_addr_range"], "doip.tester_addr_range")
+        if len(bounds) != 2:
+            raise ConfigError(
+                "doip.tester_addr_range: expected [low, high], got %d value(s)"
+                % len(bounds)
+            )
+        low, high = bounds
+        if not (0 <= low <= high <= 0xFFFF):
+            raise ConfigError(
+                "doip.tester_addr_range: [0x%04X, 0x%04X] is not a valid "
+                "ascending 16-bit range" % (low, high)
+            )
+        cfg.tester_addr_range = (low, high)
     return cfg
 
 

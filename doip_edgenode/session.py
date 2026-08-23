@@ -638,7 +638,9 @@ class DoIPSession:
 
         if self._ecu_conn is None:
             # ECU unreachable
-            await self._send_diag_nack(0x03)  # target unreachable
+            # ISO 13400-2 Table 26: 0x06 = "target unreachable" (0x03 is
+            # "unknown target address" — a different failure mode).
+            await self._send_diag_nack(0x06)  # target unreachable
             return
 
         # Forward to ECU
@@ -646,7 +648,7 @@ class DoIPSession:
             await self._ecu_conn.send(bytes(processed))
         except Exception as exc:
             logger.error("DoIPSession: ECU send error: %s", exc)
-            await self._send_diag_nack(0x03)
+            await self._send_diag_nack(0x06)  # target unreachable
             return
 
         # Receive ECU response(s).

@@ -147,7 +147,37 @@ class TestLifecycle:
             await client.activate()
             ptype, payload = await client.diagnostic(b"\x3E\x00", target=0x1234)
             assert ptype == PT_DIAGNOSTIC_NEGATIVE_ACK
-            assert payload[4] == 0x01                       # unknown target address
+            # ISO 13400-2 Table 26: 0x03 = unknown target address (0x00/0x01
+            # are reserved by ISO 13400 and must never appear on the wire).
+            assert payload[4] == 0x03
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_routing_activation_from_out_of_range_sa_is_denied(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            # 0x0BAD falls outside the tester SA range (0x0E00-0x0FFF, ISO
+            # 13400-2 Table 13) — must be denied, not accepted.
+            ptype, payload = await client.activate(tester=0x0BAD)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x00                        # unknown source address
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_truncated_routing_activation_request_gets_generic_nack(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            # 3-byte payload: SA(2) + activation_type(1), missing the 4-byte
+            # reserved field required by ISO 13400-2 Table 15 (7 bytes total).
+            await client.send(PT_ROUTING_ACT_REQUEST,
+                              struct.pack("!H", TESTER_ADDR) + b"\x00")
+            ptype, payload = await client.recv()
+            assert ptype == PT_HEADER_NACK
+            assert payload == b"\x04"                        # invalid payload length
             await client.close()
             return True
 

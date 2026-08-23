@@ -456,7 +456,7 @@ class ECUSession:
             - responds  → deny new with 0x03
             - times out → evict old, accept new with 0x10
         """
-        if len(payload) < 3:
+        if len(payload) < 7:  # ISO 13400-2 Table 15: SA(2) + type(1) + reserved(4)
             logger.warning("Routing Activation Request too short")
             await self._send(_build(PT_HEADER_NACK, bytes([0x04])))
             return

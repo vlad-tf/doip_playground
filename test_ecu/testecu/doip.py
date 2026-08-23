@@ -75,14 +75,24 @@ PTYPE_NAMES = {
     PT_DIAGNOSTIC_NEGATIVE_ACK: "Diagnostic Message Negative ACK",
 }
 
-# Diagnostic Message negative acknowledge codes (ISO 13400-2 Table 26)
-NACK_INVALID_SOURCE_ADDRESS   = 0x00
-NACK_UNKNOWN_TARGET_ADDRESS   = 0x01
-NACK_MESSAGE_TOO_LARGE        = 0x02
-NACK_OUT_OF_MEMORY            = 0x03
-NACK_TARGET_UNREACHABLE       = 0x04
-NACK_UNKNOWN_NETWORK          = 0x05
-NACK_TRANSPORT_PROTOCOL_ERROR = 0x06
+# Diagnostic Message negative acknowledge codes (ISO 13400-2 Table 26).
+# 0x00 and 0x01 are reserved by ISO 13400 — valid codes start at 0x02.
+NACK_INVALID_SOURCE_ADDRESS   = 0x02
+NACK_UNKNOWN_TARGET_ADDRESS   = 0x03
+NACK_MESSAGE_TOO_LARGE        = 0x04
+NACK_OUT_OF_MEMORY            = 0x05
+NACK_TARGET_UNREACHABLE       = 0x06
+NACK_UNKNOWN_NETWORK          = 0x07
+NACK_TRANSPORT_PROTOCOL_ERROR = 0x08
+
+# Tester (client) logical address range accepted by Routing Activation
+# (ISO 13400-2 Table 13). A source address outside this range is denied with
+# Routing Activation Response code 0x00 ("denied — unknown source address").
+TESTER_ADDR_RANGE = (0x0E00, 0x0FFF)
+
+# Minimum Routing Activation Request payload length (ISO 13400-2 Table 15):
+# source address (2) + activation type (1) + reserved (4) = 7 bytes.
+ROUTING_ACT_REQUEST_MIN_LEN = 7
 
 # IPv6 DoIP multicast group (all-nodes link-local) used for announcements
 DOIP_MCAST_ADDR = "ff02::1"
