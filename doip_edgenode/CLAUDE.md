@@ -65,8 +65,8 @@ doip_edgenode/
 
 ## Conventions actually in use here (match these, do not "improve" them)
 
-- No license header on these files (unlike `test_ecu/`) — do not add one as
-  a drive-by change.
+- License header on every `.py` file — see `../CLAUDE.md` for the exact
+  text; it's a repo-wide rule, not specific to this component.
 - Logger name = module path: `logger = logging.getLogger(__name__)`.
 - Config: dataclasses per YAML section, `load_config(path) -> AppConfig`,
   `ConfigError` on anything invalid (bad TLS version, wrong VIN/EID/GID

@@ -12,7 +12,8 @@ See `../CLAUDE.md` for why this differs from `test_ecu/`.
   Scapy, no third-party DoIP/UDS libraries. Keep it dependency-light; this is
   meant to run on a plain Windows or Linux PC with no setup beyond
   `pip install pyyaml`.
-- No license header (unlike `test_ecu/`).
+- License header at the top of `tester.py` (see `../CLAUDE.md` — it's a
+  repo-wide rule); already present, keep it when editing.
 - Mirrors DoIP constant names and NACK/response code tables from
   `echo_ecu/echo_ecu.py` (`PT_*`, `RA_RESPONSE_CODES`, `DIAG_NACK_CODES`) —
   keep new payload types/response codes consistent with those tables rather

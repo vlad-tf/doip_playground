@@ -28,18 +28,18 @@ EdgeNode and TestEcu were built at different times with different goals and
 
 - **EdgeNode** (`doip_edgenode/`) was generated from a single big implementation
   prompt (phase-by-phase, "build this from scratch"). It depends on Scapy for
-  packet framing and TLS, has no license headers, and its own docstring style.
+  packet framing and TLS, and has its own docstring style.
 - **TestEcu** (`test_ecu/`) was built later as a hand-designed plugin
-  architecture (hook precedence ladder, typed config, Apache-2.0 license
-  headers, zero dependencies beyond PyYAML, no Scapy). It is the style to
-  imitate for **new** components in this repo.
+  architecture (hook precedence ladder, typed config, zero dependencies
+  beyond PyYAML, no Scapy). It is the style to imitate for **new**
+  components in this repo.
 - **Echo ECU** (`echo_ecu/`) predates both and is deliberately frozen: TestEcu's
   DoIP framing is a verified byte-for-byte port of it
   (`test_ecu/tests/test_doip_parity.py`), so changing `echo_ecu/echo_ecu.py`
   risks breaking that guarantee silently.
 
 **Rule of thumb:** when adding a new component or a substantial new module,
-follow the TestEcu conventions (typed config + `ConfigError`, license header,
+follow the TestEcu conventions (typed config + `ConfigError`,
 dependency-light, precedence-ladder-style dispatch, README with a "Quick
 start"). When fixing a bug inside an existing component, match *that
 component's* existing style, not TestEcu's — do not silently reformat
@@ -74,9 +74,29 @@ stray tasks) defined once per test suite
 Keep using this pattern rather than adding `pytest-asyncio` as a dependency —
 it is a deliberate choice to keep `pip install pytest` sufficient.
 
-## License headers
+## License headers — applies to all four components
 
-`test_ecu/` files carry an Apache-2.0 header (see any file under
-`test_ecu/testecu/`). `doip_edgenode/`, `echo_ecu/`, and `pc_tester/` do not.
-Match whichever convention the file you are editing already uses; do not add
-headers to `doip_edgenode/`/`echo_ecu/`/`pc_tester/` files as a drive-by change.
+Every `.py` file in this repo (all of `doip_edgenode/`, `echo_ecu/`,
+`pc_tester/`, `test_ecu/`) carries the same Apache-2.0 header:
+
+```python
+# Copyright 2026 Vladislav Vostrykh, Technica Engineering GmbH
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+```
+
+It goes at the very top of the file — before the module docstring in files
+that have one (e.g. `test_ecu/main.py` puts `#!/usr/bin/env python3` above
+even that). Add this header, verbatim, to every new `.py` file you create in
+any of the four components. This is a repo-wide rule, not a per-component
+one — none of the per-component `CLAUDE.md` files repeat it.

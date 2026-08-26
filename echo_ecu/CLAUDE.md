@@ -22,15 +22,16 @@ Only touch this file for:
   or TestEcu development, confirmed against `../doip_edgenode_requirements.md`;
 - explicitly requested changes.
 
-Do not "clean up", refactor, add type hints beyond what's there, split into
-modules, or add a license header as a drive-by change — this file is
-deliberately a single, frozen, working reference implementation.
+Do not "clean up", refactor, add type hints beyond what's there, or split
+into modules — this file is deliberately a single, frozen, working
+reference implementation.
 
 ## Conventions (if you must touch it)
 
 - Pure Python stdlib only — no PyYAML-adjacent dependency additions beyond
   `pyyaml` for config, no Scapy, no third-party UDS libs.
-- No license header (unlike `test_ecu/`).
+- License header at the top (see `../CLAUDE.md` — it's a repo-wide rule);
+  already present, keep it when editing.
 - DoIP constants are prefixed `_` (module-private) except the `PT_*`
   payload-type constants and `PTYPE_NAMES`, which parity tests import.
 - Runs as its own single-directory Docker build context

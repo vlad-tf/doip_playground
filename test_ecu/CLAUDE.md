@@ -55,11 +55,9 @@ internal module.
 
 ## Conventions to follow (match existing files exactly)
 
-- **License header** on every `.py` file under `testecu/`, `tests/`, and
-  `plugins/` (Apache-2.0, copyright Vladislav Vostrykh / Technica Engineering
-  GmbH — copy the header verbatim from any existing file, e.g. `store.py`).
-  This is the opposite of `doip_edgenode/`/`echo_ecu/`, which have none —
-  don't cross the two conventions.
+- License header on every `.py` file (see `../CLAUDE.md` for the exact
+  text — it applies repo-wide, not just here). It goes above the module
+  docstring.
 - `from __future__ import annotations` at the top of every module.
 - Module docstring explaining the "why", not a restatement of the class
   list — see `store.py`, `dispatcher.py`, `doip.py` for the tone to match.
