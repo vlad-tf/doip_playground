@@ -13,9 +13,12 @@
 # limitations under the License.
 
 """
-Vehicle Announcement / Vehicle Identification over UDP (ISO 13400-2).
+Vehicle Announcement / Vehicle Identification / Entity Status over UDP (ISO 13400-2).
 
-Port of ``echo_ecu.py`` lines 111-246, retyped against ``EcuConfig``.
+Port of ``echo_ecu.py`` lines 111-246, retyped against ``EcuConfig``. Entity
+Status Request/Response support was added later: ``session.py``'s TCP-side
+handler already covered it, but the UDP listener silently dropped anything
+that was not a Vehicle Identification Request.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ from typing import Optional
 from testecu.config import EcuConfig
 from testecu.doip import (
     DOIP_MCAST_ADDR,
+    PT_ENTITY_STATUS_REQUEST,
+    PT_ENTITY_STATUS_RESPONSE,
     PT_VEHICLE_ID_REQUEST,
     PT_VEHICLE_ID_RESPONSE,
     build_frame,
@@ -63,12 +68,14 @@ def build_announcement_payload(config: EcuConfig) -> bytes:
 
 
 class _UDPProtocol(asyncio.DatagramProtocol):
-    """Answers Vehicle Identification Requests and sends announcements."""
+    """Answers Vehicle Identification and Entity Status Requests, sends announcements."""
 
     def __init__(self, config: EcuConfig, if_index: int) -> None:
         self._payload = build_announcement_payload(config)
         self._if_index = if_index
         self._port = config.listen.port
+        self._node_type = config.doip.node_type
+        self._max_data = config.doip.max_payload_bytes
         self._transport: Optional[asyncio.DatagramTransport] = None
 
     def connection_made(self, transport) -> None:  # type: ignore[override]
@@ -78,12 +85,28 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         if len(data) < 8:
             return
         pt = struct.unpack("!H", data[2:4])[0]
-        if pt != PT_VEHICLE_ID_REQUEST:
+        if pt == PT_VEHICLE_ID_REQUEST:
+            logger.debug("UDP: Vehicle Identification Request from %s", addr)
+            if self._transport:
+                self._transport.sendto(build_frame(PT_VEHICLE_ID_RESPONSE, self._payload), addr)
+                logger.debug("UDP: sent Vehicle Identification Response to %s", addr)
             return
-        logger.debug("UDP: Vehicle Identification Request from %s", addr)
-        if self._transport:
-            self._transport.sendto(build_frame(PT_VEHICLE_ID_RESPONSE, self._payload), addr)
-            logger.debug("UDP: sent Vehicle Identification Response to %s", addr)
+        if pt == PT_ENTITY_STATUS_REQUEST:
+            logger.debug("UDP: Entity Status Request from %s", addr)
+            if self._transport:
+                self._transport.sendto(build_frame(PT_ENTITY_STATUS_RESPONSE,
+                                                    self._entity_status_payload()), addr)
+                logger.debug("UDP: sent Entity Status Response to %s", addr)
+            return
+
+    def _entity_status_payload(self) -> bytes:
+        """Entity Status Response (0x4002), 7 bytes: node type, max/open sockets, max data.
+
+        UDP has no persistent socket of its own to count, so open sockets is
+        reported as 0 here — TCP sessions are answered by ``session.py``'s own
+        ``_handle_entity_status``, which knows the real registry count.
+        """
+        return bytes([self._node_type, 1, 0]) + struct.pack("!I", self._max_data)
 
     def error_received(self, exc: Exception) -> None:
         logger.warning("UDP: error: %s", exc)
