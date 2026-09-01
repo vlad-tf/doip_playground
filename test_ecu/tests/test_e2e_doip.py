@@ -129,13 +129,22 @@ class TestLifecycle:
 
         assert run(with_server(scenario))
 
-    def test_diagnostic_before_activation_is_ignored(self):
+    def test_diagnostic_before_activation_is_nacked_and_socket_closed(self):
         async def scenario(port):
             client = await Client.connect(port)
+
+            # A never-activated socket has no registered SA, so any Diagnostic
+            # Message on it is the same DoIP-070 violation as a spoofed SA:
+            # NACK 0x02 and close the TCP_DATA socket.
             await client.send(PT_DIAGNOSTIC_MESSAGE,
                               struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x3E\x00")
-            with pytest.raises(asyncio.TimeoutError):
-                await client.recv(timeout=0.3)
+            ptype, payload = await client.recv(timeout=1.0)
+            assert ptype == PT_DIAGNOSTIC_NEGATIVE_ACK
+            assert payload[4] == 0x02
+
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await client.recv(timeout=1.0)
             await client.close()
             return True
 
@@ -150,6 +159,38 @@ class TestLifecycle:
             # ISO 13400-2 Table 26: 0x03 = unknown target address (0x00/0x01
             # are reserved by ISO 13400 and must never appear on the wire).
             assert payload[4] == 0x03
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_diagnostic_from_unregistered_sa_is_nacked_and_socket_closed(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+
+            # A diagnostic message whose SA was not the one that activated
+            # routing on this socket (ISO 13400-2 DoIP-070 / Table 31 0x02) must
+            # be NACKed 0x02 and the TCP_DATA socket closed.
+            ptype, payload = await client.diagnostic(b"\x3E\x00", tester=TESTER_ADDR + 1)
+            assert ptype == PT_DIAGNOSTIC_NEGATIVE_ACK
+            assert payload[4] == 0x02
+
+            # The socket must be closed after the NACK; a further read then
+            # hits EOF (or a reset), never another DoIP frame.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await client.recv(timeout=1.0)
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_diagnostic_from_registered_sa_still_works(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            ptype, payload = await client.diagnostic(b"\x3E\x00")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
             await client.close()
             return True
 

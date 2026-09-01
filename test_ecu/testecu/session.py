@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 from testecu.doip import (
     ACCEPTED_VERSIONS,
     ALIVE_PROBE_TIMEOUT_S,
+    NACK_INVALID_SOURCE_ADDRESS,
     NACK_MESSAGE_TOO_LARGE,
     NACK_UNKNOWN_TARGET_ADDRESS,
     ROUTING_ACT_REQUEST_MIN_LEN,
@@ -92,6 +93,17 @@ class SessionRegistry:
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+
+class _CloseConnection(Exception):
+    """Internal control flow: send the pending NACK, then tear the socket down.
+
+    Raised by handlers that must both emit a frame and close the TCP_DATA
+    connection (ISO 13400-2 Table 31 / DoIP-070: NACK 0x02 "invalid source
+    address" requires the socket to be closed after the NACK is sent).
+    ``_loop`` catches it, logs, and lets ``run()``'s ``finally`` close the
+    writer and unregister the session.
+    """
 
 
 class EcuSession:
@@ -196,7 +208,13 @@ class EcuSession:
                 await self._handle_routing_activation(pload)
 
             elif pt == PT_DIAGNOSTIC_MESSAGE:
-                await self._handle_diagnostic(pload)
+                try:
+                    await self._handle_diagnostic(pload)
+                except _CloseConnection:
+                    logger.info(
+                        "Closing socket after Diagnostic NACK for %s", self._peer,
+                    )
+                    return
 
             elif pt == PT_ALIVE_CHECK_REQUEST:
                 await self._handle_alive_check()
@@ -368,10 +386,6 @@ class EcuSession:
         A handler may emit extra frames of its own before the final one via
         ``ctx.send()`` / ``ctx.response_pending()``.
         """
-        if not self.activated:
-            logger.warning("Diagnostic Message before activation — ignoring")
-            return
-
         if len(payload) < 5:
             logger.warning("Diagnostic Message payload too short (%d bytes)", len(payload))
             return
@@ -384,6 +398,27 @@ class EcuSession:
             "Diagnostic Message  src=0x%04X  tgt=0x%04X  UDS: %s  from %s",
             src, tgt, fmt_hex(uds), self._peer,
         )
+
+        # ISO 13400-2 DoIP-070 / Table 31 code 0x02: the diagnostic message's
+        # source address must be the one that activated routing on THIS socket.
+        # A never-activated socket has no registered SA (self.tester_addr is
+        # None, which no real SA can equal) and a spoofed SA on an activated
+        # socket both fail this same check — both are the same protocol
+        # violation and get the same treatment: NACK 0x02 and close the
+        # TCP_DATA socket (a real gateway would, and it stops a
+        # merely-connected-but-never-activated peer from injecting requests).
+        if not self.activated or src != self.tester_addr:
+            logger.warning(
+                "Diagnostic Message src=0x%04X on socket registered to %s — "
+                "NACK 0x02 + close",
+                src,
+                "0x%04X" % self.tester_addr if self.activated else "<not activated>",
+            )
+            await self._send(build_frame(
+                PT_DIAGNOSTIC_NEGATIVE_ACK,
+                struct.pack("!HHB", tgt, src, NACK_INVALID_SOURCE_ADDRESS),
+            ))
+            raise _CloseConnection()
 
         if tgt != self._ecu_addr and not functional:
             logger.warning("Diagnostic Message for unknown target 0x%04X — NACK", tgt)
