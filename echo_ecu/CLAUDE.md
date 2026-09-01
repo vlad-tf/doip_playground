@@ -41,7 +41,33 @@ reference implementation.
 ## Behaviour reference
 
 See the module docstring at the top of `echo_ecu.py` for the full behaviour
-list (Routing Activation → `0x10`, Diagnostic Message → ACK + echo with a
-random 4-byte trailer, Alive Check, Entity Status, Power Mode, UDP
-announcement/identification). `../README.md` §"Echo ECU or TestEcu?" explains
-when to use this vs `test_ecu/`.
+list. Beyond the original plain-echo PoC, this file now also implements:
+
+- **Diagnostic Message dispatch via `_build_uds_response()`**: `22 F1 90`
+  (ReadDataByIdentifier — VIN) returns `62 F1 90` + the 17-byte VIN from
+  `config.doip.vin`, not a plain echo. Any other UDS request gets the
+  original behaviour: `SID | 0x40` (reply bit set) + echoed sub-bytes + 4
+  random trailer bytes. Both responses are still preceded by a Positive ACK
+  (`0x8002`) as before. If you add more supported DIDs, extend
+  `_build_uds_response()`, not the dispatch loop.
+- **Alive Check Response payload**: must be the ECU's 2-byte
+  `ecu_logical_addr` (ISO 13400-2 Table 22), never an empty payload — this
+  was a real Wireshark-caught bug (`Length: 0` instead of `Length: 2`).
+- **`ECUSessionRegistry` / SA-conflict resolution**: mirrors
+  `doip_edgenode/session.py`'s `SessionRegistry` pattern exactly. When a
+  second EdgeNode connection sends a Routing Activation Request for an SA
+  already registered on another socket, the existing `ECUSession` is probed
+  via `probe_alive()` (sends an Alive Check Request, awaits the response)
+  before deciding to deny (`0x03`) or evict + accept (`0x10`). `evict()` is
+  **synchronous** for the same CancelledError-propagation reason documented
+  in `doip_edgenode/CLAUDE.md` — do not change it to `await`
+  `existing._cleanup()`.
+
+These additions are confirmed against `../doip_edgenode_requirements.md` and
+are not scope creep — see "Only touch this file for" above. They do not
+change the frozen DoIP framing constants/helpers that
+`test_ecu/tests/test_doip_parity.py` checks byte-for-byte, so the parity
+guarantee is unaffected.
+
+`../README.md` §"Echo ECU or TestEcu?" explains when to use this vs
+`test_ecu/`.

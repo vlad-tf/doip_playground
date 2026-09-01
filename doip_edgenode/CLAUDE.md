@@ -52,10 +52,14 @@ doip_edgenode/
 │                           # CorruptMiddleware, HeaderFaultMiddleware,
 │                           # TLSFaultMiddleware, ReplayMiddleware
 ├── session.py             # DoIPSession — the connection state machine
-├── ecu_client.py          # ECUConnection — outbound leg to the ECU (IPv6)
+├── session_registry.py    # SessionRegistry — tester_logical_addr → DoIPSession,
+│                           # used for SA-conflict Alive Check probing
+├── ecu_client.py          # ECUConnection — outbound leg to the ECU (IPv6);
+│                           # runs its own background reader task once RA succeeds
 ├── tls_bridge.py          # TLSBridge wrapping Scapy's TLS automatons
 ├── udp_announcer.py       # Vehicle Announcement / Identification
-├── server.py              # DoIPServer: binds sockets, dispatches sessions
+├── server.py              # DoIPServer: binds sockets, dispatches sessions,
+│                           # owns the single shared SessionRegistry instance
 ├── main.py                # CLI entry point
 └── tests/
     ├── mock_ecu.py         # loopback ECU stub for test_session.py
@@ -90,6 +94,91 @@ doip_edgenode/
   `asyncio.IncompleteReadError`, `DoIPProtocolError`, and bare `Exception`
   (log + close). One session's exception must never crash the server.
 
+### Second-connection / SA-conflict handling (ISO 13400-2 §9.3)
+
+A second TCP connection is **not** rejected at the transport level. It is
+accepted, and the conflict is resolved only when its Routing Activation
+Request arrives with a source address (SA) already registered on another
+active session (tracked by `SessionRegistry`, one shared instance owned by
+`DoIPServer` and passed into every `DoIPSession`):
+
+1. Probe the existing session with `await existing.probe_alive(timeout=0.5)` —
+   this sends an Alive Check Request to the *old* tester and awaits its
+   Alive Check Response.
+2. Old session responds (still alive) → deny the new RA with code `0x03`
+   ("SA already registered on different socket").
+3. Old session times out (dead) → call `existing.evict()`, then accept the
+   new RA with `0x10`.
+
+**`evict()` must stay synchronous — never replace it with `await
+existing._cleanup()`.** `_cleanup()` awaits `writer.wait_closed()`; if the old
+session's own inactivity-timeout task is concurrently mid-cleanup and gets
+cancelled, the injected `CancelledError` is a `BaseException` and is not
+caught by `_cleanup()`'s `except Exception: pass` guards — it propagates
+through the awaiting caller (the *new* session's `_handle_routing_activation`)
+and kills the new session instead of the old one. `evict()` only cancels
+timers, closes the writer, and unregisters — all non-blocking — and lets the
+old session's own `run()`/`finally` block finish its own `_cleanup()` in its
+own task context.
+
+This exact pattern (registry + `probe_alive()` + synchronous `evict()`)
+is mirrored in `echo_ecu.py`'s `ECUSessionRegistry`/`ECUSession` for the
+ECU-facing leg — keep them consistent if you change one.
+
+### Background reader in `ecu_client.py`
+
+Once Routing Activation toward the ECU succeeds, `ECUConnection` starts a
+background `asyncio.Task` (`_background_reader`) that continuously reads
+frames from the ECU socket. This exists so the ECU's own unsolicited Alive
+Check Request (sent when *it* is probing this connection for an SA conflict)
+gets answered immediately, without waiting for `DoIPSession` to call
+`recv()`. Everything that isn't an Alive Check Request is placed on
+`_recv_queue` for `recv()` to consume. Do not read directly from
+`self._reader` anywhere except inside `_background_reader` — it will race
+with the background task and drop frames.
+
+### Self-addressed diagnostics (EdgeNode as a pseudo-ECU)
+
+`_handle_diagnostic()` first checks whether `target_address` (read directly
+from raw bytes at offset 10–11 of the DoIP frame — **not** via
+`getattr(pkt, "target_address", None)`, which Scapy's ConditionalField
+returns `None` for even on well-formed frames) equals
+`config.doip.node_logical_addr`. If so, the message is answered locally by
+`_handle_self_diagnostic()` / `_build_uds_response()` and never forwarded to
+the ECU:
+
+- `22 F1 90` (ReadDataByIdentifier — VIN) → `62 F1 90` + the 17-byte VIN from
+  `config.doip.vin`.
+- Any other UDS request → `SID | 0x40` (reply bit set) + echoed sub-bytes +
+  4 random trailer bytes.
+
+Both a Positive ACK (`0x8002`) and the Diagnostic Message response are sent,
+matching real ECU behaviour. This exists purely to let a tester verify DoIP
+connectivity to the EdgeNode itself without a downstream ECU — extend
+`_build_uds_response()` (not `_handle_self_diagnostic()`) if you add more
+supported DIDs/services.
+
+### Two-frame ECU response relay
+
+Real ECUs (and `echo_ecu.py`) send **two** frames per Diagnostic Message:
+Positive ACK (`0x8002`) first, then the actual Diagnostic Message (`0x8001`)
+response. `_handle_diagnostic()` must call `_ecu_conn.recv()` once, relay it,
+then — only if that first frame's payload type was `PT_DIAGNOSTIC_POSITIVE_ACK`
+— call `recv()` again (with a short timeout) for the follow-up response and
+relay that too via the shared `_relay_ecu_frame()` helper. Do not assume a
+single `recv()` is sufficient; a previous bug silently returned the *previous*
+request's queued response instead of the current one because only one `recv()`
+was performed per diagnostic request.
+
+### Alive Check Response payload
+
+Both `_handle_alive_check()` (self.config.doip.node_logical_addr for the
+tester-facing leg) and the ECU-facing Alive Check auto-reply in
+`ecu_client.py`'s background reader must send the **2-byte logical address of
+the responder** as the payload (ISO 13400-2 Table 22) — never an empty
+payload. An empty Alive Check Response payload was a real bug found via
+Wireshark (`Length: 0` where `Length: 2` was expected).
+
 ### Scapy-specific pitfalls
 
 - Build packets via field assignment (`pkt.<field> = value`), never raw byte
@@ -110,6 +199,8 @@ doip_edgenode/
 | Diagnostic message before Routing Activation | Diag Negative ACK `0x8003` code `0x02` | close, log WARNING |
 | TLS handshake failure | (TLS layer sends its own alert) | close, log ERROR, no DoIP message |
 | ECU unreachable | Diag Negative ACK `0x8003` code `0x03` | keep tester session open |
+| RA request SA already active & old session alive | RA Response `0x0006` code `0x03` | keep both — new socket closes, old stays |
+| RA request SA already active & old session dead | RA Response `0x0006` code `0x10` (after evicting old) | old session's own cleanup runs; new session activates |
 | Unhandled exception in session | — | log CRITICAL with traceback, close, server keeps accepting |
 
 ### Logging levels
@@ -127,6 +218,13 @@ failures · `CRITICAL` unhandled exceptions.
 - `inject_on_nth` < 1 · `announce_count` < 1
 - routing entry referencing an interface not present in `network.*_interface`
 
+`node_logical_addr` (EdgeNode's own logical address) is optional and
+defaults to `0x0000` if absent — it is used both in UDP Vehicle Announcements
+and as the source address in Routing Activation Responses / Alive Check
+Responses / self-diagnostic replies. If a Wireshark capture shows `0x0000`
+as the EdgeNode's source address where a distinct address was expected,
+check this config value before assuming a code bug.
+
 ---
 
 ## What you must not do
@@ -142,6 +240,16 @@ failures · `CRITICAL` unhandled exceptions.
   session.
 - Do not use `threading.Thread` directly for TLS automatons — go through
   `TLSBridge`.
+- Do not replace `evict()` with an `await`ed call to the target session's
+  `_cleanup()` — see the CancelledError propagation note above; it silently
+  kills the wrong session.
+- Do not read from `ECUConnection._reader` anywhere except
+  `_background_reader` — it will race with the background task's read loop.
+- Do not read `source_address`/`target_address` off a dissected DoIP packet
+  via `getattr(pkt, ...)` and trust `None` as "field absent" — Scapy's
+  ConditionalFields can return `None` on valid frames. Read the 2-byte
+  addresses directly from `bytes(pkt)` at their fixed offsets (8–9 and
+  10–11) instead.
 - Do not implement real TLS fault injection logic; `TLSFaultMiddleware` is a
   placeholder that logs and passes through by design.
 - Do not build a REST API or web UI for this component.
