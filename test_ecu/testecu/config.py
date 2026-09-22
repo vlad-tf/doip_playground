@@ -133,6 +133,14 @@ class DoipConfig:
     #: (ISO 13400-2 Table 13). A source address outside this range is denied
     #: with response code 0x00 ("unknown source address").
     tester_addr_range: tuple = TESTER_ADDR_RANGE
+    #: Initial inactivity timer (ISO 13400-2 Table 38, T_TCP_Initial_Inactivity):
+    #: how long a freshly connected socket may sit unregistered (no valid Routing
+    #: Activation) before the ECU closes it.  Default 2 s per spec.
+    initial_inactivity_ms: int = 2000
+    #: General inactivity timer (ISO 13400-2 Table 38, T_TCP_General_Inactivity):
+    #: how long a registered socket may be idle (no data either way) before the
+    #: ECU closes it.  Reset on any traffic.  Default 5 min per spec.
+    general_inactivity_ms: int = 300000
 
 
 @dataclass
@@ -271,6 +279,10 @@ def _load_doip(raw: dict) -> DoipConfig:
         vin=_to_str(section.get("vin", "00000000000000000"), "doip.vin"),
         eid=_to_str(section.get("eid", "000000000000"), "doip.eid"),
         gid=_to_str(section.get("gid", "000000000000"), "doip.gid"),
+        initial_inactivity_ms=_to_int(section.get("initial_inactivity_ms", 2000),
+                                      "doip.initial_inactivity_ms"),
+        general_inactivity_ms=_to_int(section.get("general_inactivity_ms", 300000),
+                                      "doip.general_inactivity_ms"),
     )
     # Fail at startup rather than when the first announcement is built.
     _to_hex_bytes(cfg.eid, "doip.eid")

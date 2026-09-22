@@ -17,9 +17,11 @@ The DoIP connection state machine.
 
 Ported from ``echo_ecu.ECUSession``: routing activation (including the ISO
 13400-2 §9.3 source-address conflict resolution and alive probe), alive check,
-entity status, and power mode are unchanged.  The one difference is
-``_handle_diagnostic``, which now hands the UDS bytes to the dispatcher instead
-of building a canned echo.
+entity status, and power mode are unchanged.  Two differences from the port:
+``_handle_diagnostic`` hands the UDS bytes to the dispatcher instead of
+building a canned echo, and this class also runs the ISO 13400-2 §7.2.2/§7.2.3
+initial/general inactivity timers (see ``_supervise``), which ``echo_ecu``
+does not implement.
 """
 
 from __future__ import annotations
@@ -134,12 +136,34 @@ class EcuSession:
         self._alive_probe_pending: bool = False
         self._alive_probe_event: Optional[asyncio.Event] = None
 
+        # -------- Inactivity timers (ISO 13400-2 §7.2.2 / §7.2.3) --------
+        # The initial inactivity timer runs from connection to Routing
+        # Activation; the general inactivity timer runs from Routing Activation
+        # to shutdown and is reset by every byte sent or received.  A monotonic
+        # deadline per timer, watched by one supervisor task, is enough — no
+        # need to constantly reset OS timers on each packet.
+        self._loop_ref = asyncio.get_running_loop()
+        self._initial_timeout = config.doip.initial_inactivity_ms / 1000.0
+        self._general_timeout = config.doip.general_inactivity_ms / 1000.0
+        self._initial_deadline: Optional[float] = None
+        self._general_deadline: Optional[float] = None
+        self._kick_event = asyncio.Event()
+        self._supervisor: Optional[asyncio.Task] = None
+        self._finalized: bool = False
+        self._finalize_reason: Optional[str] = None
+
     # -----------------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------------
 
     async def run(self) -> None:
         logger.info("New connection from %s", self._peer)
+        # DoIP-083/-084: start the initial inactivity timer on "established".
+        # A timeout of 0 means "disabled" (config.yaml's documented escape
+        # hatch) — leave the deadline unset rather than firing immediately.
+        if self._initial_timeout > 0:
+            self._initial_deadline = self._loop_ref.time() + self._initial_timeout
+        self._supervisor = asyncio.ensure_future(self._supervise())
         try:
             await self._loop()
         except asyncio.IncompleteReadError:
@@ -149,6 +173,14 @@ class EcuSession:
         except Exception:
             logger.exception("Unhandled error for %s", self._peer)
         finally:
+            self._finalized = True
+            if self._supervisor is not None and not self._supervisor.done():
+                self._supervisor.cancel()
+                try:
+                    await self._supervisor
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._supervisor = None
             self.state.close()
             try:
                 self._writer.close()
@@ -167,6 +199,10 @@ class EcuSession:
         propagates CancelledError into the wrong context.  ``run()``'s finally
         block cleans up the rest in its own task.
         """
+        self._finalized = True
+        if self._supervisor is not None and not self._supervisor.done():
+            self._supervisor.cancel()
+            self._supervisor = None
         self.state.close()
         try:
             self._writer.close()
@@ -177,8 +213,79 @@ class EcuSession:
         logger.info("Evicted session for %s", self._peer)
 
     async def _send(self, raw: bytes) -> None:
+        # DoIP-080: any traffic on a registered socket resets the general timer.
+        self._bump_general()
         self._writer.write(raw)
         await self._writer.drain()
+
+    # -----------------------------------------------------------------------
+    # Inactivity supervision (§7.2.2, §7.2.3)
+    # -----------------------------------------------------------------------
+
+    def _bump_general(self) -> None:
+        """Reset the general inactivity timer (any data sent or received)."""
+        if self.activated and not self._finalized and self._general_timeout > 0:
+            self._general_deadline = self._loop_ref.time() + self._general_timeout
+
+    def _kick(self) -> None:
+        """Wake the supervisor so it recomputes against a changed deadline."""
+        if not self._finalized:
+            self._kick_event.set()
+
+    def _arm_general(self) -> None:
+        """Calls after successful Routing Activation (DoIP-128): initial timer
+        stops, general timer starts from now.
+
+        A general timeout of 0 means "disabled" — leave the deadline unset
+        rather than arming one that elapses immediately.
+        """
+        self._initial_deadline = None
+        if self._general_timeout > 0:
+            self._general_deadline = self._loop_ref.time() + self._general_timeout
+        self._kick()
+
+    def _finalize(self, reason: str) -> None:
+        """DoIP-132/-133: timer elapsed → tear this connection down.  Closing the
+        writer unblocks ``_loop()``'s read, so ``run()``'s ``finally`` does the
+        rest of the cleanup."""
+        if self._finalized:
+            return
+        self._finalized = True
+        self._finalize_reason = reason
+        logger.info("Finalizing %s: %s", self._peer, reason)
+        try:
+            self._writer.close()
+        except Exception:
+            pass
+
+    async def _supervise(self) -> None:
+        """Watch the initial and general inactivity deadlines until one elapses."""
+        while not self._finalized:
+            now = self._loop_ref.time()
+            deadlines = [d for d in (self._initial_deadline, self._general_deadline)
+                         if d is not None]
+            if not deadlines:
+                # Nothing armed (not yet started); wait for a kick.
+                self._kick_event.clear()
+                await self._kick_event.wait()
+                continue
+            delay = max(0.0, min(deadlines) - now)
+            self._kick_event.clear()
+            try:
+                await asyncio.wait_for(self._kick_event.wait(), timeout=delay)
+                continue  # kicked — a deadline changed, recompute
+            except asyncio.TimeoutError:
+                pass
+            if self._finalized:
+                return
+            if self._initial_deadline is not None \
+                    and self._loop_ref.time() >= self._initial_deadline:
+                self._finalize("initial inactivity timeout (T_TCP_Initial_Inactivity)")
+                return
+            if self._general_deadline is not None \
+                    and self._loop_ref.time() >= self._general_deadline:
+                self._finalize("general inactivity timeout (T_TCP_General_Inactivity)")
+                return
 
     # -----------------------------------------------------------------------
     # Frame loop
@@ -189,6 +296,10 @@ class EcuSession:
             raw = await read_frame(self._reader)
             pt = frame_ptype(raw)
             pload = frame_payload(raw)
+
+            # DoIP-080: any received data on a registered socket resets the
+            # general inactivity timer.
+            self._bump_general()
 
             logger.debug(
                 "RX %-40s  %3d bytes  from %s",
@@ -337,6 +448,10 @@ class EcuSession:
 
         if self._registry is not None:
             self._registry.register(src_addr, self)
+
+        # DoIP-128: routing activation accepted — stop the initial inactivity
+        # timer and start the general inactivity timer for this connection.
+        self._arm_general()
 
         await self._send(build_frame(
             PT_ROUTING_ACT_RESPONSE, self._activation_response(src_addr, 0x10),

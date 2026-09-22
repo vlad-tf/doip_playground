@@ -315,3 +315,48 @@ class TestSuppressionOverTheWire:
             return True
 
         assert run(with_server(scenario))
+
+
+class TestInactivityTimers:
+    """ISO 13400-2 §7.2.2 / §7.2.3: initial and general inactivity timers."""
+    TIMERS = {"doip": {"initial_inactivity_ms": 150, "general_inactivity_ms": 250}}
+
+    def test_unregistered_socket_closed_by_initial_timer(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            # No Routing Activation — the initial inactivity timer closes it.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError)):
+                await client.recv(timeout=2.0)
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=self.TIMERS))
+
+    def test_registered_idle_socket_closed_by_general_timer(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate()
+            assert payload[4] == 0x10
+            # Registered but idle — the general inactivity timer closes it.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError)):
+                await client.recv(timeout=2.0)
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=self.TIMERS))
+
+    def test_traffic_resets_the_general_timer(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            # Stay active far beyond the 250 ms general timer by pinging every
+            # 100 ms — each exchange must push the deadline forward, and the
+            # connection must never be closed underneath us.
+            for _ in range(4):
+                await client.diagnostic(b"\x3E\x00")
+                await asyncio.sleep(0.1)
+            assert True
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=self.TIMERS))
