@@ -140,6 +140,10 @@ class UdpConfig:
     enabled: bool = True
     announce_count: int = 3
     announce_interval_ms: int = 500
+    #: Upper bound (ms) of the random A_DoIP_Announce_Wait delay (ISO 13400-2
+    #: Table 38: random 0…500 ms) before answering a Vehicle Identification
+    #: Request.  Set to 0 to disable the delay (e.g. for deterministic tests).
+    announce_wait_ms: int = 500
 
 
 @dataclass
@@ -299,6 +303,8 @@ def _load_udp(raw: dict) -> UdpConfig:
         announce_count=_to_int(section.get("announce_count", 3), "udp.announce_count"),
         announce_interval_ms=_to_int(section.get("announce_interval_ms", 500),
                                      "udp.announce_interval_ms"),
+        announce_wait_ms=_to_int(section.get("announce_wait_ms", 500),
+                                 "udp.announce_wait_ms"),
     )
 
 

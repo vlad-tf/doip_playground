@@ -15,27 +15,32 @@
 """
 ``_UDPProtocol.datagram_received`` against a fake transport.
 
-No real socket needed: ``datagram_received`` is plain synchronous code, so a
-stand-in transport that just records ``sendto()`` calls is enough — same
-spirit as ``conftest.Probe`` avoiding real sockets for dispatcher tests.
+No real socket needed: ``datagram_received`` dispatches to a stand-in transport
+that just records ``sendto()`` calls — same spirit as ``conftest.Probe``
+avoiding real sockets for dispatcher tests.  Vehicle Identification responses
+are scheduled (A_DoIP_Announce_Wait, ISO 13400-2 DoIP-051), so those tests are
+driven through ``run()``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import struct
 
-from conftest import BASE_CONFIG, merge
+from conftest import BASE_CONFIG, merge, run
 from testecu.config import parse_config
 from testecu.doip import (
     PT_ENTITY_STATUS_REQUEST,
     PT_ENTITY_STATUS_RESPONSE,
     PT_VEHICLE_ID_REQUEST,
+    PT_VEHICLE_ID_REQUEST_WITH_EID,
+    PT_VEHICLE_ID_REQUEST_WITH_VIN,
     PT_VEHICLE_ID_RESPONSE,
     build_frame,
     payload as frame_payload,
     ptype as frame_ptype,
 )
-from testecu.udp import _UDPProtocol
+from testecu.udp import _UDPProtocol, _stagger_delay_ms
 
 
 class _FakeTransport:
@@ -46,8 +51,8 @@ class _FakeTransport:
         self.sent.append((data, addr))
 
 
-def _protocol() -> tuple:
-    config = parse_config(merge(BASE_CONFIG, {}))
+def _protocol(extra=None) -> tuple:
+    config = parse_config(merge(BASE_CONFIG, extra or {}))
     protocol = _UDPProtocol(config, if_index=0)
     transport = _FakeTransport()
     protocol.connection_made(transport)
@@ -72,13 +77,92 @@ def test_entity_status_request_gets_a_response():
 
 
 def test_vehicle_id_request_still_works():
-    protocol, transport = _protocol()
-    protocol.datagram_received(build_frame(PT_VEHICLE_ID_REQUEST, b""), ADDR)
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
 
-    assert len(transport.sent) == 1
-    raw, addr = transport.sent[0]
-    assert addr == ADDR
-    assert frame_ptype(raw) == PT_VEHICLE_ID_RESPONSE
+    async def scenario():
+        protocol.datagram_received(build_frame(PT_VEHICLE_ID_REQUEST, b""), ADDR)
+        await asyncio.sleep(0)
+        assert len(transport.sent) == 1
+        raw, addr = transport.sent[0]
+        assert addr == ADDR
+        assert frame_ptype(raw) == PT_VEHICLE_ID_RESPONSE
+
+    run(scenario())
+
+
+def test_identification_response_is_delayed_by_announce_wait():
+    # ISO 13400-2 DoIP-051: the response is withheld for an A_DoIP_Announce_Wait
+    # (0..announce_wait_ms) to avoid UDP bursts.  TestEcu derives that delay
+    # deterministically from the requester, so the test can assert on the exact
+    # value rather than just "some delay happened".
+    wait_ms = 100
+    delay_ms = _stagger_delay_ms(ADDR, wait_ms)
+    assert 0 < delay_ms < wait_ms
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": wait_ms}})
+
+    async def scenario():
+        protocol.datagram_received(build_frame(PT_VEHICLE_ID_REQUEST, b""), ADDR)
+        await asyncio.sleep(0)
+        assert transport.sent == []                 # still inside the delay window
+        await asyncio.sleep((delay_ms + 5) / 1000.0)
+        assert len(transport.sent) == 1
+        assert frame_ptype(transport.sent[0][0]) == PT_VEHICLE_ID_RESPONSE
+
+    run(scenario())
+
+
+def test_eid_request_matching_responds():
+    # DoIP-053: answer a "VIR with EID" only when the requested EID matches.
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+
+    async def scenario():
+        protocol.datagram_received(
+            build_frame(PT_VEHICLE_ID_REQUEST_WITH_EID,
+                        bytes.fromhex("AABBCCDDEEFF")), ADDR)
+        await asyncio.sleep(0)
+        assert len(transport.sent) == 1
+        assert frame_ptype(transport.sent[0][0]) == PT_VEHICLE_ID_RESPONSE
+
+    run(scenario())
+
+
+def test_eid_request_not_matching_is_ignored():
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+
+    async def scenario():
+        protocol.datagram_received(
+            build_frame(PT_VEHICLE_ID_REQUEST_WITH_EID,
+                        bytes.fromhex("000000000000")), ADDR)
+        await asyncio.sleep(0)
+        assert transport.sent == []
+
+    run(scenario())
+
+
+def test_vin_request_matching_responds():
+    # DoIP-052: answer a "VIR with VIN" only when the requested VIN matches.
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+
+    async def scenario():
+        protocol.datagram_received(
+            build_frame(PT_VEHICLE_ID_REQUEST_WITH_VIN, b"1HGBH41JXMN109186"), ADDR)
+        await asyncio.sleep(0)
+        assert len(transport.sent) == 1
+        assert frame_ptype(transport.sent[0][0]) == PT_VEHICLE_ID_RESPONSE
+
+    run(scenario())
+
+
+def test_vin_request_not_matching_is_ignored():
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+
+    async def scenario():
+        protocol.datagram_received(
+            build_frame(PT_VEHICLE_ID_REQUEST_WITH_VIN, b"0" * 17), ADDR)
+        await asyncio.sleep(0)
+        assert transport.sent == []
+
+    run(scenario())
 
 
 def test_unknown_payload_type_is_ignored():

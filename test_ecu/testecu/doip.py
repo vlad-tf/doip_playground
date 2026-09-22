@@ -43,36 +43,40 @@ ACCEPTED_VERSIONS = (0x02, 0x03)
 # Payload types
 # ---------------------------------------------------------------------------
 
-PT_HEADER_NACK              = 0x0000
-PT_VEHICLE_ID_REQUEST       = 0x0001
-PT_VEHICLE_ID_RESPONSE      = 0x0004
-PT_ROUTING_ACT_REQUEST      = 0x0005
-PT_ROUTING_ACT_RESPONSE     = 0x0006
-PT_ALIVE_CHECK_REQUEST      = 0x0007
-PT_ALIVE_CHECK_RESPONSE     = 0x0008
-PT_ENTITY_STATUS_REQUEST    = 0x4001
-PT_ENTITY_STATUS_RESPONSE   = 0x4002
-PT_POWER_MODE_REQUEST       = 0x4003
-PT_POWER_MODE_RESPONSE      = 0x4004
-PT_DIAGNOSTIC_MESSAGE       = 0x8001
-PT_DIAGNOSTIC_POSITIVE_ACK  = 0x8002
-PT_DIAGNOSTIC_NEGATIVE_ACK  = 0x8003
+PT_HEADER_NACK                   = 0x0000
+PT_VEHICLE_ID_REQUEST            = 0x0001
+PT_VEHICLE_ID_REQUEST_WITH_EID   = 0x0002
+PT_VEHICLE_ID_REQUEST_WITH_VIN   = 0x0003
+PT_VEHICLE_ID_RESPONSE           = 0x0004
+PT_ROUTING_ACT_REQUEST           = 0x0005
+PT_ROUTING_ACT_RESPONSE          = 0x0006
+PT_ALIVE_CHECK_REQUEST           = 0x0007
+PT_ALIVE_CHECK_RESPONSE          = 0x0008
+PT_ENTITY_STATUS_REQUEST         = 0x4001
+PT_ENTITY_STATUS_RESPONSE        = 0x4002
+PT_POWER_MODE_REQUEST            = 0x4003
+PT_POWER_MODE_RESPONSE           = 0x4004
+PT_DIAGNOSTIC_MESSAGE            = 0x8001
+PT_DIAGNOSTIC_POSITIVE_ACK       = 0x8002
+PT_DIAGNOSTIC_NEGATIVE_ACK       = 0x8003
 
 PTYPE_NAMES = {
-    PT_HEADER_NACK:             "Header NACK",
-    PT_VEHICLE_ID_REQUEST:      "Vehicle Identification Request",
-    PT_VEHICLE_ID_RESPONSE:     "Vehicle Identification Response",
-    PT_ROUTING_ACT_REQUEST:     "Routing Activation Request",
-    PT_ROUTING_ACT_RESPONSE:    "Routing Activation Response",
-    PT_ALIVE_CHECK_REQUEST:     "Alive Check Request",
-    PT_ALIVE_CHECK_RESPONSE:    "Alive Check Response",
-    PT_ENTITY_STATUS_REQUEST:   "Entity Status Request",
-    PT_ENTITY_STATUS_RESPONSE:  "Entity Status Response",
-    PT_POWER_MODE_REQUEST:      "Power Mode Info Request",
-    PT_POWER_MODE_RESPONSE:     "Power Mode Info Response",
-    PT_DIAGNOSTIC_MESSAGE:      "Diagnostic Message",
-    PT_DIAGNOSTIC_POSITIVE_ACK: "Diagnostic Message Positive ACK",
-    PT_DIAGNOSTIC_NEGATIVE_ACK: "Diagnostic Message Negative ACK",
+    PT_HEADER_NACK:                 "Header NACK",
+    PT_VEHICLE_ID_REQUEST:          "Vehicle Identification Request",
+    PT_VEHICLE_ID_REQUEST_WITH_EID: "Vehicle Identification Request with EID",
+    PT_VEHICLE_ID_REQUEST_WITH_VIN: "Vehicle Identification Request with VIN",
+    PT_VEHICLE_ID_RESPONSE:         "Vehicle Identification Response",
+    PT_ROUTING_ACT_REQUEST:         "Routing Activation Request",
+    PT_ROUTING_ACT_RESPONSE:        "Routing Activation Response",
+    PT_ALIVE_CHECK_REQUEST:         "Alive Check Request",
+    PT_ALIVE_CHECK_RESPONSE:        "Alive Check Response",
+    PT_ENTITY_STATUS_REQUEST:       "Entity Status Request",
+    PT_ENTITY_STATUS_RESPONSE:      "Entity Status Response",
+    PT_POWER_MODE_REQUEST:          "Power Mode Info Request",
+    PT_POWER_MODE_RESPONSE:         "Power Mode Info Response",
+    PT_DIAGNOSTIC_MESSAGE:          "Diagnostic Message",
+    PT_DIAGNOSTIC_POSITIVE_ACK:     "Diagnostic Message Positive ACK",
+    PT_DIAGNOSTIC_NEGATIVE_ACK:     "Diagnostic Message Negative ACK",
 }
 
 # Diagnostic Message negative acknowledge codes (ISO 13400-2 Table 26).

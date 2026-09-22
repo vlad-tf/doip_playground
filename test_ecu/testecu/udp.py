@@ -35,11 +35,35 @@ from testecu.doip import (
     PT_ENTITY_STATUS_REQUEST,
     PT_ENTITY_STATUS_RESPONSE,
     PT_VEHICLE_ID_REQUEST,
+    PT_VEHICLE_ID_REQUEST_WITH_EID,
+    PT_VEHICLE_ID_REQUEST_WITH_VIN,
     PT_VEHICLE_ID_RESPONSE,
     build_frame,
 )
 
 logger = logging.getLogger("testecu.udp")
+
+
+def _stagger_delay_ms(addr: tuple, max_ms: int) -> int:
+    """
+    Deterministic A_DoIP_Announce_Wait in ``0..max_ms``, derived from the peer.
+
+    ISO 13400-2 DoIP-051 wants a *random* 0..500 ms delay so simultaneous DoIP
+    entities don't burst.  TestEcu deliberately substitutes a stable per-request
+    hash of the requester instead: different peers get different delays (same
+    anti-burst effect) but the same peer always gets the same delay, so a test
+    can still assert on the behaviour.  ``max_ms <= 0`` means "respond now".
+    """
+    if max_ms <= 0:
+        return 0
+    seed = 0
+    for part in addr:
+        if isinstance(part, str):
+            for byte in part.encode("utf-8", "ignore"):
+                seed = (seed * 31 + byte) & 0xFFFFFFFF
+        elif isinstance(part, int):
+            seed = (seed * 31 + part) & 0xFFFFFFFF
+    return seed % (max_ms + 1)
 
 
 def build_announcement_payload(config: EcuConfig) -> bytes:
@@ -77,6 +101,13 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         self._node_type = config.doip.node_type
         self._max_data = config.doip.max_payload_bytes
         self._transport: Optional[asyncio.DatagramTransport] = None
+        #: Entity identification used to match 0x0002 (VIR with EID) requests.
+        self._eid = bytes.fromhex(config.doip.eid)
+        #: VIN (17 bytes, zero-padded) used to match 0x0003 (VIR with VIN).
+        self._vin = config.doip.vin.encode("ascii")[:17].ljust(17, b"\x00")
+        self._announce_wait_ms = config.udp.announce_wait_ms
+        #: Held refs to in-flight delayed responses so the event loop reaches them.
+        self._tasks: set = set()
 
     def connection_made(self, transport) -> None:  # type: ignore[override]
         self._transport = transport
@@ -85,12 +116,6 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         if len(data) < 8:
             return
         pt = struct.unpack("!H", data[2:4])[0]
-        if pt == PT_VEHICLE_ID_REQUEST:
-            logger.debug("UDP: Vehicle Identification Request from %s", addr)
-            if self._transport:
-                self._transport.sendto(build_frame(PT_VEHICLE_ID_RESPONSE, self._payload), addr)
-                logger.debug("UDP: sent Vehicle Identification Response to %s", addr)
-            return
         if pt == PT_ENTITY_STATUS_REQUEST:
             logger.debug("UDP: Entity Status Request from %s", addr)
             if self._transport:
@@ -98,6 +123,52 @@ class _UDPProtocol(asyncio.DatagramProtocol):
                                                     self._entity_status_payload()), addr)
                 logger.debug("UDP: sent Entity Status Response to %s", addr)
             return
+        if pt in (PT_VEHICLE_ID_REQUEST,
+                  PT_VEHICLE_ID_REQUEST_WITH_EID,
+                  PT_VEHICLE_ID_REQUEST_WITH_VIN):
+            # ISO 13400-2 Figure 8: a VIN/EID-parameterised request is only
+            # answered if the requested VIN/EID matches this entity.
+            req = data[8:]
+            if not self._matches(req, pt):
+                logger.debug("UDP: Vehicle Identification Request (pt=0x%04X) "
+                             "does not match from %s", pt, addr)
+                return
+            logger.debug("UDP: Vehicle Identification Request (pt=0x%04X) from %s",
+                         pt, addr)
+            self._schedule_identification_response(addr)
+            return
+
+    def _matches(self, req: bytes, pt: int) -> bool:
+        """DoIP-051/-052/-053: does this identification request target this entity?"""
+        if pt == PT_VEHICLE_ID_REQUEST:
+            return True
+        if pt == PT_VEHICLE_ID_REQUEST_WITH_EID:
+            return len(req) >= 6 and req[:6] == self._eid
+        if pt == PT_VEHICLE_ID_REQUEST_WITH_VIN:
+            return len(req) >= 17 and req[:17] == self._vin
+        return False
+
+    def _schedule_identification_response(self, addr: tuple) -> None:
+        """Send the identification response after a deferred A_DoIP_Announce_Wait."""
+        if self._transport is None:
+            return
+        delay = _stagger_delay_ms(addr, self._announce_wait_ms) / 1000.0
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(self._send_identification_after(delay, addr))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _send_identification_after(self, delay: float, addr: tuple) -> None:
+        # ISO 13400-2 DoIP-051: the delay avoids UDP packet bursts when many
+        # DoIP entities share the network and all answer one broadcast request.
+        # TestEcu derives the delay deterministically from the requester (see
+        # _stagger_delay_ms) rather than at random, so behaviour stays
+        # assertable — a documented deviation from the ISO's random 0..500 ms.
+        if delay:
+            await asyncio.sleep(delay)
+        if self._transport:
+            self._transport.sendto(build_frame(PT_VEHICLE_ID_RESPONSE, self._payload), addr)
+            logger.debug("UDP: sent Vehicle Identification Response to %s", addr)
 
     def _entity_status_payload(self) -> bytes:
         """Entity Status Response (0x4002), 7 bytes: node type, max/open sockets, max data.
