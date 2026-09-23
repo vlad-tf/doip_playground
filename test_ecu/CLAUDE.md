@@ -70,6 +70,12 @@ internal module.
   (`logging.getLogger("testecu.dispatcher")`, `"testecu.core"`, ...), not
   `__name__` — follow the existing per-module logger name, don't invent a
   new naming scheme.
+- ISO 13400-2 citations (common throughout `doip.py`/`session.py`/`udp.py`):
+  clause/table number + `DoIP-yyy` ReqID + a one-line paraphrase in your own
+  words, e.g. `# ISO 13400-2 Table 31 code 0x02: ...`. See `../CLAUDE.md`'s
+  "Citing the DoIP spec" section for the full rule — this is the style
+  already used everywhere in this component, and the reason: requirement IDs
+  and paraphrases aren't copyrightable, the standard's own sentences are.
 
 ### The dispatcher precedence ladder — do not reorder without reading `dispatcher.py`'s module docstring
 

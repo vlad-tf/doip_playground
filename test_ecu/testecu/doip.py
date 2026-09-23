@@ -91,7 +91,8 @@ NACK_TRANSPORT_PROTOCOL_ERROR = 0x08
 
 # Tester (client) logical address range accepted by Routing Activation
 # (ISO 13400-2 Table 13). A source address outside this range is denied with
-# Routing Activation Response code 0x00 ("denied — unknown source address").
+# Routing Activation Response code 0x00 (an unrecognised/unknown source
+# address).
 TESTER_ADDR_RANGE = (0x0E00, 0x0FFF)
 
 # Minimum Routing Activation Request payload length (ISO 13400-2 Table 15):

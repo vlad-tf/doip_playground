@@ -638,8 +638,8 @@ class DoIPSession:
 
         if self._ecu_conn is None:
             # ECU unreachable
-            # ISO 13400-2 Table 26: 0x06 = "target unreachable" (0x03 is
-            # "unknown target address" — a different failure mode).
+            # ISO 13400-2 Table 26: code 0x06 covers a target that cannot be
+            # reached at all, distinct from 0x03 (target address not recognised).
             await self._send_diag_nack(0x06)  # target unreachable
             return
 

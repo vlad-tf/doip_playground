@@ -17,14 +17,14 @@ DoIP EdgeNode — Session Registry.
 
 Tracks active DoIPSessions by tester logical address.
 
-Used to enforce ISO 13400-2 §9.3 (Routing Activation):
-  When a new Routing Activation Request arrives with a source address (SA)
-  that is already registered on a different socket, the DoIP server MUST
-  send an Alive Check Request to the existing connection before deciding
-  whether to accept or deny the new one.
+Used to enforce the ISO 13400-2 §9.3 Routing Activation conflict-resolution
+rule: when a new Routing Activation Request arrives with a source address
+(SA) that is already registered on a different socket, this server probes
+the existing connection with an Alive Check Request before deciding whether
+to accept or deny the new one.
 
-  - Old connection responds   → deny new with response code 0x03
-                                ("SA already registered on different socket")
+  - Old connection responds   → deny new with response code 0x03 (SA already
+                                registered on a different socket)
   - Old connection times out  → evict old, accept new with response code 0x10
 
 All access is from the asyncio event loop; no locking is needed.

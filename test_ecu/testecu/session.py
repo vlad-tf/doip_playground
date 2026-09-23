@@ -99,13 +99,16 @@ class SessionRegistry:
 
 
 class _CloseConnection(Exception):
-    """Internal control flow: send the pending NACK, then tear the socket down.
+    """Internal control flow: send the pending NACK/denial, then tear the
+    socket down.
 
     Raised by handlers that must both emit a frame and close the TCP_DATA
-    connection (ISO 13400-2 Table 31 / DoIP-070: NACK 0x02 "invalid source
-    address" requires the socket to be closed after the NACK is sent).
-    ``_loop`` catches it, logs, and lets ``run()``'s ``finally`` close the
-    writer and unregister the session.
+    connection: a Diagnostic Message with an invalid source address (ISO
+    13400-2 Table 31 / DoIP-070, NACK code 0x02) and any Routing Activation
+    Response that denies rather than accepts (ISO 13400-2 Table 25 — every
+    code other than 0x10/0x11 leaves the requester expected to reconnect, not
+    keep talking on the same socket). ``_loop`` catches it, logs, and lets
+    ``run()``'s ``finally`` close the writer and unregister the session.
     """
 
 
@@ -159,7 +162,8 @@ class EcuSession:
 
     async def run(self) -> None:
         logger.info("New connection from %s", self._peer)
-        # DoIP-083/-084: start the initial inactivity timer on "established".
+        # DoIP-083/-084: start the initial inactivity timer once the TCP
+        # connection is established.
         # A timeout of 0 means "disabled" (config.yaml's documented escape
         # hatch) — leave the deadline unset rather than firing immediately.
         if self._initial_timeout > 0:
@@ -354,7 +358,14 @@ class EcuSession:
                 return
 
             if pt == PT_ROUTING_ACT_REQUEST:
-                await self._handle_routing_activation(pload)
+                try:
+                    await self._handle_routing_activation(pload)
+                except _CloseConnection:
+                    logger.info(
+                        "Closing socket after Routing Activation denial for %s",
+                        self._peer,
+                    )
+                    return
 
             elif pt == PT_DIAGNOSTIC_MESSAGE:
                 try:
@@ -423,8 +434,13 @@ class EcuSession:
 
         ISO 13400-2 Table 15: the fixed payload is source address (2) +
         activation type (1) + reserved (4) = 7 bytes; anything shorter is a
-        malformed frame and must be rejected with Generic NACK 0x04 ("invalid
-        payload length"), not parsed.
+        malformed frame and must be rejected with Generic NACK 0x04 (payload
+        length not valid for this message), not parsed.
+
+        ISO 13400-2 Table 25: every response code other than success (0x10)
+        denies the request, and every denial here closes the TCP_DATA socket
+        (raises ``_CloseConnection``, caught by ``_loop``) rather than leaving
+        it open for a retry on the same connection.
         """
         if len(payload) < ROUTING_ACT_REQUEST_MIN_LEN:
             logger.warning(
@@ -456,6 +472,45 @@ class EcuSession:
                 PT_ROUTING_ACT_RESPONSE,
                 self._activation_response(src_addr, 0x00),
             ))
+            raise _CloseConnection()
+
+        # ISO 13400-2 Table 48 code 0x06: only the default (0x00) and the
+        # OEM-specific/WWH-OBD pass-through (0x01) activation types are
+        # supported — anything else is denied, not silently accepted.
+        if activation_type not in (0x00, 0x01):
+            logger.warning(
+                "Routing Activation with unsupported type=0x%02X from %s — "
+                "denying (0x06)", activation_type, self._peer,
+            )
+            await self._send(build_frame(
+                PT_ROUTING_ACT_RESPONSE,
+                self._activation_response(src_addr, 0x06),
+            ))
+            raise _CloseConnection()
+
+        # ISO 13400-2 Table 48 code 0x02: this socket is already activated for
+        # a different SA, so a Routing Activation Request for a new SA on the
+        # same socket (a "re-bind") is denied rather than silently re-registered.
+        if self.activated and src_addr != self.tester_addr:
+            logger.warning(
+                "Routing Activation re-bind attempt: socket already activated "
+                "for SA=0x%04X, new request is SA=0x%04X — denying (0x02)",
+                self.tester_addr, src_addr,
+            )
+            await self._send(build_frame(
+                PT_ROUTING_ACT_RESPONSE,
+                self._activation_response(src_addr, 0x02),
+            ))
+            raise _CloseConnection()
+
+        # A repeat Routing Activation Request for the already-bound SA is
+        # idempotent — re-confirm success rather than falling through.
+        if self.activated and src_addr == self.tester_addr:
+            logger.debug("Repeat Routing Activation for already-active SA=0x%04X "
+                         "— re-confirming success", src_addr)
+            await self._send(build_frame(
+                PT_ROUTING_ACT_RESPONSE, self._activation_response(src_addr, 0x10),
+            ))
             return
 
         if self._registry is not None:
@@ -474,7 +529,7 @@ class EcuSession:
                         PT_ROUTING_ACT_RESPONSE,
                         self._activation_response(src_addr, 0x03),
                     ))
-                    return
+                    raise _CloseConnection()
                 logger.info("Existing session %s did not respond — evicting it",
                             existing._peer)
                 existing.evict()
@@ -588,9 +643,12 @@ class EcuSession:
             ))
             return
 
-        # 1. Positive ACK
+        # 1. Positive ACK.  ISO 13400-2 Table 28 / DoIP-066: the ack's SA is the
+        # node sending it (this ECU) and its TA is the requesting tester — the
+        # same swap the Diagnostic Message response below uses, not the
+        # request's own SA/TA order.
         await self._send(build_frame(PT_DIAGNOSTIC_POSITIVE_ACK,
-                                     struct.pack("!HHB", src, tgt, 0x00)))
+                                     struct.pack("!HHB", tgt, src, 0x00)))
         logger.debug("Sent Positive ACK to %s", self._peer)
 
         # 2. UDS response, with src/tgt swapped

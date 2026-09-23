@@ -112,7 +112,8 @@ def test_identification_response_is_delayed_by_announce_wait():
 
 
 def test_eid_request_matching_responds():
-    # DoIP-053: answer a "VIR with EID" only when the requested EID matches.
+    # DoIP-053: answer a Vehicle Identification Request with EID only when
+    # the requested EID matches.
     protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
 
     async def scenario():
@@ -140,7 +141,8 @@ def test_eid_request_not_matching_is_ignored():
 
 
 def test_vin_request_matching_responds():
-    # DoIP-052: answer a "VIR with VIN" only when the requested VIN matches.
+    # DoIP-052: answer a Vehicle Identification Request with VIN only when
+    # the requested VIN matches.
     protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
 
     async def scenario():

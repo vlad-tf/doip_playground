@@ -100,3 +100,22 @@ that have one (e.g. `test_ecu/main.py` puts `#!/usr/bin/env python3` above
 even that). Add this header, verbatim, to every new `.py` file you create in
 any of the four components. This is a repo-wide rule, not a per-component
 one — none of the per-component `CLAUDE.md` files repeat it.
+
+## Citing the DoIP spec (ISO 13400-2) — applies to all four components
+
+ISO 13400-2 is a purchased standard, not public domain. When a comment,
+docstring, or review doc references it:
+
+- Cite the clause/table number and, where one exists, the `DoIP-yyy`
+  requirement ID, then describe the rule **in your own words** — e.g. "ISO
+  13400-2 Table 28 / DoIP-066: the Positive ACK's SA/TA are from the ECU's
+  perspective (SA=ECU, TA=tester), not an echo of the request's SA/TA."
+  Requirement IDs, clause numbers, and a paraphrase of what a rule requires
+  are not copyrightable; the standard's own sentences and table text are.
+- Never paste the standard's actual sentences, table layouts, or figure
+  captions into anything that gets committed — code comments, docstrings, or
+  review/methodology docs alike.
+- Do not add the spec PDF (or any full/partial text extracted from it, e.g.
+  via `pypdf`) to this repo or its git history. If a review needs the
+  extracted text to grep requirement IDs, keep it outside the repo (`/tmp` or
+  similar) — never write it to a tracked file.

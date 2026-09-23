@@ -131,7 +131,7 @@ class DoipConfig:
     gid: str = "000000000000"
     #: Accepted tester (client) logical address range for Routing Activation
     #: (ISO 13400-2 Table 13). A source address outside this range is denied
-    #: with response code 0x00 ("unknown source address").
+    #: with response code 0x00 (an unrecognised source address).
     tester_addr_range: tuple = TESTER_ADDR_RANGE
     #: Initial inactivity timer (ISO 13400-2 Table 38, T_TCP_Initial_Inactivity):
     #: how long a freshly connected socket may sit unregistered (no valid Routing

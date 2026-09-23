@@ -118,6 +118,10 @@ class TestLifecycle:
             ptype, payload = await client.diagnostic(b"\x22\xF1\x90")
             assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
             assert payload[4] == 0x00
+            # ISO 13400-2 Table 28 / DoIP-066: the ACK's SA is the ECU that
+            # sends it, TA is the requesting tester — swapped vs the request.
+            assert struct.unpack("!H", payload[0:2])[0] == ECU_ADDR
+            assert struct.unpack("!H", payload[2:4])[0] == TESTER_ADDR
 
             ptype, payload = await client.recv()
             assert ptype == PT_DIAGNOSTIC_MESSAGE
@@ -204,6 +208,11 @@ class TestLifecycle:
             ptype, payload = await client.activate(tester=0x0BAD)
             assert ptype == PT_ROUTING_ACT_RESPONSE
             assert payload[4] == 0x00                        # unknown source address
+            # ISO 13400-2 Table 25: a denial (any code but 0x10/0x11) closes
+            # the socket — the client is expected to reconnect, not retry here.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await client.recv(timeout=1.0)
             await client.close()
             return True
 
@@ -244,6 +253,65 @@ class TestLifecycle:
             ptype, payload = await client.recv()
             assert ptype == PT_HEADER_NACK
             assert payload == b"\x01"
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+
+class TestRoutingActivationValidation:
+    def test_rebind_to_different_sa_is_denied(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate(tester=TESTER_ADDR)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+
+            # ISO 13400-2 Table 48 code 0x02: a second Routing Activation for a
+            # *different* SA on the same socket must be denied, not re-bound.
+            ptype, payload = await client.activate(tester=TESTER_ADDR + 1)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x02
+            # A re-bind denial closes the socket too (Table 25) — the tester
+            # is expected to reconnect with the correct SA, not keep talking.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await client.recv(timeout=1.0)
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_rebind_to_same_sa_stays_active(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate(tester=TESTER_ADDR)
+            assert payload[4] == 0x10
+
+            # A repeat Request for the same already-active SA just re-confirms
+            # success (0x10) — idempotent, not a protocol violation.
+            ptype, payload = await client.activate(tester=TESTER_ADDR)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_unsupported_activation_type_is_denied(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            # ISO 13400-2 Table 48 code 0x06: only activation types 0x00/0x01
+            # are supported — 0x02 must be denied, not silently accepted.
+            await client.send(PT_ROUTING_ACT_REQUEST,
+                              struct.pack("!H", TESTER_ADDR) + b"\x02" + b"\x00\x00\x00\x00")
+            ptype, payload = await client.recv()
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x06
+            # Unsupported-activation-type denial closes the socket too.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await client.recv(timeout=1.0)
             await client.close()
             return True
 
