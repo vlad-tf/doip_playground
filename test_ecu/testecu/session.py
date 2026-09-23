@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import struct
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -244,17 +245,53 @@ class EcuSession:
             self._general_deadline = self._loop_ref.time() + self._general_timeout
         self._kick()
 
-    def _finalize(self, reason: str) -> None:
+    def _finalize(self, reason: str, abortive: bool = False) -> None:
         """DoIP-132/-133: timer elapsed → tear this connection down.  Closing the
         writer unblocks ``_loop()``'s read, so ``run()``'s ``finally`` does the
-        rest of the cleanup."""
+        rest of the cleanup.
+
+        ``abortive=True`` forces a TCP RST instead of the normal orderly FIN
+        close — used for T_TCP_Initial_Inactivity (§7.2.2): the peer never
+        completed Routing Activation, so this socket was never a trusted
+        session, and the teardown should say so accordingly. Traffic-bearing
+        closes (general inactivity, normal disconnect) keep the graceful FIN.
+        """
         if self._finalized:
             return
         self._finalized = True
         self._finalize_reason = reason
         logger.info("Finalizing %s: %s", self._peer, reason)
+        if abortive:
+            self._abort_connection()
+        else:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+
+    def _abort_connection(self) -> None:
+        """Force a TCP RST rather than an orderly FIN close.
+
+        ``asyncio``'s normal ``close()`` performs a graceful shutdown; getting
+        an RST out of it needs ``SO_LINGER`` set to "on, 0 seconds" on the raw
+        socket *before* the transport is torn down, followed by an abortive
+        close (``transport.abort()``, which skips flushing) rather than
+        ``writer.close()``.
+        """
+        sock = self._writer.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                 struct.pack("ii", 1, 0))
+            except OSError:
+                logger.debug("Could not set SO_LINGER for abortive close of %s",
+                             self._peer)
+        transport = self._writer.transport
         try:
-            self._writer.close()
+            if transport is not None:
+                transport.abort()
+            else:
+                self._writer.close()
         except Exception:
             pass
 
@@ -280,7 +317,8 @@ class EcuSession:
                 return
             if self._initial_deadline is not None \
                     and self._loop_ref.time() >= self._initial_deadline:
-                self._finalize("initial inactivity timeout (T_TCP_Initial_Inactivity)")
+                self._finalize("initial inactivity timeout (T_TCP_Initial_Inactivity)",
+                                abortive=True)
                 return
             if self._general_deadline is not None \
                     and self._loop_ref.time() >= self._general_deadline:

@@ -325,7 +325,10 @@ class TestInactivityTimers:
         async def scenario(port):
             client = await Client.connect(port)
             # No Routing Activation — the initial inactivity timer closes it.
-            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError)):
+            # This socket was never trusted (no successful Routing Activation),
+            # so the teardown is abortive (TCP RST), not an orderly FIN —
+            # readexactly() surfaces that as ConnectionResetError specifically.
+            with pytest.raises(ConnectionResetError):
                 await client.recv(timeout=2.0)
             await client.close()
             return True
