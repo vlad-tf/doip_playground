@@ -35,8 +35,9 @@ udp:
   announce_count:       3     # Vehicle Announcements sent on startup
   announce_interval_ms: 500   # ...and the gap between them
   # Upper bound (ms) of the random A_DoIP_Announce_Wait delay (ISO 13400-2
-  # Table 38: 0..500) before answering a Vehicle Identification Request.
-  announce_wait_ms:     500   # 0 = answer immediately (deterministic tests)
+  # Table 38: 0..500), applied both before the first startup Vehicle
+  # Announcement and before answering a Vehicle Identification Request.
+  announce_wait_ms:     500   # 0 = act immediately (deterministic tests)
 
 # ---------------------------------------------------------------------------
 # UDS behaviour

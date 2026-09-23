@@ -149,7 +149,8 @@ class UdpConfig:
     announce_count: int = 3
     announce_interval_ms: int = 500
     #: Upper bound (ms) of the random A_DoIP_Announce_Wait delay (ISO 13400-2
-    #: Table 38: random 0…500 ms) before answering a Vehicle Identification
+    #: Table 38: random 0…500 ms), applied both before the first startup
+    #: Vehicle Announcement and before answering a Vehicle Identification
     #: Request.  Set to 0 to disable the delay (e.g. for deterministic tests).
     announce_wait_ms: int = 500
 

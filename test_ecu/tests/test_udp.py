@@ -40,7 +40,7 @@ from testecu.doip import (
     payload as frame_payload,
     ptype as frame_ptype,
 )
-from testecu.udp import _UDPProtocol, _stagger_delay_ms
+from testecu.udp import _UDPProtocol, _stagger_delay_ms, run_announcer
 
 
 class _FakeTransport:
@@ -107,6 +107,31 @@ def test_identification_response_is_delayed_by_announce_wait():
         await asyncio.sleep((delay_ms + 5) / 1000.0)
         assert len(transport.sent) == 1
         assert frame_ptype(transport.sent[0][0]) == PT_VEHICLE_ID_RESPONSE
+
+    run(scenario())
+
+
+def test_run_announcer_waits_before_first_announcement():
+    # Regression test: the first startup Vehicle Announcement was going out
+    # immediately, with no A_DoIP_Announce_Wait at all. ``run_announcer``
+    # needs a real bound socket (unlike the ``_UDPProtocol``-only tests
+    # above), so this one does bind one — on loopback/ephemeral port, best
+    # effort like the function itself.
+    wait_ms = 150
+    seed_key = (BASE_CONFIG["doip"]["ecu_logical_addr"], BASE_CONFIG["doip"]["vin"])
+    delay_ms = _stagger_delay_ms(seed_key, wait_ms)
+    assert 0 < delay_ms < wait_ms
+
+    config = parse_config(merge(BASE_CONFIG, {
+        "udp": {"enabled": True, "announce_count": 1, "announce_wait_ms": wait_ms},
+    }))
+
+    async def scenario():
+        task = asyncio.ensure_future(run_announcer(config))
+        await asyncio.sleep((delay_ms - 30) / 1000.0)
+        assert not task.done()                       # still inside the wait window
+        await task                                    # completes once it sends
+        assert task.done()
 
     run(scenario())
 
