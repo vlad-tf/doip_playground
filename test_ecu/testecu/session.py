@@ -16,12 +16,17 @@
 The DoIP connection state machine.
 
 Ported from ``echo_ecu.ECUSession``: routing activation (including the ISO
-13400-2 §9.3 source-address conflict resolution and alive probe), alive check,
-entity status, and power mode are unchanged.  Two differences from the port:
-``_handle_diagnostic`` hands the UDS bytes to the dispatcher instead of
-building a canned echo, and this class also runs the ISO 13400-2 §7.2.2/§7.2.3
-initial/general inactivity timers (see ``_supervise``), which ``echo_ecu``
-does not implement.
+13400-2 §9.3 source-address conflict resolution and alive probe) and alive
+check are unchanged. Three differences from the port: ``_handle_diagnostic``
+hands the UDS bytes to the dispatcher instead of building a canned echo;
+this class also runs the ISO 13400-2 §7.2.2/§7.2.3 initial/general
+inactivity timers (see ``_supervise``), which ``echo_ecu`` does not
+implement; and Entity Status Request (0x4001) and Power Mode Info Request
+(0x4003) are *not* answered here — ISO 13400-2 classes both as UDP_DISCOVERY
+messages, so a TCP_DATA socket receiving either now gets the same Header
+NACK 0x01 as any other payload type this socket doesn't accept (``udp.py``
+answers the UDP side). ``echo_ecu`` still answers them over TCP; that's a
+deliberate divergence, not a bug to sync back.
 """
 
 from __future__ import annotations
@@ -44,11 +49,7 @@ from testecu.doip import (
     PT_DIAGNOSTIC_MESSAGE,
     PT_DIAGNOSTIC_NEGATIVE_ACK,
     PT_DIAGNOSTIC_POSITIVE_ACK,
-    PT_ENTITY_STATUS_REQUEST,
-    PT_ENTITY_STATUS_RESPONSE,
     PT_HEADER_NACK,
-    PT_POWER_MODE_REQUEST,
-    PT_POWER_MODE_RESPONSE,
     PT_ROUTING_ACT_REQUEST,
     PT_ROUTING_ACT_RESPONSE,
     PTYPE_NAMES,
@@ -125,8 +126,6 @@ class EcuSession:
 
         config = ecu.config
         self._ecu_addr = config.doip.ecu_logical_addr
-        self._node_type = config.doip.node_type
-        self._power_mode = config.doip.power_mode
         self._max_data = config.doip.max_payload_bytes
         self._tester_addr_range = config.doip.tester_addr_range
 
@@ -384,14 +383,14 @@ class EcuSession:
                 if self._alive_probe_pending and self._alive_probe_event is not None:
                     self._alive_probe_event.set()
 
-            elif pt == PT_ENTITY_STATUS_REQUEST:
-                await self._handle_entity_status()
-
-            elif pt == PT_POWER_MODE_REQUEST:
-                await self._handle_power_mode()
-
             else:
-                logger.warning("Unknown payload type 0x%04X — sending Header NACK", pt)
+                # Covers truly unknown payload types and the two ISO 13400-2
+                # UDP_DISCOVERY-only types (Entity Status Request 0x4001,
+                # Power Mode Info Request 0x4003) if sent here by mistake —
+                # this TCP_DATA socket doesn't accept either; ``udp.py``
+                # answers them on the UDP side.
+                logger.warning("Unknown/unsupported payload type 0x%04X on TCP_DATA "
+                               "— sending Header NACK", pt)
                 await self._send(build_frame(PT_HEADER_NACK, bytes([0x01])))
 
     # -----------------------------------------------------------------------
@@ -566,21 +565,6 @@ class EcuSession:
                                      struct.pack("!H", self._ecu_addr)))
         logger.debug("Sent Alive Check Response (src=0x%04X) to %s",
                      self._ecu_addr, self._peer)
-
-    async def _handle_entity_status(self) -> None:
-        """Entity Status Response (0x4002): node type, max/open sockets, max data."""
-        open_sockets = len(self._registry) if self._registry is not None else 1
-        payload = (
-            bytes([self._node_type, 1, max(1, open_sockets)])
-            + struct.pack("!I", self._max_data)
-        )
-        await self._send(build_frame(PT_ENTITY_STATUS_RESPONSE, payload))
-        logger.debug("Sent Entity Status Response to %s", self._peer)
-
-    async def _handle_power_mode(self) -> None:
-        """Power Mode Info Response (0x4004), 1 byte."""
-        await self._send(build_frame(PT_POWER_MODE_RESPONSE, bytes([self._power_mode])))
-        logger.debug("Sent Power Mode Response to %s", self._peer)
 
     # -----------------------------------------------------------------------
     # Diagnostic messages — the UDS entry point

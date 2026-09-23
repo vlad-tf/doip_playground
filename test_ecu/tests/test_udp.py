@@ -32,6 +32,8 @@ from testecu.config import parse_config
 from testecu.doip import (
     PT_ENTITY_STATUS_REQUEST,
     PT_ENTITY_STATUS_RESPONSE,
+    PT_POWER_MODE_REQUEST,
+    PT_POWER_MODE_RESPONSE,
     PT_VEHICLE_ID_REQUEST,
     PT_VEHICLE_ID_REQUEST_WITH_EID,
     PT_VEHICLE_ID_REQUEST_WITH_VIN,
@@ -74,6 +76,21 @@ def test_entity_status_request_gets_a_response():
     assert len(payload) == 7
     assert payload[0] == 0x01                        # node type (default config)
     assert struct.unpack("!I", payload[3:7])[0] == 4096
+
+
+def test_power_mode_info_request_gets_a_response():
+    # ISO 13400-2 Table 12 / DoIP-116..118: the Diagnostic Power Mode info
+    # request (0x4003) is sent over UDP (UDP_DISCOVERY) and must be answered
+    # over UDP with 0x4004 carrying the configured power mode byte — it used
+    # to be dropped by the UDP responder.
+    protocol, transport = _protocol()
+    protocol.datagram_received(build_frame(PT_POWER_MODE_REQUEST, b""), ADDR)
+
+    assert len(transport.sent) == 1
+    raw, addr = transport.sent[0]
+    assert addr == ADDR
+    assert frame_ptype(raw) == PT_POWER_MODE_RESPONSE
+    assert frame_payload(raw) == b"\x01"            # power_mode (default config)
 
 
 def test_vehicle_id_request_still_works():

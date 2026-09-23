@@ -29,10 +29,8 @@ from testecu.doip import (
     PT_DIAGNOSTIC_NEGATIVE_ACK,
     PT_DIAGNOSTIC_POSITIVE_ACK,
     PT_ENTITY_STATUS_REQUEST,
-    PT_ENTITY_STATUS_RESPONSE,
     PT_HEADER_NACK,
     PT_POWER_MODE_REQUEST,
-    PT_POWER_MODE_RESPONSE,
     PT_ROUTING_ACT_REQUEST,
     PT_ROUTING_ACT_RESPONSE,
     build_frame,
@@ -319,18 +317,22 @@ class TestRoutingActivationValidation:
 
 
 class TestNodeServices:
-    def test_entity_status_and_power_mode(self):
+    def test_entity_status_and_power_mode_are_rejected_over_tcp(self):
+        # ISO 13400-2 classes both Entity Status (0x4001/0x4002) and Power
+        # Mode Info (0x4003/0x4004) as UDP_DISCOVERY-only message types — a
+        # TCP_DATA socket sending either gets Header NACK 0x01, the same as
+        # any other payload type this socket doesn't accept. See
+        # test_udp.py for the UDP side, which does answer both.
         async def scenario(port):
             client = await Client.connect(port)
             await client.send(PT_ENTITY_STATUS_REQUEST, b"")
             ptype, payload = await client.recv()
-            assert ptype == PT_ENTITY_STATUS_RESPONSE
-            assert payload[0] == 0x01                       # node type: gateway
-            assert struct.unpack("!I", payload[3:7])[0] == 4096
+            assert ptype == PT_HEADER_NACK
+            assert payload == b"\x01"
 
             await client.send(PT_POWER_MODE_REQUEST, b"")
             ptype, payload = await client.recv()
-            assert ptype == PT_POWER_MODE_RESPONSE
+            assert ptype == PT_HEADER_NACK
             assert payload == b"\x01"
             await client.close()
             return True

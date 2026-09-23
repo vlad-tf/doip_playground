@@ -34,6 +34,8 @@ from testecu.doip import (
     DOIP_MCAST_ADDR,
     PT_ENTITY_STATUS_REQUEST,
     PT_ENTITY_STATUS_RESPONSE,
+    PT_POWER_MODE_REQUEST,
+    PT_POWER_MODE_RESPONSE,
     PT_VEHICLE_ID_REQUEST,
     PT_VEHICLE_ID_REQUEST_WITH_EID,
     PT_VEHICLE_ID_REQUEST_WITH_VIN,
@@ -104,6 +106,7 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         self._if_index = if_index
         self._port = config.listen.port
         self._node_type = config.doip.node_type
+        self._power_mode = config.doip.power_mode
         self._max_data = config.doip.max_payload_bytes
         self._transport: Optional[asyncio.DatagramTransport] = None
         #: Entity identification used to match 0x0002 (VIR with EID) requests.
@@ -127,6 +130,16 @@ class _UDPProtocol(asyncio.DatagramProtocol):
                 self._transport.sendto(build_frame(PT_ENTITY_STATUS_RESPONSE,
                                                     self._entity_status_payload()), addr)
                 logger.debug("UDP: sent Entity Status Response to %s", addr)
+            return
+        if pt == PT_POWER_MODE_REQUEST:
+            # ISO 13400-2 Table 12 / DoIP-116..118: the Diagnostic Power Mode
+            # info request (0x4003) arrives on UDP_DISCOVERY and the response
+            # (0x4004) goes back over UDP to the requester's port.
+            logger.debug("UDP: Power Mode Info Request from %s", addr)
+            if self._transport:
+                self._transport.sendto(build_frame(PT_POWER_MODE_RESPONSE,
+                                                   bytes([self._power_mode])), addr)
+                logger.debug("UDP: sent Power Mode Info Response to %s", addr)
             return
         if pt in (PT_VEHICLE_ID_REQUEST,
                   PT_VEHICLE_ID_REQUEST_WITH_EID,
@@ -178,9 +191,11 @@ class _UDPProtocol(asyncio.DatagramProtocol):
     def _entity_status_payload(self) -> bytes:
         """Entity Status Response (0x4002), 7 bytes: node type, max/open sockets, max data.
 
-        UDP has no persistent socket of its own to count, so open sockets is
-        reported as 0 here — TCP sessions are answered by ``session.py``'s own
-        ``_handle_entity_status``, which knows the real registry count.
+        This is the only place Entity Status is answered — ISO 13400-2 makes
+        it a UDP_DISCOVERY-only message type, so ``session.py``'s TCP_DATA
+        loop rejects it instead of answering it (see that module's docstring).
+        This protocol instance has no persistent socket of its own to count
+        active TCP sessions against, so open sockets is reported as 0 here.
         """
         return bytes([self._node_type, 1, 0]) + struct.pack("!I", self._max_data)
 
