@@ -44,20 +44,25 @@ from testecu.doip import (
 logger = logging.getLogger("testecu.udp")
 
 
-def _stagger_delay_ms(addr: tuple, max_ms: int) -> int:
+def _stagger_delay_ms(key: tuple, max_ms: int) -> int:
     """
-    Deterministic A_DoIP_Announce_Wait in ``0..max_ms``, derived from the peer.
+    Deterministic A_DoIP_Announce_Wait in ``0..max_ms``, derived from ``key``.
 
-    ISO 13400-2 DoIP-051 wants a *random* 0..500 ms delay so simultaneous DoIP
-    entities don't burst.  TestEcu deliberately substitutes a stable per-request
-    hash of the requester instead: different peers get different delays (same
-    anti-burst effect) but the same peer always gets the same delay, so a test
-    can still assert on the behaviour.  ``max_ms <= 0`` means "respond now".
+    ISO 13400-2's A_DoIP_Announce_Wait is a *random* 0..500 ms delay used in
+    two places: before answering a Vehicle Identification Request (keyed by
+    the requester's address, so simultaneous responders don't burst), and
+    before this entity's own first Vehicle Announcement after start-up (keyed
+    by this entity's own identity, so simultaneous entities powering up
+    together don't all announce at once). TestEcu deliberately substitutes a
+    stable hash of ``key`` for the random draw in both cases: different keys
+    get different delays (the same anti-burst effect), but the same key
+    always gets the same delay, so a test can still assert on the behaviour.
+    ``max_ms <= 0`` means "act immediately, no delay".
     """
     if max_ms <= 0:
         return 0
     seed = 0
-    for part in addr:
+    for part in key:
         if isinstance(part, str):
             for byte in part.encode("utf-8", "ignore"):
                 seed = (seed * 31 + byte) & 0xFFFFFFFF
@@ -196,8 +201,9 @@ class _UDPProtocol(asyncio.DatagramProtocol):
 
 async def run_announcer(config: EcuConfig) -> None:
     """
-    Bind UDP/IPv6, join the DoIP multicast group, send the configured number of
-    announcements, then keep listening for Vehicle Identification Requests.
+    Bind UDP/IPv6, join the DoIP multicast group, wait out
+    A_DoIP_Announce_Wait, send the configured number of announcements, then
+    keep listening for Vehicle Identification Requests.
 
     Every step that depends on the interface is best-effort: on a developer
     machine there is no ``eth0`` and no multicast on loopback, and that must not
@@ -250,6 +256,22 @@ async def run_announcer(config: EcuConfig) -> None:
     )
 
     logger.info("UDP: listening on [::]:%d  interface=%s", port, interface or "any")
+
+    # ISO 13400-2 A_DoIP_Announce_Wait: wait 0..announce_wait_ms before the
+    # *first* Vehicle Announcement after start-up, so multiple DoIP entities
+    # powering up together don't all announce in the same instant. Keyed by
+    # this entity's own address/VIN (there is no requester to key on here,
+    # unlike the Vehicle Identification Request case above) — deterministic
+    # for the same testability reason documented on ``_stagger_delay_ms``.
+    initial_wait_ms = _stagger_delay_ms(
+        (config.doip.ecu_logical_addr, config.doip.vin), config.udp.announce_wait_ms,
+    )
+    if initial_wait_ms:
+        logger.debug(
+            "UDP: waiting %d ms (A_DoIP_Announce_Wait) before the first "
+            "Vehicle Announcement", initial_wait_ms,
+        )
+        await asyncio.sleep(initial_wait_ms / 1000.0)
 
     count = config.udp.announce_count
     interval = config.udp.announce_interval_ms / 1000.0
