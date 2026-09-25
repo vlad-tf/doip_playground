@@ -165,7 +165,7 @@ class Dispatcher:
                     self._log.warning(
                         "dispatcher: %s is claimed by %d plugins (%s) — they run in "
                         "that order and a plugin returning None hands over to the next",
-                        template % key, len(hooks),
+                        template % key, len(names),
                         ", ".join(hook.label for hook in hooks),
                     )
 

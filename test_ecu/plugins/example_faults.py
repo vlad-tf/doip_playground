@@ -80,7 +80,9 @@ class SimpleDtcs(Plugin):
 
     Only ``reportDTCByStatusMask`` (0x02) is answered, which is enough for most
     tester smoke tests.  Everything else falls through and ends up as
-    subFunctionNotSupported from the ``unknown_service`` policy.
+    serviceNotSupported (0x11) from the ``unknown_service`` policy — that
+    policy has no per-sub-function NRC, so it is never
+    subFunctionNotSupported (0x12) regardless of what request triggered it.
     """
 
     name = "SimpleDtcs"

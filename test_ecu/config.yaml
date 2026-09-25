@@ -22,8 +22,8 @@ doip:
   eid:  "AABBCCDDEEFF"        # 6-byte Entity ID (12 hex chars)
   gid:  "000000000000"        # 6-byte Group ID  (12 hex chars)
   tester_addr_range: [0x0E00, 0x0FFF]  # accepted client SA range (ISO 13400-2
-                                        # Table 13); Routing Activation from an
-                                        # SA outside this range is denied (0x00)
+                                       # Table 13); Routing Activation from an
+                                       # SA outside this range is denied (0x00)
   # Inactivity timers (ISO 13400-2 Table 38).  Set to 0 to disable either.
   initial_inactivity_ms:  2000    # T_TCP_Initial_Inactivity: close if a new
                                   # socket never sends a valid Routing Activation
@@ -34,9 +34,11 @@ udp:
   enabled:              true  # false (or --no-udp) skips the announcer entirely
   announce_count:       3     # Vehicle Announcements sent on startup
   announce_interval_ms: 500   # ...and the gap between them
-  # Upper bound (ms) of the random A_DoIP_Announce_Wait delay (ISO 13400-2
-  # Table 38: 0..500), applied both before the first startup Vehicle
-  # Announcement and before answering a Vehicle Identification Request.
+  # Upper bound (ms) of the A_DoIP_Announce_Wait delay (ISO 13400-2 Table 38:
+  # 0..500), applied both before the first startup Vehicle Announcement and
+  # before answering a Vehicle Identification Request. Derived
+  # deterministically here rather than drawn at random -- see
+  # testecu/udp.py: _stagger_delay_ms.
   announce_wait_ms:     500   # 0 = act immediately (deterministic tests)
 
 # ---------------------------------------------------------------------------
@@ -50,9 +52,9 @@ uds:
   p2_star_server_ms:      5000   # and again every 90% of this afterwards
   auto_response_pending:  true   # false = never emit 0x78 automatically
   max_response_pending:   10     # cap on 0x78 frames per request before giving
-                                  # up with NRC 0x10; 0 = unlimited (a hung
-                                  # handler would then flood 0x78 forever and
-                                  # keep the connection alive indefinitely)
+                                 # up with NRC 0x10; 0 = unlimited (a hung
+                                 # handler would then flood 0x78 forever and
+                                 # keep the connection alive indefinitely)
   suppress_pos_rsp_bit:   true   # honour sub-function bit 7 (e.g. 3E 80)
   functional_addr:        0x1FFF # target address treated as a functional request
 

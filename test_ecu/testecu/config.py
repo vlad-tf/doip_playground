@@ -153,10 +153,13 @@ class UdpConfig:
     enabled: bool = True
     announce_count: int = 3
     announce_interval_ms: int = 500
-    #: Upper bound (ms) of the random A_DoIP_Announce_Wait delay (ISO 13400-2
-    #: Table 38: random 0…500 ms), applied both before the first startup
-    #: Vehicle Announcement and before answering a Vehicle Identification
-    #: Request.  Set to 0 to disable the delay (e.g. for deterministic tests).
+    #: Upper bound (ms) of the A_DoIP_Announce_Wait delay (ISO 13400-2
+    #: Table 38: 0…500 ms), applied both before the first startup Vehicle
+    #: Announcement and before answering a Vehicle Identification Request.
+    #: ISO 13400-2 specifies a random draw in that range; TestEcu derives it
+    #: deterministically instead (see ``udp.py: _stagger_delay_ms``), so this
+    #: bound is honoured but the delay itself is never actually random.  Set
+    #: to 0 to disable the delay (e.g. for deterministic tests).
     announce_wait_ms: int = 500
 
 

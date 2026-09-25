@@ -402,3 +402,30 @@ class TestIntrospection:
         probe_for(CONFIG, [DidPlugin(), Other()])
         assert any("claimed by 2 plugins" in record.message
                    for record in caplog.records)
+
+    def test_duplicate_claim_count_is_plugins_not_hooks(self, caplog):
+        """
+        One plugin registering two hooks for the same DID must still count as
+        1 plugin, not 2 -- this is the shape ``len(hooks)`` used to miscount
+        (it would report "3 plugins" here: 2 hooks from ``TwoHooks`` + 1 from
+        ``Other``, when only 2 plugins are actually involved).
+        """
+        class TwoHooks(Plugin):
+            name = "TwoHooks"
+
+            @read_did(0xF190)
+            def first(self, req, ctx):
+                return None
+
+            @read_did(0xF190)
+            def second(self, req, ctx):
+                return None
+
+        class Other(DidPlugin):
+            name = "Other"
+
+        probe_for(CONFIG, [TwoHooks(), Other()])
+        assert any("claimed by 2 plugins" in record.message
+                   for record in caplog.records)
+        assert not any("claimed by 3 plugins" in record.message
+                      for record in caplog.records)
