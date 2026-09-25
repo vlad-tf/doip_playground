@@ -243,6 +243,15 @@ example in about fifteen lines.
   (`testecu/uds.py: SUB_FUNCTION_SERVICES`). For ReadDataByIdentifier, byte 1 is the DID
   high byte — without this, `22 F1 90` would look like a suppressed request and the VIN
   would never be sent.
+- **`0x36 exceededNumberOfAttempts` is reported, not enforced.** `uds.security.max_attempts`
+  is counted and a wrong key past that count gets `0x36`, but a *correct* key always
+  unlocks on the very next try — there is no lockout. ISO 14229-1 §9.4 expects a delay
+  timer to start once the limit is hit, rejecting further SecurityAccess requests with
+  `0x37 requiredTimeDelayNotExpired` until it elapses (`0x37` is not even in
+  `testecu/uds.py: NRC_NAMES`). Deliberately not implemented: a delay timer is
+  time-dependent, which conflicts with the "nothing is random" determinism invariant
+  above — the two are in tension, and resolving that is a maintainer decision, not one to
+  make silently in a bugfix.
 
 ---
 

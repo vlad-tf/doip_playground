@@ -204,6 +204,24 @@ class TestSecurityAccess:
         assert hx(responses[1]) == "7F 27 35"      # attempt 1 of 2
         assert hx(responses[3]) == "7F 27 36"      # exceeded
 
+    def test_deviation_exceeding_attempts_does_not_lock_out_a_correct_key(self):
+        """
+        Pins a documented deviation (README's "Deliberate deviations" list):
+        ``max_attempts`` is counted and reported (0x36), but never enforced as
+        a lockout. A correct key unlocks on the very next try regardless — no
+        ISO 14229-1 §9.4 delay timer, no 0x37. If this ever changes, it is a
+        deliberate feature, not a silent regression, and the README bullet
+        needs updating alongside it.
+        """
+        p = probe_for(dict(CONFIG, uds={"security": {"max_attempts": 1}}))
+        responses = p.exchange(
+            "27 01", "27 02 00 00 00 00",   # attempt 1: wrong key, limit reached
+            "27 01", "27 02 " + GOOD_KEY,   # tried again anyway: correct key
+        )
+        assert hx(responses[1]) == "7F 27 36"      # exceeded — but not locked out
+        assert hx(responses[3]) == "67 02"         # unlocks anyway, no 0x37
+        assert p.state.security_level == 1
+
     def test_key_without_seed_is_a_sequence_error(self):
         assert hx(probe_for(CONFIG).send("27 02 " + GOOD_KEY)) == "7F 27 24"
 
