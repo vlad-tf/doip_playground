@@ -263,6 +263,27 @@ class TestLifecycle:
 
         assert run(with_server(scenario))
 
+    def test_truncated_diagnostic_message_gets_generic_nack(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            # 4-byte payload: SA(2) + TA(2), no UDS bytes at all -- below the
+            # 5-byte minimum (SA+TA+ >=1 UDS byte). Must be NACKed, not
+            # silently dropped (which left the tester with nothing to see
+            # but its own P2 timeout).
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR))
+            ptype, payload = await client.recv()
+            assert ptype == PT_HEADER_NACK
+            assert payload == b"\x04"    # invalid payload length
+            # Not a spoofing/addressing violation, so the socket stays open.
+            ptype, payload = await client.diagnostic(b"\x3E\x00")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
     def test_wrong_protocol_version_gets_a_header_nack(self):
         async def scenario(port):
             client = await Client.connect(port)

@@ -631,7 +631,19 @@ class EcuSession:
         ``ctx.send()`` / ``ctx.response_pending()``.
         """
         if len(payload) < 5:
-            logger.warning("Diagnostic Message payload too short (%d bytes)", len(payload))
+            # Minimum viable Diagnostic Message: SA(2) + TA(2) + at least one
+            # UDS byte (the SID) = 5. Shorter than that is invalid for this
+            # payload type (DoIP-045) — the same treatment as the too-short
+            # Routing Activation Request above: Generic Header NACK 0x04, not
+            # a Diagnostic Negative Ack, since we may not even have a usable
+            # SA/TA to put in one. Silently dropping it (the previous
+            # behaviour) left the tester with no response and nothing to
+            # time out on but its own P2 timer.
+            logger.warning(
+                "Diagnostic Message payload too short (%d bytes) — Generic NACK",
+                len(payload),
+            )
+            await self._send(build_frame(PT_HEADER_NACK, bytes([0x04])))
             return
 
         src, tgt = struct.unpack("!HH", payload[0:4])
