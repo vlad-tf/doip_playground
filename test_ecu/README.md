@@ -261,6 +261,7 @@ Sections `listen`, `doip` and `udp` are identical to
 | `p2_server_ms` | `50` | emit `7F xx 78` if a handler takes longer |
 | `p2_star_server_ms` | `5000` | and again every 90% of this |
 | `auto_response_pending` | `true` | set false to never emit 0x78 automatically |
+| `max_response_pending` | `10` | cap on 0x78 frames per request before giving up with NRC 0x10; `0` = unlimited |
 | `suppress_pos_rsp_bit` | `true` | honour sub-function bit 7 |
 | `functional_addr` | `0x1FFF` | target address that means "functional request" |
 | `unknown_service` | `nrc` | `nrc` → `7F <sid> 11`, `echo`, `silent` |

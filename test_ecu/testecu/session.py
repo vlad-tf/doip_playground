@@ -738,10 +738,13 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
     0x78 forever — and since every sent frame resets the general inactivity
     timer (DoIP-080), the connection could never time out either, turning one
     hung handler into a permanent frame flood on an immortal connection. Once
-    the cap is hit, this gives up: sends a final NRC 0x10 (generalReject) and
-    stops waiting, leaving ``task`` running detached rather than cancelling
-    it — ``shield`` already means we can't reach into arbitrary plugin code
-    safely, so a done callback just logs if it ever finishes or raises.
+    the cap is hit, this gives up: cancels ``task``, sends a final NRC 0x10
+    (generalReject), and stops waiting. Cancelling (not detaching) matters —
+    ``shield`` only protects the handler from the P2 timeout, never from
+    teardown, and plugin code is already expected to be cancellable
+    (``dispatcher.py`` re-raises ``CancelledError`` rather than isolating
+    it) — otherwise the abandoned task outlives the connection for good and
+    can still call ``responder()`` whenever it eventually wakes up.
     """
     uds_cfg = ecu.uds
     task = asyncio.ensure_future(ecu.dispatcher.dispatch(request, state, responder))
@@ -760,6 +763,14 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
                     "— giving up with NRC 0x10 (uds.max_response_pending)",
                     request.describe(), pending_sent,
                 )
+                # Cancel rather than detach: shield only protects the handler
+                # from the P2 timeout, not from teardown — plugin code is
+                # already expected to be cancellable (dispatcher.py re-raises
+                # CancelledError instead of isolating it), cancelling runs its
+                # finally blocks, and a merely-slow handler that outlives the
+                # cap must not wake up later and ctx.send() a stray frame onto
+                # a connection the tester has moved on from.
+                task.cancel()
                 task.add_done_callback(_log_abandoned_dispatch)
                 await responder(bytes([0x7F, request.sid & 0xFF, NRC_GENERAL_REJECT]))
                 return NO_RESPONSE
