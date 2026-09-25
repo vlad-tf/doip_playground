@@ -161,6 +161,27 @@ class TestLifecycle:
             # ISO 13400-2 Table 26: 0x03 = unknown target address (0x00/0x01
             # are reserved by ISO 13400 and must never appear on the wire).
             assert payload[4] == 0x03
+            # ISO 13400-2 Table 28 / DoIP-066: the NACK's SA is always this
+            # ECU's own address — never 0x1234, the invalid target the
+            # requester sent, which it doesn't own.
+            assert struct.unpack("!H", payload[0:2])[0] == ECU_ADDR
+            assert struct.unpack("!H", payload[2:4])[0] == TESTER_ADDR
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_functional_diagnostic_ack_uses_our_own_address(self):
+        # ISO 13400-2 Table 28 / DoIP-066: a functional (broadcast) request's
+        # ``tgt`` is the functional address, not this ECU's own — the ACK's
+        # SA must still be this ECU's own address, not the functional one.
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            ptype, payload = await client.diagnostic(b"\x3E\x00", target=0x1FFF)
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            assert struct.unpack("!H", payload[0:2])[0] == ECU_ADDR
+            assert struct.unpack("!H", payload[2:4])[0] == TESTER_ADDR
             await client.close()
             return True
 

@@ -621,7 +621,7 @@ class EcuSession:
             )
             await self._send(build_frame(
                 PT_DIAGNOSTIC_NEGATIVE_ACK,
-                struct.pack("!HHB", tgt, src, NACK_INVALID_SOURCE_ADDRESS),
+                struct.pack("!HHB", self._ecu_addr, src, NACK_INVALID_SOURCE_ADDRESS),
             ))
             raise _CloseConnection()
 
@@ -629,23 +629,27 @@ class EcuSession:
             logger.warning("Diagnostic Message for unknown target 0x%04X — NACK", tgt)
             await self._send(build_frame(
                 PT_DIAGNOSTIC_NEGATIVE_ACK,
-                struct.pack("!HHB", tgt, src, NACK_UNKNOWN_TARGET_ADDRESS),
+                struct.pack("!HHB", self._ecu_addr, src, NACK_UNKNOWN_TARGET_ADDRESS),
             ))
             return
 
         if len(uds) > self._max_data:
             await self._send(build_frame(
                 PT_DIAGNOSTIC_NEGATIVE_ACK,
-                struct.pack("!HHB", tgt, src, NACK_MESSAGE_TOO_LARGE),
+                struct.pack("!HHB", self._ecu_addr, src, NACK_MESSAGE_TOO_LARGE),
             ))
             return
 
-        # 1. Positive ACK.  ISO 13400-2 Table 28 / DoIP-066: the ack's SA is the
-        # node sending it (this ECU) and its TA is the requesting tester — the
-        # same swap the Diagnostic Message response below uses, not the
-        # request's own SA/TA order.
+        # 1. Positive ACK.  ISO 13400-2 Table 28 / DoIP-066: the ack's SA is
+        # always this entity's own logical address — never the request's
+        # ``tgt`` field, which is only *this* ECU's address in the plain
+        # physical-addressing case. A functional request's ``tgt`` is the
+        # functional address, and an unknown-target NACK's ``tgt`` is
+        # whatever invalid address the requester sent; using either as our
+        # own SA would tell the tester this ECU is answering from an address
+        # it doesn't own.
         await self._send(build_frame(PT_DIAGNOSTIC_POSITIVE_ACK,
-                                     struct.pack("!HHB", tgt, src, 0x00)))
+                                     struct.pack("!HHB", self._ecu_addr, src, 0x00)))
         logger.debug("Sent Positive ACK to %s", self._peer)
 
         # 2. UDS response, with src/tgt swapped
