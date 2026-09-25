@@ -27,6 +27,8 @@ from __future__ import annotations
 import asyncio
 import struct
 
+import pytest
+
 from conftest import BASE_CONFIG, merge, run
 from testecu.config import parse_config
 from testecu.doip import (
@@ -42,6 +44,7 @@ from testecu.doip import (
     payload as frame_payload,
     ptype as frame_ptype,
 )
+import testecu.udp as udp_module
 from testecu.udp import _UDPProtocol, _stagger_delay_ms, run_announcer
 
 
@@ -53,9 +56,9 @@ class _FakeTransport:
         self.sent.append((data, addr))
 
 
-def _protocol(extra=None) -> tuple:
+def _protocol(extra=None, registry=None, max_sockets=1) -> tuple:
     config = parse_config(merge(BASE_CONFIG, extra or {}))
-    protocol = _UDPProtocol(config, if_index=0)
+    protocol = _UDPProtocol(config, if_index=0, registry=registry, max_sockets=max_sockets)
     transport = _FakeTransport()
     protocol.connection_made(transport)
     return protocol, transport
@@ -76,6 +79,33 @@ def test_entity_status_request_gets_a_response():
     assert len(payload) == 7
     assert payload[0] == 0x01                        # node type (default config)
     assert struct.unpack("!I", payload[3:7])[0] == 4096
+
+
+def test_entity_status_reports_zero_open_sockets_with_no_registry():
+    # Default (no registry passed) — the previous, still-supported behaviour
+    # for a standalone _UDPProtocol.
+    protocol, transport = _protocol(registry=None, max_sockets=5)
+    protocol.datagram_received(build_frame(PT_ENTITY_STATUS_REQUEST, b""), ADDR)
+    payload = frame_payload(transport.sent[0][0])
+    assert payload[1] == 5      # max sockets: the configured backlog
+    assert payload[2] == 0      # open sockets: no registry to count against
+
+
+def test_entity_status_reports_the_live_registry_size():
+    # SessionRegistry compares by identity only (see test_session_registry.py),
+    # so plain object() sentinels work as stand-in sessions -- no real socket
+    # or Routing Activation needed to populate it.
+    from testecu.session import SessionRegistry
+
+    registry = SessionRegistry()
+    registry.register(0x0E00, object())
+    registry.register(0x0E01, object())
+
+    protocol, transport = _protocol(registry=registry, max_sockets=8)
+    protocol.datagram_received(build_frame(PT_ENTITY_STATUS_REQUEST, b""), ADDR)
+    payload = frame_payload(transport.sent[0][0])
+    assert payload[1] == 8      # max sockets: the configured backlog
+    assert payload[2] == 2      # open sockets: len(registry)
 
 
 def test_power_mode_info_request_gets_a_response():
@@ -134,6 +164,12 @@ def test_run_announcer_waits_before_first_announcement():
     # needs a real bound socket (unlike the ``_UDPProtocol``-only tests
     # above), so this one does bind one — on loopback/ephemeral port, best
     # effort like the function itself.
+    #
+    # ``run_announcer`` runs until cancelled (see
+    # ``test_run_announcer_closes_the_transport_on_cancellation`` below) —
+    # it no longer returns on its own once the startup announcements are
+    # sent, so this test cancels it once it has confirmed the wait/send
+    # behaviour rather than awaiting completion.
     wait_ms = 150
     seed_key = (BASE_CONFIG["doip"]["ecu_logical_addr"], BASE_CONFIG["doip"]["vin"])
     delay_ms = _stagger_delay_ms(seed_key, wait_ms)
@@ -147,10 +183,62 @@ def test_run_announcer_waits_before_first_announcement():
         task = asyncio.ensure_future(run_announcer(config))
         await asyncio.sleep((delay_ms - 30) / 1000.0)
         assert not task.done()                       # still inside the wait window
-        await task                                    # completes once it sends
-        assert task.done()
+        await asyncio.sleep((delay_ms + 30) / 1000.0)
+        assert not task.done()                        # sent, now waiting to be cancelled
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     run(scenario())
+
+
+def test_run_announcer_closes_the_transport_on_cancellation():
+    """
+    Regression test: ``run_announcer`` used to return right after sending the
+    startup announcements. The UDP socket kept working only because the
+    event loop held a reference to the transport through its reader
+    callback -- nothing in the code closed it. ``TestEcuServer.stop()``
+    cancels this task to shut down; before this fix that cancelled a task
+    that had already finished, so the socket was never closed (one leaked
+    bound socket per start/stop cycle).
+
+    ``_UDPProtocol`` is swapped for a capturing subclass for the duration of
+    this test so the transport it receives in ``connection_made`` can be
+    inspected -- ``run_announcer`` does not otherwise hand it back to the
+    caller.
+    """
+    created = []
+
+    class _CapturingProtocol(udp_module._UDPProtocol):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    config = parse_config(merge(BASE_CONFIG, {
+        "udp": {"enabled": True, "announce_count": 1, "announce_wait_ms": 0},
+    }))
+
+    original = udp_module._UDPProtocol
+    udp_module._UDPProtocol = _CapturingProtocol
+    try:
+        async def scenario():
+            task = asyncio.ensure_future(udp_module.run_announcer(config))
+            # Give it time to bind, announce, and reach the "run until
+            # cancelled" wait -- at that point it must still be open.
+            await asyncio.sleep(0.05)
+            assert len(created) == 1
+            transport = created[0]._transport
+            assert transport is not None
+            assert not transport.is_closing()
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert transport.is_closing()
+
+        run(scenario())
+    finally:
+        udp_module._UDPProtocol = original
 
 
 def test_eid_request_matching_responds():

@@ -27,7 +27,7 @@ import asyncio
 import logging
 import socket
 import struct
-from typing import Optional
+from typing import Any, Optional
 
 from testecu.config import EcuConfig
 from testecu.doip import (
@@ -101,13 +101,18 @@ def build_announcement_payload(config: EcuConfig) -> bytes:
 class _UDPProtocol(asyncio.DatagramProtocol):
     """Answers Vehicle Identification and Entity Status Requests, sends announcements."""
 
-    def __init__(self, config: EcuConfig, if_index: int) -> None:
+    def __init__(self, config: EcuConfig, if_index: int,
+                 registry: Optional[Any] = None, max_sockets: int = 1) -> None:
         self._payload = build_announcement_payload(config)
         self._if_index = if_index
         self._port = config.listen.port
         self._node_type = config.doip.node_type
         self._power_mode = config.doip.power_mode
         self._max_data = config.doip.max_payload_bytes
+        #: Only object queried for "currently open sockets" below — see
+        #: ``_entity_status_payload`` for what it can and can't tell us.
+        self._registry = registry
+        self._max_sockets = max_sockets
         self._transport: Optional[asyncio.DatagramTransport] = None
         #: Entity identification used to match 0x0002 (VIR with EID) requests.
         self._eid = bytes.fromhex(config.doip.eid)
@@ -194,10 +199,20 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         This is the only place Entity Status is answered — ISO 13400-2 makes
         it a UDP_DISCOVERY-only message type, so ``session.py``'s TCP_DATA
         loop rejects it instead of answering it (see that module's docstring).
-        This protocol instance has no persistent socket of its own to count
-        active TCP sessions against, so open sockets is reported as 0 here.
+
+        ``max_sockets`` is the caller's TCP listen backlog (best available
+        proxy — this ECU does not otherwise cap concurrent sessions).
+        ``open_sockets`` is ``len(registry)``: sessions that have completed
+        Routing Activation. That is an approximation, not an exact count of
+        open TCP sockets — a connected-but-not-yet-activated socket holds a
+        real socket but has no registry entry — but it is closer to reality
+        than the previous hardcoded 0, which told a tester this entity always
+        had room for one more connection even when it did not.
         """
-        return bytes([self._node_type, 1, 0]) + struct.pack("!I", self._max_data)
+        open_sockets = min(len(self._registry), 0xFF) if self._registry is not None else 0
+        max_sockets = min(max(self._max_sockets, 0), 0xFF)
+        return (bytes([self._node_type, max_sockets, open_sockets])
+                + struct.pack("!I", self._max_data))
 
     def error_received(self, exc: Exception) -> None:
         logger.warning("UDP: error: %s", exc)
@@ -214,15 +229,21 @@ class _UDPProtocol(asyncio.DatagramProtocol):
             logger.warning("UDP: announcement send failed: %s", exc)
 
 
-async def run_announcer(config: EcuConfig) -> None:
+async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
+                        max_sockets: int = 1) -> None:
     """
     Bind UDP/IPv6, join the DoIP multicast group, wait out
     A_DoIP_Announce_Wait, send the configured number of announcements, then
-    keep listening for Vehicle Identification Requests.
+    run until cancelled, answering Vehicle Identification Requests, and close
+    the transport on the way out.
 
     Every step that depends on the interface is best-effort: on a developer
     machine there is no ``eth0`` and no multicast on loopback, and that must not
     stop the TCP side from coming up.
+
+    ``registry``/``max_sockets`` are only used to answer Entity Status
+    Requests (see ``_UDPProtocol._entity_status_payload``); both default so
+    this stays usable standalone, same as before this parameter existed.
     """
     interface = config.listen.interface
     port = config.listen.port
@@ -266,34 +287,52 @@ async def run_announcer(config: EcuConfig) -> None:
 
     loop = asyncio.get_running_loop()
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: _UDPProtocol(config, if_index),
+        lambda: _UDPProtocol(config, if_index, registry=registry, max_sockets=max_sockets),
         sock=sock,
     )
 
     logger.info("UDP: listening on [::]:%d  interface=%s", port, interface or "any")
 
-    # ISO 13400-2 A_DoIP_Announce_Wait: wait 0..announce_wait_ms before the
-    # *first* Vehicle Announcement after start-up, so multiple DoIP entities
-    # powering up together don't all announce in the same instant. Keyed by
-    # this entity's own address/VIN (there is no requester to key on here,
-    # unlike the Vehicle Identification Request case above) — deterministic
-    # for the same testability reason documented on ``_stagger_delay_ms``.
-    initial_wait_ms = _stagger_delay_ms(
-        (config.doip.ecu_logical_addr, config.doip.vin), config.udp.announce_wait_ms,
-    )
-    if initial_wait_ms:
-        logger.debug(
-            "UDP: waiting %d ms (A_DoIP_Announce_Wait) before the first "
-            "Vehicle Announcement", initial_wait_ms,
+    # Everything below runs inside the try so that closing the transport
+    # (in the finally) covers every exit path — including cancellation
+    # arriving mid-wait or mid-announcement, not just the "done, now idle"
+    # case at the bottom. Without this, TestEcuServer.stop() cancels a task
+    # that leaves the bound UDP socket open behind it (nothing else in the
+    # process holds a reference that would close it), which leaks one socket
+    # per start/stop cycle in tests and in any embedding that restarts the
+    # server.
+    try:
+        # ISO 13400-2 A_DoIP_Announce_Wait: wait 0..announce_wait_ms before
+        # the *first* Vehicle Announcement after start-up, so multiple DoIP
+        # entities powering up together don't all announce in the same
+        # instant. Keyed by this entity's own address/VIN (there is no
+        # requester to key on here, unlike the Vehicle Identification
+        # Request case above) — deterministic for the same testability
+        # reason documented on ``_stagger_delay_ms``.
+        initial_wait_ms = _stagger_delay_ms(
+            (config.doip.ecu_logical_addr, config.doip.vin), config.udp.announce_wait_ms,
         )
-        await asyncio.sleep(initial_wait_ms / 1000.0)
+        if initial_wait_ms:
+            logger.debug(
+                "UDP: waiting %d ms (A_DoIP_Announce_Wait) before the first "
+                "Vehicle Announcement", initial_wait_ms,
+            )
+            await asyncio.sleep(initial_wait_ms / 1000.0)
 
-    count = config.udp.announce_count
-    interval = config.udp.announce_interval_ms / 1000.0
-    for index in range(count):
-        protocol.send_announcement()
-        logger.info("UDP: sent Vehicle Announcement %d/%d", index + 1, count)
-        if index < count - 1:
-            await asyncio.sleep(interval)
+        count = config.udp.announce_count
+        interval = config.udp.announce_interval_ms / 1000.0
+        for index in range(count):
+            protocol.send_announcement()
+            logger.info("UDP: sent Vehicle Announcement %d/%d", index + 1, count)
+            if index < count - 1:
+                await asyncio.sleep(interval)
 
-    logger.info("UDP: announcements done; listening for Vehicle Identification Requests")
+        logger.info(
+            "UDP: announcements done; listening for Vehicle Identification Requests")
+
+        # Nothing else keeps this coroutine (or the transport it owns) alive:
+        # TestEcuServer.stop() cancels this task to shut down, which raises
+        # CancelledError out of this wait and into the finally below.
+        await asyncio.Event().wait()
+    finally:
+        transport.close()
