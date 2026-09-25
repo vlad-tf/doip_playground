@@ -88,8 +88,21 @@ class SessionRegistry:
         self._sessions[logical_addr] = session
         logger.debug("registry: registered SA=0x%04X", logical_addr)
 
-    def unregister(self, logical_addr: int) -> None:
-        if self._sessions.pop(logical_addr, None) is not None:
+    def unregister(self, logical_addr: int, session: "EcuSession") -> None:
+        """
+        Remove ``logical_addr`` only if it still points at ``session``.
+
+        Identity-checked on purpose: eviction (``evict()``) unregisters the
+        old session immediately, a new session then registers under the same
+        SA, and only *afterwards* does the evicted session's own ``run()``
+        ``finally`` run and call this again — a plain pop-by-key there would
+        remove the *new* session's entry instead of noticing it's already
+        gone. That silently defeated ISO 13400-2 §9.3 conflict resolution:
+        the registry would end up empty, and a third connection with the
+        same SA would be accepted with no alive probe at all.
+        """
+        if self._sessions.get(logical_addr) is session:
+            del self._sessions[logical_addr]
             logger.debug("registry: unregistered SA=0x%04X", logical_addr)
 
     def lookup(self, logical_addr: int) -> Optional["EcuSession"]:
@@ -192,7 +205,7 @@ class EcuSession:
             except Exception:
                 pass
             if self._registry is not None and self.tester_addr is not None:
-                self._registry.unregister(self.tester_addr)
+                self._registry.unregister(self.tester_addr, self)
             logger.info("Session closed for %s", self._peer)
 
     def evict(self) -> None:
@@ -213,7 +226,7 @@ class EcuSession:
         except Exception:
             pass
         if self._registry is not None and self.tester_addr is not None:
-            self._registry.unregister(self.tester_addr)
+            self._registry.unregister(self.tester_addr, self)
         logger.info("Evicted session for %s", self._peer)
 
     async def _send(self, raw: bytes) -> None:
