@@ -49,6 +49,10 @@ uds:
   p2_server_ms:           50     # emit 7F xx 78 if a handler takes longer
   p2_star_server_ms:      5000   # and again every 90% of this afterwards
   auto_response_pending:  true   # false = never emit 0x78 automatically
+  max_response_pending:   10     # cap on 0x78 frames per request before giving
+                                  # up with NRC 0x10; 0 = unlimited (a hung
+                                  # handler would then flood 0x78 forever and
+                                  # keep the connection alive indefinitely)
   suppress_pos_rsp_bit:   true   # honour sub-function bit 7 (e.g. 3E 80)
   functional_addr:        0x1FFF # target address treated as a functional request
 

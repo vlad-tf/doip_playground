@@ -335,6 +335,24 @@ class TestResponsePending:
         probe_for(CONFIG, [Slow()]).send("22 F1 90")
         assert finished == [True]
 
+    def test_a_handler_that_never_returns_is_capped_with_nrc_0x10(self):
+        # Without uds.max_response_pending, a handler that never returns would
+        # make this emit 7F 22 78 forever. Capped at 2 here so the test
+        # doesn't hang; a real deployment defaults to 10.
+        class Hung(Plugin):
+            name = "Hung"
+
+            @on_service(0x22)
+            async def read(self, req, ctx):
+                await asyncio.Event().wait()      # never returns
+
+        config = dict(CONFIG, uds={"max_response_pending": 2, "p2_star_server_ms": 20})
+        p = probe_for(config, [Hung()])
+        # The final NRC already went out via the responder (in p.extra) — the
+        # dispatch itself reports "nothing more to send", not the NRC bytes.
+        assert p.send("22 F1 90") is None
+        assert [hx(frame) for frame in p.extra] == ["7F 22 78", "7F 22 78", "7F 22 10"]
+
 
 class TestDeterminism:
     def test_the_same_request_twice_gives_identical_bytes(self):

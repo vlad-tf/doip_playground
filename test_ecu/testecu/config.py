@@ -171,6 +171,16 @@ class UdsConfig:
     p2_server_ms: int = 50
     p2_star_server_ms: int = 5000
     auto_response_pending: bool = True
+    #: Cap on the number of ``7F <sid> 78`` (ResponsePending) frames sent
+    #: while waiting for one request's handler.  Without a cap, a handler
+    #: that never returns (a hung/buggy plugin) makes the ECU emit 0x78
+    #: forever — and since every sent frame resets the general inactivity
+    #: timer (DoIP-080), the connection can never time out on its own either.
+    #: Once the cap is hit, the ECU gives up: sends a final NRC 0x10
+    #: (generalReject) and stops retrying, leaving the handler's task running
+    #: detached rather than force-cancelling arbitrary plugin code.  0 means
+    #: unlimited (the pre-existing, unbounded behaviour).
+    max_response_pending: int = 10
     suppress_pos_rsp_bit: bool = True
     functional_addr: int = 0x1FFF
     unknown_service: str = "nrc"    # nrc | echo | silent
@@ -354,6 +364,8 @@ def _load_uds(raw: dict) -> UdsConfig:
                                   "uds.p2_star_server_ms"),
         auto_response_pending=_to_bool(section.get("auto_response_pending", True),
                                        "uds.auto_response_pending"),
+        max_response_pending=_to_int(section.get("max_response_pending", 10),
+                                     "uds.max_response_pending"),
         suppress_pos_rsp_bit=_to_bool(section.get("suppress_pos_rsp_bit", True),
                                       "uds.suppress_pos_rsp_bit"),
         functional_addr=_to_int(section.get("functional_addr", 0x1FFF),
@@ -378,6 +390,8 @@ def _load_uds(raw: dict) -> UdsConfig:
         )
     if cfg.p2_server_ms <= 0:
         raise ConfigError("uds.p2_server_ms: must be > 0")
+    if cfg.max_response_pending < 0:
+        raise ConfigError("uds.max_response_pending: must be >= 0 (0 = unlimited)")
     return cfg
 
 

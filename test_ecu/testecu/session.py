@@ -62,6 +62,7 @@ from testecu.doip import (
 from testecu.uds import (
     FUNCTIONAL_SUPPRESSED_NRCS,
     NO_RESPONSE,
+    NRC_GENERAL_REJECT,
     NRC_RESPONSE_PENDING,
     NegativeResponse,
     SuppressResponse,
@@ -731,6 +732,16 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
     Without this a slow plugin handler blows the tester's P2 timeout.
     ``shield`` inside ``wait_for`` is the point: the timeout must observe the
     handler, never cancel it.
+
+    ``uds.max_response_pending`` caps how many 0x78 frames one request may
+    generate. A handler that never returns would otherwise make this emit
+    0x78 forever — and since every sent frame resets the general inactivity
+    timer (DoIP-080), the connection could never time out either, turning one
+    hung handler into a permanent frame flood on an immortal connection. Once
+    the cap is hit, this gives up: sends a final NRC 0x10 (generalReject) and
+    stops waiting, leaving ``task`` running detached rather than cancelling
+    it — ``shield`` already means we can't reach into arbitrary plugin code
+    safely, so a done callback just logs if it ever finishes or raises.
     """
     uds_cfg = ecu.uds
     task = asyncio.ensure_future(ecu.dispatcher.dispatch(request, state, responder))
@@ -738,11 +749,35 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
         return await task
 
     window = uds_cfg.p2_server_ms / 1000.0
+    pending_sent = 0
     while True:
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=window)
         except asyncio.TimeoutError:
+            if uds_cfg.max_response_pending and pending_sent >= uds_cfg.max_response_pending:
+                logger.warning(
+                    "%s: handler still running after %d ResponsePending frames "
+                    "— giving up with NRC 0x10 (uds.max_response_pending)",
+                    request.describe(), pending_sent,
+                )
+                task.add_done_callback(_log_abandoned_dispatch)
+                await responder(bytes([0x7F, request.sid & 0xFF, NRC_GENERAL_REJECT]))
+                return NO_RESPONSE
             logger.debug("P2 elapsed for %s — sending ResponsePending",
                          request.describe())
             await responder(bytes([0x7F, request.sid & 0xFF, NRC_RESPONSE_PENDING]))
+            pending_sent += 1
             window = (uds_cfg.p2_star_server_ms / 1000.0) * 0.9
+
+
+def _log_abandoned_dispatch(task: "asyncio.Task") -> None:
+    """Done callback for a dispatch task abandoned by the max_response_pending cap.
+
+    Only purpose: consume the eventual result/exception so asyncio doesn't
+    log "Task exception was never retrieved" for a task nothing awaits anymore.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Abandoned dispatch task raised after giving up: %r", exc)
