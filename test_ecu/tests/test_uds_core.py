@@ -154,6 +154,21 @@ class TestWriteDataByIdentifier:
         assert hx(responses[3]) == "6E 01 00"
         assert hx(responses[4]) == "62 01 00 11 22 33 44"
 
+    def test_unknown_did_is_request_out_of_range(self):
+        assert hx(probe_for(CONFIG).send("2E 99 99 01")) == "7F 2E 31"
+
+    def test_echo_policy_answers_with_the_identifier(self):
+        # unknown_did: echo must actually reach the wire on the write path
+        # too, not just on 0x22 — WriteDataByIdentifier's positive body is
+        # just ``6E <did>``, no value, so the echoed identifier bytes are a
+        # valid response body on their own.
+        p = probe_for(dict(CONFIG, uds={"unknown_did": "echo"}))
+        assert hx(p.send("2E 99 99 01")) == "6E 99 99"
+
+    def test_silent_policy_sends_nothing(self):
+        p = probe_for(dict(CONFIG, uds={"unknown_did": "silent"}))
+        assert p.send("2E 99 99 01") is None
+
     def test_wrong_value_length(self):
         p = probe_for(CONFIG)
         responses = p.exchange("10 03", "27 01", "27 02 " + GOOD_KEY, "2E 01 00 11 22")

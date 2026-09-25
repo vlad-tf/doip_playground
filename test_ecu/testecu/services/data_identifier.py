@@ -136,8 +136,12 @@ async def write_data_by_identifier(core: Any, ctx: Context) -> Any:
     # 2. YAML table
     spec = core.ecu.store.spec(did)
     if spec is None:
-        _unknown_did(core, ctx, did, "write")
-        return NO_RESPONSE                # only reachable under the 'silent' policy
+        # 'nrc' raises inside _unknown_did itself; 'silent' returns None here
+        # (-> NO_RESPONSE); 'echo' returns the identifier bytes, which is a
+        # valid WriteDataByIdentifier positive-response body on its own
+        # (``6E <did>``, no value) — it must actually be sent, not dropped.
+        echoed = _unknown_did(core, ctx, did, "write")
+        return NO_RESPONSE if echoed is None else request.positive(echoed)
     if not spec.write:
         raise ctx.nrc(NRC_REQUEST_OUT_OF_RANGE, "%s is read-only" % spec.label())
 
