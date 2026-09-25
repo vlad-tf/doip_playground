@@ -125,6 +125,11 @@ class DoipConfig:
     ecu_logical_addr: int = 0x0002
     node_type: int = 0x01
     power_mode: int = 0x01
+    #: Business-level max UDS payload for a Diagnostic Message. Since commit
+    #: 238ffa6 this also feeds session.py's framing-level read cap
+    #: (``max_len = max_payload_bytes + 4 + _FRAME_LEN_SLACK`` in
+    #: ``EcuSession._loop``) — do not relax the range check below without
+    #: re-checking that connection.
     max_payload_bytes: int = 4096
     vin: str = "00000000000000000"
     eid: str = "000000000000"
@@ -296,11 +301,40 @@ def _load_doip(raw: dict) -> DoipConfig:
                                       "doip.general_inactivity_ms"),
     )
     # Fail at startup rather than when the first announcement is built.
-    _to_hex_bytes(cfg.eid, "doip.eid")
-    _to_hex_bytes(cfg.gid, "doip.gid")
+    # ISO 13400-2's Vehicle Identification / Announcement payload (see
+    # udp.py:build_announcement_payload) has fixed 6-byte fields for EID and
+    # GID and a fixed 17-byte field for VIN; anything else misaligns every
+    # field after it rather than raising, so length is checked here, not just
+    # that the string parses as hex.
+    for name, value in (("eid", cfg.eid), ("gid", cfg.gid)):
+        decoded = _to_hex_bytes(value, "doip.%s" % name)
+        if len(decoded) != 6:
+            raise ConfigError(
+                "doip.%s: %d byte(s) after hex decoding, expected 6" % (name, len(decoded))
+            )
+    try:
+        cfg.vin.encode("ascii")
+    except UnicodeEncodeError:
+        raise ConfigError("doip.vin: %r is not pure ASCII" % cfg.vin)
+    if len(cfg.vin) != 17:
+        raise ConfigError(
+            "doip.vin: %d character(s), expected 17 (silently padding/truncating "
+            "would misalign the rest of the Vehicle Announcement payload)"
+            % len(cfg.vin)
+        )
     if not 0 <= cfg.ecu_logical_addr <= 0xFFFF:
         raise ConfigError("doip.ecu_logical_addr: 0x%X is not a 16-bit address"
                           % cfg.ecu_logical_addr)
+    # 16 MiB: far above any real Diagnostic Message, while still keeping
+    # session.py's read_frame cap (see the field's docstring above) bounded.
+    # A negative value would invert that cap instead of loosening it — a
+    # legitimate 7-byte frame would then fail as "too large" while masking
+    # the real problem, so this is a hard error, not a clamp.
+    if not 0 < cfg.max_payload_bytes <= 0x1000000:
+        raise ConfigError(
+            "doip.max_payload_bytes: %d is not a usable payload limit "
+            "(1..16777216)" % cfg.max_payload_bytes
+        )
 
     if "tester_addr_range" in section:
         bounds = _to_int_list(section["tester_addr_range"], "doip.tester_addr_range")
@@ -321,7 +355,7 @@ def _load_doip(raw: dict) -> DoipConfig:
 
 def _load_udp(raw: dict) -> UdpConfig:
     section = _section(raw, "udp")
-    return UdpConfig(
+    cfg = UdpConfig(
         enabled=_to_bool(section.get("enabled", True), "udp.enabled"),
         announce_count=_to_int(section.get("announce_count", 3), "udp.announce_count"),
         announce_interval_ms=_to_int(section.get("announce_interval_ms", 500),
@@ -329,6 +363,17 @@ def _load_udp(raw: dict) -> UdpConfig:
         announce_wait_ms=_to_int(section.get("announce_wait_ms", 500),
                                  "udp.announce_wait_ms"),
     )
+    # All three reach asyncio.sleep()/range() in run_announcer: a negative
+    # announce_count silently sends nothing, and a negative interval/wait
+    # reaches asyncio.sleep() with a value it was never meant to see. 0 stays
+    # valid throughout (announce_wait_ms's documented "act immediately";
+    # announce_count/interval's "no announcements"/"no gap between them").
+    for name, value in (("announce_count", cfg.announce_count),
+                        ("announce_interval_ms", cfg.announce_interval_ms),
+                        ("announce_wait_ms", cfg.announce_wait_ms)):
+        if value < 0:
+            raise ConfigError("udp.%s: must be >= 0" % name)
+    return cfg
 
 
 def _load_security(section: dict) -> SecurityConfig:
@@ -392,6 +437,19 @@ def _load_uds(raw: dict) -> UdsConfig:
         raise ConfigError("uds.p2_server_ms: must be > 0")
     if cfg.max_response_pending < 0:
         raise ConfigError("uds.max_response_pending: must be >= 0 (0 = unlimited)")
+    if not 0 <= cfg.functional_addr <= 0xFFFF:
+        raise ConfigError("uds.functional_addr: 0x%X is not a 16-bit address"
+                          % cfg.functional_addr)
+    # Unlike p2_server_ms, 0 is never a valid p2_star: session.py's
+    # _dispatch_with_p2 divides it into a wait window on every ResponsePending
+    # cycle, and a zero window would spin, emitting 0x78 frames as fast as it
+    # can until uds.max_response_pending finally stops it.
+    if cfg.p2_star_server_ms <= 0:
+        raise ConfigError("uds.p2_star_server_ms: must be > 0")
+    # 0 is deliberately "disabled" for s3_server_ms (see its docstring) —
+    # only reject negative, do not tighten this to > 0.
+    if cfg.s3_server_ms < 0:
+        raise ConfigError("uds.s3_server_ms: must be >= 0 (0 = disabled)")
     return cfg
 
 

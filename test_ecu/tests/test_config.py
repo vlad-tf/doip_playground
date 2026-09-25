@@ -129,6 +129,103 @@ class TestUdsSection:
         assert "functional_addr" in str(exc.value)
 
 
+class TestDoipSection:
+    def test_max_payload_bytes_negative_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"max_payload_bytes": -100000}})
+        assert "max_payload_bytes" in str(exc.value)
+
+    def test_max_payload_bytes_zero_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"max_payload_bytes": 0}})
+        assert "max_payload_bytes" in str(exc.value)
+
+    def test_max_payload_bytes_over_ceiling_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"max_payload_bytes": 0x1000001}})
+        assert "max_payload_bytes" in str(exc.value)
+
+    def test_max_payload_bytes_normal_value_is_accepted(self):
+        assert cfg({"doip": {"max_payload_bytes": 4096}}).doip.max_payload_bytes == 4096
+
+    def test_short_eid_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"eid": "AABB"}})
+        assert "doip.eid" in str(exc.value)
+
+    def test_short_gid_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"gid": "00"}})
+        assert "doip.gid" in str(exc.value)
+
+    def test_short_vin_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"vin": "SHORTVIN"}})
+        assert "doip.vin" in str(exc.value)
+
+    def test_non_ascii_vin_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"vin": "1HGBH41JXMN10918é"}})
+        assert "doip.vin" in str(exc.value)
+
+    def test_valid_eid_gid_vin_are_accepted(self):
+        parsed = cfg({"doip": {"eid": "AABBCCDDEEFF", "gid": "000000000000",
+                               "vin": "1HGBH41JXMN109186"}})
+        assert parsed.doip.eid == "AABBCCDDEEFF"
+        assert parsed.doip.vin == "1HGBH41JXMN109186"
+
+
+class TestUdsRanges:
+    def test_functional_addr_out_of_range_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"uds": {"functional_addr": 0x12345}})
+        assert "functional_addr" in str(exc.value)
+
+    def test_p2_star_server_ms_zero_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"uds": {"p2_star_server_ms": 0}})
+        assert "p2_star_server_ms" in str(exc.value)
+
+    def test_p2_star_server_ms_negative_is_rejected(self):
+        with pytest.raises(ConfigError):
+            cfg({"uds": {"p2_star_server_ms": -1}})
+
+    def test_s3_server_ms_negative_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"uds": {"s3_server_ms": -1}})
+        assert "s3_server_ms" in str(exc.value)
+
+    def test_s3_server_ms_zero_still_means_disabled(self):
+        # 0 is the documented "disabled" value -- must stay accepted.
+        assert cfg({"uds": {"s3_server_ms": 0}}).uds.s3_server_ms == 0
+
+
+class TestUdpRanges:
+    def test_announce_count_negative_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"udp": {"announce_count": -1}})
+        assert "announce_count" in str(exc.value)
+
+    def test_announce_interval_ms_negative_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"udp": {"announce_interval_ms": -1}})
+        assert "announce_interval_ms" in str(exc.value)
+
+    def test_announce_wait_ms_negative_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"udp": {"announce_wait_ms": -1}})
+        assert "announce_wait_ms" in str(exc.value)
+
+    def test_zero_still_means_disabled_for_all_three(self):
+        # 0 is documented ("no announcements" / "no gap" / "act immediately")
+        # -- must stay accepted, not tightened into > 0 by accident.
+        parsed = cfg({"udp": {"announce_count": 0, "announce_interval_ms": 0,
+                              "announce_wait_ms": 0}})
+        assert parsed.udp.announce_count == 0
+        assert parsed.udp.announce_interval_ms == 0
+        assert parsed.udp.announce_wait_ms == 0
+
+
 class TestPlugins:
     def test_entry_needs_exactly_one_source(self):
         with pytest.raises(ConfigError) as exc:
