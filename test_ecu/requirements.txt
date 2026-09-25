@@ -5,4 +5,6 @@
 pyyaml>=6.0
 
 # Development only:
-#   pip3 install --user pytest pytest-asyncio
+#   pip3 install --user pytest
+# No pytest-asyncio: async tests are driven through the run() helper in
+# tests/conftest.py instead (see pytest.ini).
