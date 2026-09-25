@@ -177,6 +177,29 @@ class SuppressResponse(Exception):
     """
 
 
+class AbortConnectionAfterResponse(Exception):
+    """
+    Internal control flow: send ``response``, then abortively close the
+    TCP_DATA connection (architecture roadmap P9).
+
+    A handler cannot both ``return`` bytes to send and ask for the socket to
+    go away afterward, so this exception carries the response instead.
+    Raised today only by ``services/reset.py``'s ``ecu_reset`` when
+    ``uds.reset_drops_connection`` is set — a real ECU disappears off the bus
+    on reset; TestEcu's default behaviour keeps the socket open (see that
+    module's docstring) precisely because most callers want the opposite of
+    this. ``session.py``'s ``_uds_worker`` is the only thing that catches
+    this — a caller outside a live connection (``conftest.Probe``, say) will
+    see it propagate as an ordinary unhandled exception, which is correct:
+    there is no connection for it to close.
+    """
+
+    def __init__(self, response: bytes, reason: str) -> None:
+        self.response = response
+        self.reason = reason
+        super().__init__(reason)
+
+
 class _NoResponse:
     """Sentinel: the request was handled, but nothing is to be sent back."""
 

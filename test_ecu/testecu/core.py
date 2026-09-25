@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from testecu.config import EcuConfig, UdsConfig
 from testecu.dispatcher import Dispatcher
+from testecu.doip_dispatcher import DoipDispatcher
 from testecu.loader import load_plugins
 from testecu.plugin import Plugin
 from testecu.store import DidStore
@@ -98,6 +99,14 @@ class SessionState:
             timeout, self.session_type, (" for " + self._label) if self._label else "",
         )
         self.reset()
+        # Architecture roadmap P9: this timer can legitimately fire with no
+        # live socket watching it (the tester disconnected mid-non-default
+        # session and hasn't reconnected yet -- the whole point of keying
+        # state by tester rather than by socket). Reverting to default here
+        # is exactly the "nothing left to remember" tidy-up condition, so
+        # drop this entry from the shared table now rather than leaving it
+        # to a reconnect that may never come.
+        self._ecu.maybe_drop_session_state(self.tester_addr, self)
 
     def _cancel_s3(self) -> None:
         if self._s3_task is not None and not self._s3_task.done():
@@ -133,6 +142,21 @@ class EcuCore:
             plugins = load_plugins(config.plugins.specs, strict=config.plugins.strict)
         self.plugins: List[Plugin] = plugins
         self.dispatcher = Dispatcher(self, plugins, self.log)
+        #: DoIP-layer hooks (architecture roadmap P2) — routing activation,
+        #: diagnostic ACK, frame rx/tx, identification request. Separate
+        #: from ``dispatcher`` on purpose; see ``doip_dispatcher.py``.
+        self.doip_hooks = DoipDispatcher(self, plugins, self.log)
+        #: UDS session state keyed by tester logical address, not by socket
+        #: (architecture roadmap P9) -- a tester that drops TCP and
+        #: reconnects within S3 finds the same session/security state, the
+        #: same way a real ECU's diagnostic session belongs to the tester,
+        #: not the transport. ``SessionRegistry`` (``session.py``) answers a
+        #: different question -- which *socket* currently owns an SA -- and
+        #: is intentionally not merged with this. Bounded by construction:
+        #: at most one entry per SA in ``doip.tester_addr_range``, and
+        #: ``maybe_drop_session_state`` keeps only non-default ones around
+        #: past their socket closing.
+        self._session_states: Dict[int, "SessionState"] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -156,7 +180,82 @@ class EcuCore:
     # -- state -------------------------------------------------------------
 
     def new_session(self, label: str = "") -> SessionState:
+        """A throwaway ``SessionState``, not tracked in ``_session_states``.
+
+        Kept for callers that drive UDS resolution without a real socket
+        (``tests/conftest.py``'s ``Probe``) -- they want a fresh state each
+        time, not one keyed by and shared across some tester address.
+        """
         return SessionState(self, label)
+
+    def session_for(self, tester_addr: int, label: str = "") -> SessionState:
+        """
+        The ``SessionState`` for ``tester_addr`` (architecture roadmap P9).
+
+        Returns the existing entry when this tester still has one (a
+        reconnect within S3, or a still-live one from another socket that
+        just got evicted via §9.3 conflict resolution) or creates and
+        registers a fresh default/locked one otherwise. Called from
+        ``session.py`` only on a *successful* Routing Activation -- there is
+        no state to look up or create before a tester has a registered SA.
+        """
+        state = self._session_states.get(tester_addr)
+        if state is not None:
+            state._label = label
+            return state
+        state = SessionState(self, label)
+        state.tester_addr = tester_addr
+        self._session_states[tester_addr] = state
+        return state
+
+    def maybe_drop_session_state(self, tester_addr: Optional[int],
+                                 state: "Optional[SessionState]" = None) -> None:
+        """
+        Drop ``tester_addr``'s state if there is nothing left to remember.
+
+        "Nothing to remember" = default session, security locked, no
+        pending seed -- the same state a fresh ``SessionState`` would start
+        in, so keeping it around buys a reconnecting tester nothing. Called
+        when a socket closes/is evicted (``session.py``) and when the S3
+        timer itself returns a state to default with no socket watching
+        (``SessionState._s3_expiry``). A non-default state is deliberately
+        left in place either way, for a reconnect within S3 to find.
+
+        ``state``, when given, is identity-checked against the table entry
+        before anything is dropped -- the same reason
+        ``SessionRegistry.unregister`` identity-checks (see that docstring):
+        an evicted socket's own ``run()`` can notice its writer closed and
+        run its cleanup well after a *new* socket has already looked up or
+        created a fresh entry for the same SA, and a plain
+        "drop by SA" here would delete that new session's state instead of
+        the caller's own, stale one.
+        """
+        if tester_addr is None:
+            return
+        current = self._session_states.get(tester_addr)
+        if current is None:
+            return
+        if state is not None and current is not state:
+            return    # this entry now belongs to a different, newer session
+        if (current.session_type == self.uds.default_session
+                and current.security_level == 0
+                and current.seed_pending is None):
+            current.close()
+            del self._session_states[tester_addr]
+
+    def drop_session_state(self, tester_addr: Optional[int]) -> None:
+        """
+        Unconditionally forget ``tester_addr``'s state.
+
+        Used only by ECUReset when ``uds.reset_drops_connection`` is set: a
+        real reset forgets everything immediately, not just when the state
+        happens to already be tidy.
+        """
+        if tester_addr is None:
+            return
+        state = self._session_states.pop(tester_addr, None)
+        if state is not None:
+            state.close()
 
     def reset(self, clear_writes: bool = True) -> None:
         """ECUReset: drop runtime DID writes and the routine bookkeeping."""
@@ -182,4 +281,7 @@ class EcuCore:
         hooks = self.dispatcher.describe()
         lines.append("Hooks               : %d" % len(hooks))
         lines.extend(hooks)
+        doip_hooks = self.doip_hooks.describe()
+        lines.append("DoIP-layer hooks    : %d" % len(doip_hooks))
+        lines.extend(doip_hooks)
         return lines

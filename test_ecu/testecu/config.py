@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from testecu.doip import TESTER_ADDR_RANGE
+from testecu.doip import ALIVE_PROBE_TIMEOUT_S, TESTER_ADDR_RANGE
 from testecu.uds import (
     NRC_NAMES,
     SESSION_DEFAULT,
@@ -146,6 +146,23 @@ class DoipConfig:
     #: how long a registered socket may be idle (no data either way) before the
     #: ECU closes it.  Reset on any traffic.  Default 5 min per spec.
     general_inactivity_ms: int = 300000
+    #: Advertised/enforced concurrent-session limit (architecture roadmap P3).
+    #: Single source of truth for two things that must agree: the Routing
+    #: Activation check in ``session.py`` (deny new registrations past this
+    #: count with ISO 13400-2 Table 25 code 0x01, "all sockets in use") and
+    #: the Entity Status Response's ``max_sockets`` byte in ``udp.py``. This
+    #: is deliberately a different number from the TCP ``listen`` backlog
+    #: (the kernel's pending-*accept* queue) — do not thread ``backlog`` into
+    #: either of those two places again.
+    max_concurrent_sessions: int = 8
+    #: ISO 13400-2 ``T_TCP_Alive_Check`` (architecture roadmap P6) — how long
+    #: ``session.py`` waits for an Alive Check Response during §9.3
+    #: conflict-resolution probing before treating the probed socket as
+    #: dead. ``doip.ALIVE_PROBE_TIMEOUT_S`` stays the module constant this
+    #: field defaults from (it is also the frozen parity anchor
+    #: ``test_doip_parity.py`` checks against ``echo_ecu`` — do not remove
+    #: it in favour of this field).
+    alive_check_timeout_ms: int = int(ALIVE_PROBE_TIMEOUT_S * 1000)
 
 
 @dataclass
@@ -195,6 +212,13 @@ class UdsConfig:
     unknown_did: str = "nrc"        # nrc | echo | silent
     on_handler_error: str = "nrc"   # nrc | fallthrough | silent
     reset_clears_writes: bool = True
+    #: ECUReset behaviour (architecture roadmap P9). ``False`` (default):
+    #: session resets in place, the TCP connection stays open -- see
+    #: ``services/reset.py``'s docstring for why. ``True``: the connection
+    #: closes abortively right after the positive response and this
+    #: tester's session state is dropped outright, the way an actually
+    #: -vanishing ECU would behave.
+    reset_drops_connection: bool = False
     sessions: List[int] = field(default_factory=lambda: [0x01, 0x02, 0x03, 0x04])
     security: SecurityConfig = field(default_factory=SecurityConfig)
 
@@ -302,6 +326,11 @@ def _load_doip(raw: dict) -> DoipConfig:
                                       "doip.initial_inactivity_ms"),
         general_inactivity_ms=_to_int(section.get("general_inactivity_ms", 300000),
                                       "doip.general_inactivity_ms"),
+        max_concurrent_sessions=_to_int(section.get("max_concurrent_sessions", 8),
+                                        "doip.max_concurrent_sessions"),
+        alive_check_timeout_ms=_to_int(
+            section.get("alive_check_timeout_ms", int(ALIVE_PROBE_TIMEOUT_S * 1000)),
+            "doip.alive_check_timeout_ms"),
     )
     # Fail at startup rather than when the first announcement is built.
     # ISO 13400-2's Vehicle Identification / Announcement payload (see
@@ -337,6 +366,16 @@ def _load_doip(raw: dict) -> DoipConfig:
         raise ConfigError(
             "doip.max_payload_bytes: %d is not a usable payload limit "
             "(1..16777216)" % cfg.max_payload_bytes
+        )
+    if cfg.max_concurrent_sessions <= 0:
+        raise ConfigError(
+            "doip.max_concurrent_sessions: %d must be a positive count "
+            "(0 would deny every Routing Activation)" % cfg.max_concurrent_sessions
+        )
+    if cfg.alive_check_timeout_ms <= 0:
+        raise ConfigError(
+            "doip.alive_check_timeout_ms: %d must be positive "
+            "(0 would never wait for a response)" % cfg.alive_check_timeout_ms
         )
 
     if "tester_addr_range" in section:
@@ -427,6 +466,9 @@ def _load_uds(raw: dict) -> UdsConfig:
                                  "uds.on_handler_error"),
         reset_clears_writes=_to_bool(section.get("reset_clears_writes", True),
                                      "uds.reset_clears_writes"),
+        reset_drops_connection=_to_bool(
+            section.get("reset_drops_connection", False),
+            "uds.reset_drops_connection"),
         security=_load_security(_section(section, "security")),
     )
     if "sessions" in section:

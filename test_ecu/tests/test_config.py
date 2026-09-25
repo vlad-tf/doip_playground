@@ -148,6 +148,37 @@ class TestDoipSection:
     def test_max_payload_bytes_normal_value_is_accepted(self):
         assert cfg({"doip": {"max_payload_bytes": 4096}}).doip.max_payload_bytes == 4096
 
+    def test_max_concurrent_sessions_defaults_to_8(self):
+        assert cfg().doip.max_concurrent_sessions == 8
+
+    def test_max_concurrent_sessions_zero_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"max_concurrent_sessions": 0}})
+        assert "max_concurrent_sessions" in str(exc.value)
+
+    def test_max_concurrent_sessions_negative_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"max_concurrent_sessions": -1}})
+        assert "max_concurrent_sessions" in str(exc.value)
+
+    def test_max_concurrent_sessions_normal_value_is_accepted(self):
+        assert cfg({"doip": {"max_concurrent_sessions": 3}}
+                  ).doip.max_concurrent_sessions == 3
+
+    def test_alive_check_timeout_ms_defaults_to_500(self):
+        # Parity with doip.ALIVE_PROBE_TIMEOUT_S (0.5s) -- architecture
+        # roadmap P6: the constant stays the documented default.
+        assert cfg().doip.alive_check_timeout_ms == 500
+
+    def test_alive_check_timeout_ms_zero_is_rejected(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"alive_check_timeout_ms": 0}})
+        assert "alive_check_timeout_ms" in str(exc.value)
+
+    def test_alive_check_timeout_ms_normal_value_is_accepted(self):
+        assert cfg({"doip": {"alive_check_timeout_ms": 250}}
+                  ).doip.alive_check_timeout_ms == 250
+
     def test_short_eid_is_rejected(self):
         with pytest.raises(ConfigError) as exc:
             cfg({"doip": {"eid": "AABB"}})

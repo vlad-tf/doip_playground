@@ -30,10 +30,12 @@ import struct
 from typing import Any, Optional
 
 from testecu.config import EcuConfig
+from testecu.plugin import DoipContext, IdentificationRequest
 from testecu.doip import (
     DOIP_MCAST_ADDR,
     PT_ENTITY_STATUS_REQUEST,
     PT_ENTITY_STATUS_RESPONSE,
+    PT_HEADER_NACK,
     PT_POWER_MODE_REQUEST,
     PT_POWER_MODE_RESPONSE,
     PT_VEHICLE_ID_REQUEST,
@@ -41,6 +43,27 @@ from testecu.doip import (
     PT_VEHICLE_ID_REQUEST_WITH_VIN,
     PT_VEHICLE_ID_RESPONSE,
     build_frame,
+    validate_header,
+)
+
+#: Payload types this UDP_DISCOVERY listener accepts on an inbound datagram
+#: (architecture roadmap P4). Anything else gets a Header NACK 0x01, same
+#: wire shape as the TCP_DATA side, instead of the previous silent drop.
+_UDP_KNOWN_TYPES = (
+    PT_ENTITY_STATUS_REQUEST,
+    PT_POWER_MODE_REQUEST,
+    PT_VEHICLE_ID_REQUEST,
+    PT_VEHICLE_ID_REQUEST_WITH_EID,
+    PT_VEHICLE_ID_REQUEST_WITH_VIN,
+)
+
+#: ISO 13400-2 Figure 8: only a Vehicle Identification Request may use
+#: protocol version 0xFF ("not yet known") — Entity Status and Power Mode
+#: Info requests always require ``ACCEPTED_VERSIONS`` like everything else.
+_VERSION_WILDCARD_TYPES = (
+    PT_VEHICLE_ID_REQUEST,
+    PT_VEHICLE_ID_REQUEST_WITH_EID,
+    PT_VEHICLE_ID_REQUEST_WITH_VIN,
 )
 
 logger = logging.getLogger("testecu.udp")
@@ -102,7 +125,8 @@ class _UDPProtocol(asyncio.DatagramProtocol):
     """Answers Vehicle Identification and Entity Status Requests, sends announcements."""
 
     def __init__(self, config: EcuConfig, if_index: int,
-                 registry: Optional[Any] = None, max_sockets: int = 1) -> None:
+                 registry: Optional[Any] = None, max_sockets: int = 1,
+                 doip_hooks: Optional[Any] = None) -> None:
         self._payload = build_announcement_payload(config)
         self._if_index = if_index
         self._port = config.listen.port
@@ -113,6 +137,9 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         #: ``_entity_status_payload`` for what it can and can't tell us.
         self._registry = registry
         self._max_sockets = max_sockets
+        #: DoIP-layer hooks (architecture roadmap P2) — ``on_identification_request``
+        #: only, on this side; see the module docstring.
+        self._doip_hooks = doip_hooks
         self._transport: Optional[asyncio.DatagramTransport] = None
         #: Entity identification used to match 0x0002 (VIR with EID) requests.
         self._eid = bytes.fromhex(config.doip.eid)
@@ -128,6 +155,24 @@ class _UDPProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         if len(data) < 8:
             return
+
+        # Architecture roadmap P4: shared with session.py's TCP_DATA loop via
+        # ``testecu.doip.validate_header``. Previously this listener never
+        # checked the generic header at all — a bad version/inverse or a
+        # payload type it doesn't handle just silently fell through every
+        # ``if`` below instead of getting the Header NACK ISO 13400-2 expects.
+        nack = validate_header(data, _UDP_KNOWN_TYPES,
+                               version_wildcard_types=_VERSION_WILDCARD_TYPES)
+        if nack is not None:
+            logger.warning(
+                "UDP: invalid header (ver=0x%02X inv=0x%02X pt=0x%04X) from %s "
+                "— Header NACK 0x%02X", data[0], data[1],
+                struct.unpack("!H", data[2:4])[0], addr, nack,
+            )
+            if self._transport:
+                self._transport.sendto(build_frame(PT_HEADER_NACK, bytes([nack])), addr)
+            return
+
         pt = struct.unpack("!H", data[2:4])[0]
         if pt == PT_ENTITY_STATUS_REQUEST:
             logger.debug("UDP: Entity Status Request from %s", addr)
@@ -158,7 +203,7 @@ class _UDPProtocol(asyncio.DatagramProtocol):
                 return
             logger.debug("UDP: Vehicle Identification Request (pt=0x%04X) from %s",
                          pt, addr)
-            self._schedule_identification_response(addr)
+            self._schedule_identification_response(addr, pt, req)
             return
 
     def _matches(self, req: bytes, pt: int) -> bool:
@@ -171,17 +216,18 @@ class _UDPProtocol(asyncio.DatagramProtocol):
             return len(req) >= 17 and req[:17] == self._vin
         return False
 
-    def _schedule_identification_response(self, addr: tuple) -> None:
+    def _schedule_identification_response(self, addr: tuple, pt: int, req: bytes) -> None:
         """Send the identification response after a deferred A_DoIP_Announce_Wait."""
         if self._transport is None:
             return
         delay = _stagger_delay_ms(addr, self._announce_wait_ms) / 1000.0
         loop = asyncio.get_running_loop()
-        task = loop.create_task(self._send_identification_after(delay, addr))
+        task = loop.create_task(self._send_identification_after(delay, addr, pt, req))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _send_identification_after(self, delay: float, addr: tuple) -> None:
+    async def _send_identification_after(self, delay: float, addr: tuple,
+                                         pt: int, req: bytes) -> None:
         # ISO 13400-2 DoIP-051: the delay avoids UDP packet bursts when many
         # DoIP entities share the network and all answer one broadcast request.
         # TestEcu derives the delay deterministically from the requester (see
@@ -189,6 +235,29 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         # assertable — a documented deviation from the ISO's random 0..500 ms.
         if delay:
             await asyncio.sleep(delay)
+
+        if self._doip_hooks is not None:
+            async def _send_to(payload_type: int, data: bytes, _addr: tuple = addr) -> None:
+                if self._transport:
+                    self._transport.sendto(build_frame(payload_type, data), _addr)
+
+            ctx = DoipContext(ecu=None, log=logger, peer=addr, send_frame=_send_to)
+            override = await self._doip_hooks.resolve_identification_request(
+                IdentificationRequest(payload_type=pt, requester=addr, raw=req), ctx)
+            if override is not None:
+                if override:
+                    await _send_to(PT_VEHICLE_ID_RESPONSE, override)
+                    logger.debug(
+                        "UDP: sent DoIP-hook-overridden Vehicle Identification "
+                        "Response to %s", addr,
+                    )
+                else:
+                    logger.info(
+                        "DoIP hook withheld the Vehicle Identification Response to %s",
+                        addr,
+                    )
+                return
+
         if self._transport:
             self._transport.sendto(build_frame(PT_VEHICLE_ID_RESPONSE, self._payload), addr)
             logger.debug("UDP: sent Vehicle Identification Response to %s", addr)
@@ -200,8 +269,10 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         it a UDP_DISCOVERY-only message type, so ``session.py``'s TCP_DATA
         loop rejects it instead of answering it (see that module's docstring).
 
-        ``max_sockets`` is the caller's TCP listen backlog (best available
-        proxy — this ECU does not otherwise cap concurrent sessions).
+        ``max_sockets`` is ``doip.max_concurrent_sessions`` (architecture
+        roadmap P3) — the same number ``session.py``'s Routing Activation
+        check enforces, not the TCP listen backlog (a different thing: the
+        kernel's pending-*accept* queue, not a concurrent-session limit).
         ``open_sockets`` is ``len(registry)``: sessions that have completed
         Routing Activation. That is an approximation, not an exact count of
         open TCP sockets — a connected-but-not-yet-activated socket holds a
@@ -230,7 +301,7 @@ class _UDPProtocol(asyncio.DatagramProtocol):
 
 
 async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
-                        max_sockets: int = 1) -> None:
+                        max_sockets: int = 1, doip_hooks: Optional[Any] = None) -> None:
     """
     Bind UDP/IPv6, join the DoIP multicast group, wait out
     A_DoIP_Announce_Wait, send the configured number of announcements, then
@@ -242,8 +313,10 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
     stop the TCP side from coming up.
 
     ``registry``/``max_sockets`` are only used to answer Entity Status
-    Requests (see ``_UDPProtocol._entity_status_payload``); both default so
-    this stays usable standalone, same as before this parameter existed.
+    Requests (see ``_UDPProtocol._entity_status_payload``); ``doip_hooks``
+    only for ``@on_identification_request`` (architecture roadmap P2). All
+    three default so this stays usable standalone, same as before these
+    parameters existed.
     """
     interface = config.listen.interface
     port = config.listen.port
@@ -287,7 +360,8 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
 
     loop = asyncio.get_running_loop()
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: _UDPProtocol(config, if_index, registry=registry, max_sockets=max_sockets),
+        lambda: _UDPProtocol(config, if_index, registry=registry, max_sockets=max_sockets,
+                             doip_hooks=doip_hooks),
         sock=sock,
     )
 

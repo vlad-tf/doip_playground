@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
-from typing import Optional
+from typing import Iterable, Optional
 
 # ---------------------------------------------------------------------------
 # Protocol version
@@ -89,6 +89,18 @@ NACK_OUT_OF_MEMORY            = 0x05
 NACK_TARGET_UNREACHABLE       = 0x06
 NACK_UNKNOWN_NETWORK          = 0x07
 NACK_TRANSPORT_PROTOCOL_ERROR = 0x08
+
+# Generic Header (PT_HEADER_NACK) negative acknowledge codes (ISO 13400-2
+# Table 14 / DoIP-045) — architecture roadmap P6. A *different* code space
+# from the ``NACK_*`` family above (Table 26, the Diagnostic Message NACK):
+# the two tables happen to share some of the same small integers (0x00..0x04
+# on both), which is exactly why they are named distinctly here rather than
+# under one shared prefix — conflating them would make a call site's
+# ``0x02`` ambiguous between "message too large" on two unrelated tables.
+NACK_GENERIC_INCORRECT_PATTERN      = 0x00
+NACK_GENERIC_UNKNOWN_PAYLOAD_TYPE   = 0x01
+NACK_GENERIC_MESSAGE_TOO_LARGE      = 0x02
+NACK_GENERIC_INVALID_PAYLOAD_LENGTH = 0x04
 
 # Tester (client) logical address range accepted by Routing Activation
 # (ISO 13400-2 Table 13). A source address outside this range is denied with
@@ -160,6 +172,54 @@ async def read_frame(reader: asyncio.StreamReader,
         return hdr
     payload = await reader.readexactly(plen)
     return hdr + payload
+
+
+def validate_header(raw: bytes, known_types: Optional[Iterable[int]] = None, *,
+                    version_wildcard_types: Iterable[int] = ()) -> Optional[int]:
+    """
+    ISO 13400-2 Table 2 Generic Header check: protocol version vs. its
+    bitwise-inverse companion, plus (when the caller cares) whether the
+    payload type is one it accepts at all.
+
+    Shared between ``session.py`` (TCP_DATA) and ``udp.py`` (UDP_DISCOVERY)
+    — architecture roadmap P4. The two sides used to check this
+    independently; TCP validated version/inverse inline and UDP didn't check
+    it at all, so any junk header slipped straight through
+    ``datagram_received``'s payload-type dispatch.
+
+    Returns a Generic Header NACK code (Table 14 / DoIP-045) or ``None`` if
+    the header is acceptable:
+
+      - ``0x00`` ("incorrect pattern format") if ``inv`` isn't ``raw[0]``'s
+        bitwise complement, or the version isn't one of
+        ``ACCEPTED_VERSIONS`` and isn't the ``0xFF`` "version not yet known"
+        wildcard for a payload type listed in ``version_wildcard_types``.
+        ISO 13400-2 Figure 8 permits ``0xFF`` specifically on a Vehicle
+        Identification Request, because a tester that has not yet completed
+        the vehicle discovery exchange cannot know which protocol version
+        this entity speaks — TCP_DATA has no such request, so it passes an
+        empty tuple and never allows the wildcard.
+      - ``0x01`` ("unknown payload type") if ``known_types`` is given and
+        the payload type isn't in it. ``None`` (the default) skips this
+        check entirely — a caller that already has its own payload-type
+        dispatch/fallback (``session.py``'s, unchanged by this function) can
+        keep doing that instead of duplicating it here.
+
+    ``raw`` must be at least the 4 leading header bytes (version, inverse,
+    2-byte payload type); every caller reaches this only after a complete
+    8-byte-header read (``read_frame`` on TCP, the ``len(data) < 8`` guard on
+    UDP), so that is never actually the tight edge in practice.
+    """
+    ver = raw[0]
+    inv = raw[1]
+    pt = struct.unpack("!H", raw[2:4])[0]
+    if inv != (0xFF ^ ver):
+        return NACK_GENERIC_INCORRECT_PATTERN
+    if ver not in ACCEPTED_VERSIONS and not (ver == 0xFF and pt in version_wildcard_types):
+        return NACK_GENERIC_INCORRECT_PATTERN
+    if known_types is not None and pt not in known_types:
+        return NACK_GENERIC_UNKNOWN_PAYLOAD_TYPE
+    return None
 
 
 def ptype(raw: bytes) -> int:

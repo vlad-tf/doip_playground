@@ -217,7 +217,7 @@ Implemented by the core, all of it overridable by `@on_service`:
 | SID | Service | Notes |
 |---|---|---|
 | `0x10` | DiagnosticSessionControl | `50 <sub> P2 P2*`; relocks security, re-arms S3 |
-| `0x11` | ECUReset | restores DID defaults; **does not drop the TCP connection** (see below) |
+| `0x11` | ECUReset | restores DID defaults; drops the TCP connection only if `uds.reset_drops_connection` is set (see below) |
 | `0x22` | ReadDataByIdentifier | multi-DID; serves `0xF186` = active session |
 | `0x27` | SecurityAccess | fixed seed + `none`/`xor`/`add` key; attempt counter |
 | `0x2E` | WriteDataByIdentifier | length-checked against the YAML `length:` |
@@ -232,9 +232,21 @@ example in about fifteen lines.
 
 ### Deliberate deviations from a real ECU
 
-- **ECUReset keeps the socket open.** A real ECU would vanish off the bus. Dropping the
-  connection would force every test client to reconnect and re-activate routing after
-  each reset, which makes the simulator much less useful.
+- **ECUReset keeps the socket open by default, switchably.** A real ECU would vanish off
+  the bus. Dropping the connection on every reset would force every test client to
+  reconnect and re-activate routing each time, which makes the simulator much less useful
+  for most testing — so `uds.reset_drops_connection` defaults to `false` and resets happen
+  in place. Set it `true` to get the real-ECU behaviour instead (the connection closes
+  abortively right after the positive response, and this tester's session state is
+  forgotten outright) when what you are exercising is an EdgeNode's own "ECU vanished,
+  came back" reconnect handling, which the default behaviour cannot exercise at all.
+- **Session/security state belongs to the tester, not the socket.** A tester that enters
+  a non-default session, unlocks security, then drops TCP (network blip, deliberate
+  reconnect test, whatever) and reconnects within `s3_server_ms` finds the *same* state —
+  matching a real ECU, whose diagnostic session belongs to the tester and only elapses via
+  S3, not via the transport. `SessionRegistry` (which socket currently owns a given tester
+  address) is a separate structure from this and is unaffected: at most one live socket per
+  tester either way, this is only about what UDS state a reconnecting tester finds.
 - **Nothing is random.** The security seed comes from the config, and the `echo`
   fallback echoes the request with no random trailer (the echo node appends four random
   bytes). A simulator you cannot write an assertion against is not worth much.
@@ -277,6 +289,7 @@ Sections `listen`, `doip` and `udp` are identical to
 | `unknown_did` | `nrc` | `nrc` → `7F <sid> 31`, `echo` (returns the DID), `silent` |
 | `on_handler_error` | `nrc` | `nrc` → `7F <sid> 22`, `fallthrough`, `silent` |
 | `reset_clears_writes` | `true` | ECUReset restores YAML DID defaults |
+| `reset_drops_connection` | `false` | `true` = ECUReset closes the TCP connection abortively and forgets this tester's session state, instead of resetting it in place |
 | `security.*` | | `enabled`, `seed`, `algorithm`, `key`, `max_attempts` |
 
 `unknown_service: echo` reproduces the echo node's behaviour if you want a drop-in
@@ -368,6 +381,23 @@ volume somewhere else to use a directory outside this repo:
 volumes:
   - /path/to/my_plugins:/app/plugins:ro
 ```
+
+### Why TestEcu is IPv6-only
+
+TestEcu binds `AF_INET6` only, with no IPv4 fallback — a deliberate decision
+(architecture roadmap P8), not an oversight. The top-level
+[`docker-compose.yml`](../docker-compose.yml) does have an IPv4 network
+(`doip_frontend`, 172.30.100.0/24), which can look like tension with an
+IPv6-only ECU, but that network sits between `doip-pc-tester` and
+`doip-edgenode` only — TestEcu is attached solely to `doip_backend`
+(`fd2e:646f:6970::/64`), the same IPv6 ULA the frozen `echo_ecu` node uses.
+The EdgeNode is the IPv4/IPv6 bridge in this topology; nothing ever needs to
+reach TestEcu directly over IPv4. If that changes — a future test target that
+puts an IPv4-only tester or gateway directly on TestEcu's own network — IPv4
+support becomes a real `listen.family` option at that point (`server.py`'s
+socket setup and `udp.py`'s announcer would both need a genuine second code
+path, not a one-line family swap); until then, adding it speculatively would
+just be more surface with no test target to exercise it against.
 
 ---
 

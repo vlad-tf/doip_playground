@@ -29,6 +29,14 @@ doip:
                                   # socket never sends a valid Routing Activation
   general_inactivity_ms:  300000  # T_TCP_General_Inactivity: close a registered
                                   # socket after 5 min of no traffic either way
+  max_concurrent_sessions: 8      # advertised (Entity Status max_sockets) AND
+                                  # enforced: a Routing Activation beyond this
+                                  # many registered SAs is denied (0x01, "all
+                                  # sockets in use") -- distinct from the TCP
+                                  # listen backlog, which is not a session limit
+  alive_check_timeout_ms:  500    # T_TCP_Alive_Check: how long a competing
+                                  # Routing Activation waits for an Alive Check
+                                  # Response before evicting the probed socket
 
 udp:
   enabled:              true  # false (or --no-udp) skips the announcer entirely
@@ -64,6 +72,9 @@ uds:
   on_handler_error:       nrc    # nrc -> 7F <sid> 22 | fallthrough | silent
 
   reset_clears_writes:    true   # ECUReset restores the DID defaults below
+  reset_drops_connection: false  # true = ECUReset closes the connection abortively
+                                 # and forgets this tester's session state, instead
+                                 # of resetting it in place (see README.md)
 
   # SecurityAccess (0x27).  Deliberately trivial — a real seed/key algorithm
   # belongs in a plugin via @on_service(0x27).  The seed is fixed, never random,

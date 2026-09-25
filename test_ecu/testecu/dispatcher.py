@@ -50,6 +50,14 @@ from testecu.plugin import (
     Context,
     Plugin,
 )
+
+#: The UDS-layer kinds this dispatcher knows how to bucket. A plugin may also
+#: carry DoIP-layer kinds (``on_routing_activation`` and friends,
+#: architecture roadmap P2) in the same ``plugin.hooks`` table — those are
+#: ``DoipDispatcher``'s job, not this class's, so they are skipped here
+#: rather than raising.
+_UDS_KINDS = frozenset((KIND_OBSERVER, KIND_SERVICE, KIND_READ_DID,
+                       KIND_WRITE_DID, KIND_ROUTINE))
 from testecu.uds import (
     NO_RESPONSE,
     NRC_CONDITIONS_NOT_CORRECT,
@@ -137,6 +145,8 @@ class Dispatcher:
     def _register(self, plugins: Iterable[Plugin]) -> None:
         for plugin in plugins:
             for kind, table in plugin.hooks.items():
+                if kind not in _UDS_KINDS:
+                    continue    # a DoIP-layer kind -- DoipDispatcher's job
                 for key, entries in table.items():
                     for method_name, extra in entries:
                         priority = extra.get("priority")

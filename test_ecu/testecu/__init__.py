@@ -27,9 +27,18 @@ from __future__ import annotations
 
 from testecu.plugin import (
     ANY_SERVICE,
+    WITHHOLD_ACK,
     Context,
+    DoipContext,
+    IdentificationRequest,
     Plugin,
+    RoutingActivationRequest,
+    on_diagnostic_ack,
+    on_frame_rx,
+    on_frame_tx,
+    on_identification_request,
     on_request,
+    on_routing_activation,
     on_service,
     read_did,
     routine,
@@ -71,6 +80,10 @@ __all__ = [
     # Plugin API
     "Plugin", "Context", "on_service", "on_request",
     "read_did", "write_did", "routine", "ANY_SERVICE",
+    # DoIP-layer plugin API (architecture roadmap P2)
+    "DoipContext", "RoutingActivationRequest", "IdentificationRequest",
+    "on_routing_activation", "on_diagnostic_ack", "on_frame_rx", "on_frame_tx",
+    "on_identification_request", "WITHHOLD_ACK",
     # Control flow
     "NegativeResponse", "NO_RESPONSE", "UdsRequest",
     # Sessions

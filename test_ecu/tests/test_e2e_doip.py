@@ -31,6 +31,7 @@ from testecu.doip import (
     PT_DIAGNOSTIC_NEGATIVE_ACK,
     PT_DIAGNOSTIC_POSITIVE_ACK,
     PT_ENTITY_STATUS_REQUEST,
+    PT_ENTITY_STATUS_RESPONSE,
     PT_HEADER_NACK,
     PT_POWER_MODE_REQUEST,
     PT_ROUTING_ACT_REQUEST,
@@ -62,22 +63,30 @@ class Client:
         reader, writer = await asyncio.open_connection("::1", port)
         return cls(reader, writer)
 
-    async def send(self, payload_type, payload):
-        self.writer.write(build_frame(payload_type, payload))
+    async def send(self, payload_type, payload, version=0x02):
+        self.writer.write(build_frame(payload_type, payload, version=version))
         await self.writer.drain()
 
     async def recv(self, timeout=2.0):
         raw = await asyncio.wait_for(read_frame(self.reader), timeout=timeout)
         return struct.unpack("!H", raw[2:4])[0], raw[8:]
 
-    async def activate(self, tester=TESTER_ADDR):
+    async def recv_version(self, timeout=2.0):
+        """Like ``recv`` but also returns the response frame's version byte
+        (architecture roadmap P5)."""
+        raw = await asyncio.wait_for(read_frame(self.reader), timeout=timeout)
+        return raw[0], struct.unpack("!H", raw[2:4])[0], raw[8:]
+
+    async def activate(self, tester=TESTER_ADDR, version=0x02):
         await self.send(PT_ROUTING_ACT_REQUEST,
-                        struct.pack("!H", tester) + b"\x00" + b"\x00\x00\x00\x00")
+                        struct.pack("!H", tester) + b"\x00" + b"\x00\x00\x00\x00",
+                        version=version)
         return await self.recv()
 
-    async def diagnostic(self, uds, target=ECU_ADDR, tester=TESTER_ADDR):
+    async def diagnostic(self, uds, target=ECU_ADDR, tester=TESTER_ADDR, version=0x02):
         await self.send(PT_DIAGNOSTIC_MESSAGE,
-                        struct.pack("!HH", tester, target) + uds)
+                        struct.pack("!HH", tester, target) + uds,
+                        version=version)
         return await self.recv()
 
     async def send_raw_header(self, payload_type, declared_len, real_bytes=b""):
@@ -427,6 +436,413 @@ class TestSourceAddressConflict:
         assert run(with_server(scenario))
 
 
+class TestSessionStateSurvivesReconnect:
+    """
+    Architecture roadmap P9: UDS session state is keyed by tester SA in
+    ``EcuCore``, not created fresh per socket -- a tester that drops TCP and
+    reconnects within S3 finds the same session/security state a real ECU
+    would still have.
+    """
+
+    #: 0xF186 is the built-in "active diagnostic session" DID (needs the
+    #: ``dynamic`` declaration to reach the core's handling of it); 0xF1B0
+    #: is a made-up DID gated on security level 1, unlockable via the
+    #: standard seed/key exchange (seed 11223344 XOR key A5A5A5A5).
+    CONFIG_SEC = {
+        "listen": {"host": "::1", "port": 0, "interface": ""},
+        "data_identifiers": {
+            0xF186: {"type": "dynamic"},
+            0xF1B0: {"type": "hex", "value": "AA", "read_security": 1},
+        },
+    }
+    GOOD_KEY = bytes.fromhex("B4 87 96 E1".replace(" ", ""))
+
+    async def _enter_extended_and_unlock(self, client):
+        ptype, payload = await client.diagnostic(b"\x10\x03")
+        assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+        ptype, payload = await client.recv()
+        assert payload[4:6] == b"\x50\x03"
+
+        ptype, payload = await client.diagnostic(b"\x27\x01")
+        assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+        ptype, payload = await client.recv()
+        assert payload[4] == 0x67   # positive response to 0x27 01 (seed)
+
+        ptype, payload = await client.diagnostic(b"\x27\x02" + self.GOOD_KEY)
+        assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+        ptype, payload = await client.recv()
+        assert payload[4:6] == b"\x67\x02"   # positive response to 0x27 02 (key)
+
+    def test_state_survives_a_reconnect_within_s3(self):
+        async def scenario(port):
+            first = await Client.connect(port)
+            await first.activate()
+            await self._enter_extended_and_unlock(first)
+            await first.close()   # TCP drops -- deliberately, not ECUReset
+            # Let the closed session's own cleanup (SessionRegistry.unregister)
+            # finish server-side before reconnecting -- otherwise Routing
+            # Activation for the same SA hits the §9.3 alive-probe path
+            # (waits out ``alive_check_timeout_ms``, 500ms default), which
+            # would dwarf the 200ms ``s3_server_ms`` this test relies on.
+            await asyncio.sleep(0.05)
+
+            # Reconnect promptly (well within the 200ms s3_server_ms test
+            # default) and re-activate -- same tester SA, new socket.
+            second = await Client.connect(port)
+            ptype, payload = await second.activate()
+            assert payload[4] == 0x10
+
+            ptype, payload = await second.diagnostic(b"\x22\xF1\x86")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            ptype, payload = await second.recv()
+            assert payload[4:] == b"\x62\xF1\x86\x03"   # still extended (0x03)
+
+            ptype, payload = await second.diagnostic(b"\x22\xF1\xB0")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            ptype, payload = await second.recv()
+            assert payload[4:] == b"\x62\xF1\xB0\xAA"   # still unlocked -- readable
+            await second.close()
+            return True
+
+        assert run(with_server(scenario, self.CONFIG_SEC))
+
+    def test_state_does_not_survive_past_s3(self):
+        async def scenario(port):
+            first = await Client.connect(port)
+            await first.activate()
+            await self._enter_extended_and_unlock(first)
+            await first.close()
+
+            # Wait past s3_server_ms (200ms default) before reconnecting.
+            await asyncio.sleep(0.35)
+
+            second = await Client.connect(port)
+            ptype, payload = await second.activate()
+            assert payload[4] == 0x10
+
+            ptype, payload = await second.diagnostic(b"\x22\xF1\x86")
+            ptype, payload = await second.recv()
+            assert payload[4:] == b"\x62\xF1\x86\x01"   # back to default (0x01)
+
+            ptype, payload = await second.diagnostic(b"\x22\xF1\xB0")
+            ptype, payload = await second.recv()
+            assert ptype == PT_DIAGNOSTIC_MESSAGE
+            assert payload[4] == 0x7F and payload[6] == 0x33   # securityAccessDenied
+            await second.close()
+            return True
+
+        assert run(with_server(scenario, self.CONFIG_SEC))
+
+    def test_two_different_testers_have_independent_state(self):
+        async def scenario(port):
+            a = await Client.connect(port)
+            await a.activate(tester=TESTER_ADDR)
+            await self._enter_extended_and_unlock(a)
+            await a.close()
+
+            b = await Client.connect(port)
+            await b.activate(tester=TESTER_ADDR + 1)
+            ptype, payload = await b.diagnostic(b"\x22\xF1\x86", tester=TESTER_ADDR + 1)
+            ptype, payload = await b.recv()
+            # A different tester's fresh session is unaffected by A's state.
+            assert payload[4:] == b"\x62\xF1\x86\x01"
+            await b.close()
+            return True
+
+        assert run(with_server(scenario, self.CONFIG_SEC))
+
+    def test_reset_drops_connection_closes_the_socket_and_forgets_state(self):
+        config = {**self.CONFIG_SEC, "uds": {"reset_drops_connection": True}}
+
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            await self._enter_extended_and_unlock(client)
+
+            ptype, payload = await client.diagnostic(b"\x11\x01")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+
+            # The final "51 01" response and the abortive RST (SO_LINGER 0)
+            # race on the wire -- a real vanishing ECU offers no stronger
+            # guarantee either. Either the response arrives and the read
+            # after it fails, or the RST wins outright; either way nothing
+            # further can ever be read from this socket.
+            try:
+                ptype, payload = await client.recv(timeout=0.3)
+                assert payload[4:] == b"\x51\x01"
+            except (asyncio.IncompleteReadError, ConnectionResetError,
+                    asyncio.TimeoutError):
+                pass
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await client.recv(timeout=0.3)
+            await asyncio.sleep(0.05)   # let server-side cleanup finish
+
+            # A fresh connection for the same tester finds default/locked state,
+            # not whatever was unlocked before the reset.
+            second = await Client.connect(port)
+            await second.activate()
+            ptype, payload = await second.diagnostic(b"\x22\xF1\x86")
+            ptype, payload = await second.recv()
+            assert payload[4:] == b"\x62\xF1\x86\x01"
+            await second.close()
+            return True
+
+        assert run(with_server(scenario, config))
+
+
+class TestConcurrencyLimit:
+    """Architecture roadmap P3: ``doip.max_concurrent_sessions`` is enforced,
+    not just advertised."""
+
+    LIMIT_CONFIG = {"doip": {"max_concurrent_sessions": 2}}
+
+    def test_a_tester_beyond_the_limit_is_denied_0x01_and_closed(self):
+        async def scenario(port):
+            clients = []
+            for i in range(2):
+                c = await Client.connect(port)
+                ptype, payload = await c.activate(tester=TESTER_ADDR + i)
+                assert ptype == PT_ROUTING_ACT_RESPONSE
+                assert payload[4] == 0x10
+                clients.append(c)
+
+            # The 3rd distinct tester, with the limit already saturated at 2,
+            # must be denied with 0x01 ("all sockets in use"), not accepted.
+            third = await Client.connect(port)
+            ptype, payload = await third.activate(tester=TESTER_ADDR + 2)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x01
+
+            # Table 25: any non-success code closes the TCP_DATA socket; a
+            # further read must fail rather than hang or return more data.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await third.recv(timeout=0.3)
+
+            for c in clients:
+                await c.close()
+            await third.close()
+            return True
+
+        assert run(with_server(scenario, self.LIMIT_CONFIG))
+
+    def test_an_idempotent_repeat_activation_is_never_denied_by_the_limit(self):
+        async def scenario(port):
+            clients = []
+            for i in range(2):
+                c = await Client.connect(port)
+                ptype, payload = await c.activate(tester=TESTER_ADDR + i)
+                assert payload[4] == 0x10
+                clients.append(c)
+
+            # Repeating activation for an already-registered SA on the same
+            # socket must re-confirm success even though the registry is
+            # already at the limit -- it does not add a new registration.
+            ptype, payload = await clients[0].activate(tester=TESTER_ADDR)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+
+            for c in clients:
+                await c.close()
+            return True
+
+        assert run(with_server(scenario, self.LIMIT_CONFIG))
+
+    def test_server_wires_the_same_config_value_into_the_udp_announcer(self):
+        """
+        Entity Status is UDP-only (see ``TestNodeServices`` above), so this
+        checks the wiring at the level that matters: ``TestEcuServer.start()``
+        must feed ``run_announcer`` the *same* ``max_concurrent_sessions`` the
+        Routing Activation check enforces, not the TCP listen backlog.
+        ``test_udp.py`` already covers ``_entity_status_payload`` turning
+        ``max_sockets`` into the wire byte; this closes the gap between that
+        and the config value actually enforced above.
+        """
+        import unittest.mock as mock
+        import testecu.server as server_module
+
+        captured = {}
+        real_run_announcer = server_module.run_announcer
+
+        async def spy(config, **kwargs):
+            captured.update(kwargs)
+            raise asyncio.CancelledError()   # never actually bind/run
+
+        async def scenario(port):
+            await asyncio.sleep(0.05)   # let the scheduled announcer task run once
+            return True
+
+        # BASE_CONFIG disables UDP by default (see conftest.py) to keep other
+        # e2e tests quiet -- re-enable it here since that is exactly the path
+        # under test.
+        config = {**self.LIMIT_CONFIG, "udp": {"enabled": True}}
+        with mock.patch.object(server_module, "run_announcer", spy):
+            assert run(with_server(scenario, config))
+
+        assert captured.get("max_sockets") == 2
+
+    def test_entity_status_max_sockets_matches_the_configured_limit_directly(self):
+        """
+        Same fact as above, exercised at the layer ``test_udp.py`` already
+        drives (``_UDPProtocol`` against a fake transport), using the real
+        config value instead of a hand-picked one -- belt and suspenders
+        against the two ever drifting apart again.
+        """
+        from testecu.config import parse_config
+        from testecu.udp import _UDPProtocol
+
+        config = parse_config({
+            "listen": {"host": "::1", "port": 0, "interface": ""},
+            "doip": {"max_concurrent_sessions": 2},
+        })
+
+        class _FakeTransport:
+            def sendto(self, data, addr):
+                pass
+
+        protocol = _UDPProtocol(config, if_index=0,
+                                max_sockets=config.doip.max_concurrent_sessions)
+        protocol.connection_made(_FakeTransport())
+        payload = protocol._entity_status_payload()
+        assert payload[1] == 2
+
+
+class TestProtocolVersionEcho:
+    """Architecture roadmap P5: every response is framed in the version of
+    the request it answers, not always the entity's own default."""
+
+    def test_a_0x03_request_gets_0x03_framed_responses_throughout(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.send(
+                PT_ROUTING_ACT_REQUEST,
+                struct.pack("!H", TESTER_ADDR) + b"\x00" + b"\x00\x00\x00\x00",
+                version=0x03,
+            )
+            ver, ptype, payload = await client.recv_version()
+            assert ver == 0x03
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x22\xF1\x90",
+                              version=0x03)
+            ver, ptype, _ = await client.recv_version()
+            assert ver == 0x03
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+
+            ver, ptype, payload = await client.recv_version()
+            assert ver == 0x03
+            assert ptype == PT_DIAGNOSTIC_MESSAGE
+            assert payload[4:] == b"\x62\xF1\x90" + b"1HGBH41JXMN109186"
+
+            await client.send(PT_ALIVE_CHECK_REQUEST, b"", version=0x03)
+            ver, ptype, _ = await client.recv_version()
+            assert ver == 0x03
+            assert ptype == PT_ALIVE_CHECK_RESPONSE
+
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, CONFIG))
+
+    def test_a_0x02_request_is_unaffected(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.send(
+                PT_ROUTING_ACT_REQUEST,
+                struct.pack("!H", TESTER_ADDR) + b"\x00" + b"\x00\x00\x00\x00",
+                version=0x02,
+            )
+            ver, ptype, payload = await client.recv_version()
+            assert ver == 0x02
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, CONFIG))
+
+    def test_version_is_not_sticky_across_a_connection(self):
+        # A tester that mixes versions on one socket gets each answer framed
+        # in the version it asked *that* time -- no "remembered" version.
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.send(
+                PT_ROUTING_ACT_REQUEST,
+                struct.pack("!H", TESTER_ADDR) + b"\x00" + b"\x00\x00\x00\x00",
+                version=0x03,
+            )
+            ver, _, _ = await client.recv_version()
+            assert ver == 0x03
+
+            await client.send(PT_ALIVE_CHECK_REQUEST, b"", version=0x02)
+            ver, ptype, _ = await client.recv_version()
+            assert ver == 0x02
+            assert ptype == PT_ALIVE_CHECK_RESPONSE
+
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, CONFIG))
+
+    def test_a_bad_header_nack_uses_the_entity_own_default_version(self):
+        # There is no valid request version to echo when the header itself
+        # is what's wrong -- the NACK must go out in the entity's own
+        # default (doip.VER = 0x02), not the bogus/rejected version.
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.send(PT_ALIVE_CHECK_REQUEST, b"", version=0x01)
+            ver, ptype, payload = await client.recv_version()
+            assert ver == 0x02
+            assert ptype == PT_HEADER_NACK
+            assert payload == b"\x00"
+            return True
+
+        assert run(with_server(scenario, CONFIG))
+
+    def test_the_response_under_a_slow_handler_still_echoes_its_own_request(self):
+        """
+        Pump/worker split regression guard (architecture roadmap P5 x P1):
+        the *worker*'s eventual response for a slow Diagnostic Message must
+        echo the version *that* request arrived in, not whatever version a
+        later frame -- answered by the pump while the worker is still busy --
+        happens to use.
+        """
+        async def scenario(port):
+            client = await PumpingClient.connect(port)
+            await client.activate()
+
+            # Kick off a slow request in version 0x03, but don't wait for its
+            # final response yet.
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x22\xF1\x90",
+                              version=0x03)
+            ver, ptype = (await client.recv_version())[:2]
+            assert ver == 0x03
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK   # sent by the pump
+
+            # While the slow handler is still running, answer an Alive Check
+            # on the same socket in version 0x02.
+            await client.send(PT_ALIVE_CHECK_REQUEST, b"", version=0x02)
+            ver, ptype, _ = await client.recv_version()
+            assert ver == 0x02
+            assert ptype == PT_ALIVE_CHECK_RESPONSE
+
+            # The slow handler's own response must still come back in 0x03 --
+            # not 0x02, even though that was the most recently read frame's
+            # version by the time the worker actually sends it.
+            ver, ptype, payload = await client.recv_version(timeout=2.0)
+            assert ver == 0x03
+            assert ptype == PT_DIAGNOSTIC_MESSAGE
+            assert payload[4:] == b"\x62\x01"
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, plugins=[TestPumpWorkerSplit._slow_plugin()]))
+
+
 class TestSuppressionOverTheWire:
     def test_tester_present_with_the_suppress_bit_sends_only_the_ack(self):
         async def scenario(port):
@@ -594,9 +1010,13 @@ class PumpingClient(Client):
             if pt == PT_DIAGNOSTIC_MESSAGE and payload[4:5] == b"\x7F" \
                     and len(payload) >= 7 and payload[6] == 0x78:
                 continue    # ResponsePending -- expected noise, not the answer
-            await self._queue.put((pt, payload))
+            await self._queue.put((raw[0], pt, payload))
 
     async def recv(self, timeout=2.0):
+        _ver, pt, payload = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+        return pt, payload
+
+    async def recv_version(self, timeout=2.0):
         return await asyncio.wait_for(self._queue.get(), timeout=timeout)
 
     async def close(self):
@@ -723,3 +1143,40 @@ class TestPumpWorkerSplit:
             return True
 
         assert run(with_server(scenario))
+
+    def test_closing_mid_handler_does_not_leak_the_dispatch_task(self):
+        """
+        Regression test for a gap the pump/worker split itself opened:
+        ``_dispatch_with_p2`` shields its inner dispatch task from the P2
+        timeout on purpose, but that shield also protected it from the new
+        cancellation source the split introduced -- ``_stop_uds_worker``/
+        ``evict()`` cancelling the *worker* task on teardown. Before the
+        fix, closing a connection mid-handler left the handler's task
+        running detached until it finished on its own, able to call
+        ``responder()`` (a write to an already-closed socket) well after
+        the connection was gone.
+        """
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+
+            before = {id(t) for t in asyncio.all_tasks()}
+
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x22\xF1\x90")
+            ptype, _ = await client.recv()
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+
+            # Close well before the 1.5s handler finishes.
+            await asyncio.sleep(0.1)
+            await client.close()
+
+            # Give the server's teardown a moment to run, then assert
+            # nothing new is still alive -- specifically, the dispatch task
+            # must not survive to finish on its own ~1.4s from now.
+            await asyncio.sleep(0.3)
+            leaked = [t for t in asyncio.all_tasks() if id(t) not in before and not t.done()]
+            assert leaked == [], "leaked task(s) after mid-handler close: %r" % leaked
+            return True
+
+        assert run(with_server(scenario, plugins=[self._slow_plugin()]))

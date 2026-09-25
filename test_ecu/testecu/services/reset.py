@@ -22,6 +22,7 @@ from testecu.plugin import Context
 from testecu.uds import (
     NRC_INCORRECT_MESSAGE_LENGTH,
     NRC_SUB_FUNCTION_NOT_SUPPORTED,
+    AbortConnectionAfterResponse,
 )
 
 RESET_HARD        = 0x01
@@ -44,10 +45,19 @@ async def ecu_reset(core: Any, ctx: Context) -> bytes:
     Returns to the default session, relocks security, and (when
     ``uds.reset_clears_writes`` is set) restores every DID to its YAML default.
 
-    Deliberate deviation from a real ECU: **the TCP connection is not dropped**.
-    A real ECU would disappear off the bus here, but tearing down the socket
-    would force every test client to reconnect and re-activate routing after a
-    reset, which makes the simulator far less useful than it should be.
+    Deviation from a real ECU, now switchable rather than fixed (architecture
+    roadmap P9) via ``uds.reset_drops_connection``:
+
+    - ``False`` (the default): **the TCP connection is not dropped**. A real
+      ECU would disappear off the bus here, but tearing down the socket would
+      force every test client to reconnect and re-activate routing after a
+      reset, which makes the simulator far less useful for most testing.
+    - ``True``: the connection closes abortively right after the positive
+      response, the same way an actually-vanishing ECU would, and this
+      tester's session state is forgotten outright (not just reset to
+      default in place) -- for exercising an EdgeNode's own "ECU vanished,
+      came back" reconnect handling, which the default behaviour above
+      cannot exercise at all.
     """
     request = ctx.request
     if len(request.raw) != 2:
@@ -60,6 +70,20 @@ async def ecu_reset(core: Any, ctx: Context) -> bytes:
                       "ECUReset sub-function 0x%02X is not supported" % sub)
 
     core.ecu.reset(clear_writes=core.ecu.uds.reset_clears_writes)
+
+    if core.ecu.uds.reset_drops_connection:
+        core.ecu.drop_session_state(request.source_addr)
+        ctx.log.info(
+            "ECUReset %s from tester 0x%04X — session state dropped, closing "
+            "the connection abortively (uds.reset_drops_connection)%s",
+            _NAMES[sub], request.source_addr,
+            ", DID defaults restored" if core.ecu.uds.reset_clears_writes else "",
+        )
+        raise AbortConnectionAfterResponse(
+            request.positive(bytes([sub])),
+            "ECUReset (%s) with reset_drops_connection" % _NAMES[sub],
+        )
+
     ctx.session.reset()
 
     ctx.log.info(

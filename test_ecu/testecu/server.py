@@ -93,7 +93,9 @@ class TestEcuServer:
 
         if self._ecu.config.udp.enabled:
             self._udp_task = asyncio.ensure_future(run_announcer(
-                self._ecu.config, registry=self._registry, max_sockets=self._backlog,
+                self._ecu.config, registry=self._registry,
+                max_sockets=self._ecu.config.doip.max_concurrent_sessions,
+                doip_hooks=self._ecu.doip_hooks,
             ))
         else:
             logger.info("UDP announcer disabled")

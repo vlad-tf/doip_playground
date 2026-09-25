@@ -45,7 +45,8 @@ to emit ``7F <sid> <nrc>``.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from testecu.uds import NegativeResponse, UdsRequest
 
@@ -56,12 +57,24 @@ ANY_SERVICE = -1
 #: dispatcher and the tests can read it; plugin authors never touch it.
 HOOK_ATTR = "_testecu_hooks"
 
-# Hook kinds
+# UDS-layer hook kinds
 KIND_OBSERVER  = "observer"
 KIND_SERVICE   = "service"
 KIND_READ_DID  = "read_did"
 KIND_WRITE_DID = "write_did"
 KIND_ROUTINE   = "routine"
+
+# DoIP-layer hook kinds (architecture roadmap P2). Same registration
+# machinery as the UDS kinds above (``Plugin.__init_subclass__`` collects
+# every kind generically), but resolved by ``DoipDispatcher``
+# (``testecu/doip_dispatcher.py``), not ``Dispatcher`` — the two hook
+# universes are kept in separate dispatchers because they act on different
+# things (a connection/frame vs. a UDS request) and have no shared state.
+KIND_ROUTING_ACTIVATION     = "routing_activation"
+KIND_DIAGNOSTIC_ACK         = "diagnostic_ack"
+KIND_FRAME_RX               = "frame_rx"
+KIND_FRAME_TX               = "frame_tx"
+KIND_IDENTIFICATION_REQUEST = "identification_request"
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +158,160 @@ def routine(rid: int, control: Optional[int] = None, *, priority: Optional[int] 
         key = (int(rid), None if control is None else int(control))
         return _mark(fn, KIND_ROUTINE, key, {"priority": priority})
     return deco
+
+
+# ---------------------------------------------------------------------------
+# DoIP-layer decorators (architecture roadmap P2)
+#
+# Same ``None``-means-fall-through contract as the UDS decorators above, and
+# the same handler-isolation guarantee (a raised exception is logged and
+# swallowed, never crashes the connection or the process) — see
+# ``testecu/doip_dispatcher.py: DoipDispatcher._call``.
+# ---------------------------------------------------------------------------
+
+def on_routing_activation(*, priority: Optional[int] = None):
+    """
+    Intercept a Routing Activation Request before the default accept/deny
+    logic (SA range, re-bind, §9.3 conflict resolution) runs.
+
+    ``(self, request: RoutingActivationRequest, ctx: DoipContext) -> int | None``.
+    Return a Routing Activation Response code (ISO 13400-2 Table 48 — e.g.
+    ``0x01`` busy, ``0x04``/``0x05`` auth/confirmation, ``0x11``
+    confirmation required) to short-circuit with that response instead of
+    the default logic; ``None`` falls through. ``await asyncio.sleep(...)``
+    here to delay the response past ``T_TCP_Initial_Inactivity``.
+    """
+    def deco(fn: Callable) -> Callable:
+        return _mark(fn, KIND_ROUTING_ACTIVATION, None, {"priority": priority})
+    return deco
+
+
+def on_diagnostic_ack(*, priority: Optional[int] = None):
+    """
+    Intercept the Diagnostic Message Positive ACK before it is sent.
+
+    ``(self, request: UdsRequest, ctx: DoipContext) -> int | object | None``.
+    Return a Diagnostic NACK code (ISO 13400-2 Table 26, e.g. ``0x05`` out of
+    memory, ``0x06`` target unreachable) to send that NACK instead of the
+    normal ACK; return ``WITHHOLD_ACK`` to send nothing at all (the tester's
+    own timeout is the only signal); ``None`` sends the normal, correct ACK.
+    """
+    def deco(fn: Callable) -> Callable:
+        return _mark(fn, KIND_DIAGNOSTIC_ACK, None, {"priority": priority})
+    return deco
+
+
+def on_frame_rx(*, priority: Optional[int] = None):
+    """
+    Observer: runs after every DoIP frame is read (TCP or UDP), before it is
+    handled. ``(self, payload_type: int, payload: bytes, ctx: DoipContext)``.
+    Return value ignored, exceptions logged and swallowed — same contract as
+    ``@on_request``, one layer down.
+    """
+    def deco(fn: Callable) -> Callable:
+        return _mark(fn, KIND_FRAME_RX, None, {"priority": priority})
+    return deco
+
+
+def on_frame_tx(*, priority: Optional[int] = None):
+    """
+    Observer: runs after every DoIP frame this entity sends (TCP or UDP).
+    ``(self, payload_type: int, payload: bytes, ctx: DoipContext)``. Return
+    value ignored, exceptions logged and swallowed.
+    """
+    def deco(fn: Callable) -> Callable:
+        return _mark(fn, KIND_FRAME_TX, None, {"priority": priority})
+    return deco
+
+
+def on_identification_request(*, priority: Optional[int] = None):
+    """
+    Intercept a Vehicle Identification Request over UDP.
+
+    ``(self, request: IdentificationRequest, ctx: DoipContext) -> bytes | None``.
+    Return the complete Vehicle Identification Response payload (33 bytes,
+    see ``udp.py: build_announcement_payload``) to override the default
+    answer; ``None`` sends the default. To withhold the response entirely,
+    return empty bytes (``b""``) — the caller sends nothing in that case.
+    For anything that isn't a single substituted response — a duplicate
+    answer, an unsolicited Vehicle Announcement, a delayed answer — use
+    ``ctx.send_raw(...)`` from inside the hook (``await asyncio.sleep(...)``
+    first for the delayed case) and still return ``None`` or ``b""``.
+    """
+    def deco(fn: Callable) -> Callable:
+        return _mark(fn, KIND_IDENTIFICATION_REQUEST, None, {"priority": priority})
+    return deco
+
+
+#: Sentinel returned by an ``@on_diagnostic_ack`` hook to withhold the
+#: Positive ACK entirely (as opposed to returning ``None``, which sends the
+#: normal one, or an ``int``, which sends that NACK code instead).
+WITHHOLD_ACK = object()
+
+
+@dataclass(frozen=True)
+class RoutingActivationRequest:
+    """What an ``@on_routing_activation`` hook sees — the parsed request,
+    not the raw payload (ISO 13400-2 Table 15: source address, activation
+    type, then a reserved field this simulator does not otherwise expose)."""
+
+    source_addr: int
+    activation_type: int
+    raw: bytes
+
+
+@dataclass(frozen=True)
+class IdentificationRequest:
+    """What an ``@on_identification_request`` hook sees."""
+
+    #: One of ``PT_VEHICLE_ID_REQUEST`` / ``..._WITH_EID`` / ``..._WITH_VIN``.
+    payload_type: int
+    #: The requester's UDP address, as handed to ``DatagramProtocol``.
+    requester: tuple
+    #: Raw request payload past the generic header (empty, an EID, or a VIN).
+    raw: bytes
+
+
+class DoipContext:
+    """
+    Everything a DoIP-layer handler gets besides the request itself.
+
+    Deliberately decoupled from any one transport: ``session.py`` (TCP) and
+    ``udp.py`` (UDP) each supply their own ``send_frame``/``close``
+    callables, so the same hook types and the same plugin code work on
+    either side without knowing which one it's running against.
+    """
+
+    __slots__ = ("ecu", "log", "peer", "_send_frame", "_close")
+
+    def __init__(self, ecu: Any, log: logging.Logger, peer: Any,
+                 send_frame: Callable[[int, bytes], Awaitable[None]],
+                 close: Optional[Callable[[], None]] = None) -> None:
+        self.ecu = ecu
+        self.log = log
+        self.peer = peer
+        self._send_frame = send_frame
+        self._close = close
+
+    async def send_raw(self, payload_type: int, payload: bytes) -> None:
+        """
+        Send an arbitrary extra DoIP frame right now.
+
+        For fault injection that isn't "answer this one request instead" —
+        an unsolicited Alive Check, a stray Vehicle Announcement, a
+        duplicate Vehicle Identification Response.
+        """
+        await self._send_frame(payload_type, payload)
+
+    def close(self) -> None:
+        """
+        Close the underlying connection immediately.
+
+        TCP only — a no-op on the UDP side, which has no persistent
+        per-request socket to close.
+        """
+        if self._close is not None:
+            self._close()
 
 
 # ---------------------------------------------------------------------------

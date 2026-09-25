@@ -43,6 +43,16 @@ Request arriving on this same socket — or an Alive Check *Response* this
 socket needs to read because a competing Routing Activation elsewhere is
 probing it — would sit behind whatever UDS handler is still running,
 starving liveness checking generally.
+
+**DoIP-layer hooks.** ``@on_routing_activation``, ``@on_diagnostic_ack``,
+``@on_frame_rx``/``@on_frame_tx`` (architecture roadmap P2) let a plugin
+inject faults at this layer instead of only the UDS one — deny/delay a
+Routing Activation, withhold/NACK/delay a Diagnostic ACK, observe every
+frame in or out. Resolved by ``EcuCore.doip_hooks``
+(``testecu/doip_dispatcher.py``), a separate dispatcher from the UDS one,
+through a ``DoipContext`` this class builds once per connection (see
+``__init__``) and decouples from ``self`` on purpose, so the same hook types
+and the same plugin code also work over UDP (``udp.py``).
 """
 
 from __future__ import annotations
@@ -54,9 +64,12 @@ import struct
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from testecu.doip import (
-    ACCEPTED_VERSIONS,
     ALIVE_PROBE_TIMEOUT_S,
     FrameTooLarge,
+    NACK_GENERIC_INCORRECT_PATTERN,
+    NACK_GENERIC_INVALID_PAYLOAD_LENGTH,
+    NACK_GENERIC_MESSAGE_TOO_LARGE,
+    NACK_GENERIC_UNKNOWN_PAYLOAD_TYPE,
     NACK_INVALID_SOURCE_ADDRESS,
     NACK_MESSAGE_TOO_LARGE,
     NACK_UNKNOWN_TARGET_ADDRESS,
@@ -70,18 +83,22 @@ from testecu.doip import (
     PT_ROUTING_ACT_REQUEST,
     PT_ROUTING_ACT_RESPONSE,
     PTYPE_NAMES,
+    VER,
     build_frame,
     fmt_hex,
     payload as frame_payload,
     ptype as frame_ptype,
     read_frame,
+    validate_header,
 )
+from testecu.plugin import DoipContext, RoutingActivationRequest, WITHHOLD_ACK
 from testecu.uds import (
     FUNCTIONAL_SUPPRESSED_NRCS,
     NO_RESPONSE,
     NRC_BUSY_REPEAT_REQUEST,
     NRC_GENERAL_REJECT,
     NRC_RESPONSE_PENDING,
+    AbortConnectionAfterResponse,
     NegativeResponse,
     SuppressResponse,
     UdsRequest,
@@ -174,9 +191,24 @@ class EcuSession:
         self._ecu_addr = config.doip.ecu_logical_addr
         self._max_data = config.doip.max_payload_bytes
         self._tester_addr_range = config.doip.tester_addr_range
+        #: Single source of truth for both this check and Entity Status's
+        #: ``max_sockets`` byte (architecture roadmap P3) — see the field's
+        #: docstring in ``config.py``.
+        self._max_concurrent_sessions = config.doip.max_concurrent_sessions
+        #: ISO 13400-2 ``T_TCP_Alive_Check`` (architecture roadmap P6) — read
+        #: at runtime from config rather than the hardcoded
+        #: ``ALIVE_PROBE_TIMEOUT_S`` (which stays the module default/parity
+        #: anchor; see that field's docstring in ``config.py``).
+        self._alive_check_timeout = config.doip.alive_check_timeout_ms / 1000.0
 
-        #: UDS state for this connection (session, security level, S3 timer)
-        self.state = ecu.new_session(str(self._peer))
+        #: UDS state for the tester this socket ends up registered to
+        #: (session, security level, S3 timer) -- architecture roadmap P9:
+        #: keyed by tester SA in ``EcuCore``, not created here, since it may
+        #: already exist from a previous connection this same tester used
+        #: within S3. ``None`` until Routing Activation succeeds; nothing on
+        #: this socket needs it before then. Set in
+        #: ``_handle_routing_activation`` via ``self._ecu.session_for(...)``.
+        self.state: Optional[Any] = None
 
         self.activated = False
         self.tester_addr: Optional[int] = None
@@ -188,10 +220,32 @@ class EcuSession:
         #: Validated Diagnostic Messages waiting for ``_uds_worker`` (pump /
         #: UDS executor split — see the module docstring). The pump only
         #: ever ``put_nowait``s here and goes straight back to ``read_frame``;
-        #: it never awaits the worker.
-        self._uds_queue: "asyncio.Queue[UdsRequest]" = asyncio.Queue(
+        #: it never awaits the worker. Each entry also carries the request
+        #: frame's protocol version (architecture roadmap P5) captured at
+        #: enqueue time -- see ``_uds_worker``'s docstring for why that can't
+        #: just be read back off ``self._current_req_version`` later.
+        self._uds_queue: "asyncio.Queue[tuple[UdsRequest, int]]" = asyncio.Queue(
             maxsize=_UDS_QUEUE_MAXSIZE)
         self._uds_worker_task: Optional[asyncio.Task] = None
+
+        #: Protocol version of the request currently being handled
+        #: (architecture roadmap P5) — every response is framed in the
+        #: version of the request it answers, not always the entity's own
+        #: default. Stateless per frame on purpose (see ``_send_response``'s
+        #: docstring): reset by ``_loop`` on every successfully-validated
+        #: frame, never "sticky" across a whole connection.
+        self._current_req_version: int = VER
+
+        #: DoIP-layer hook context for this connection (architecture roadmap
+        #: P2) — decoupled from ``self`` on purpose (see ``DoipContext``),
+        #: so the same hook types work identically over UDP.
+        async def _send_frame(payload_type: int, payload: bytes) -> None:
+            await self._send_response(payload_type, payload)
+
+        self._doip_ctx = DoipContext(
+            ecu=self._ecu, log=logger, peer=self._peer,
+            send_frame=_send_frame, close=lambda: self._writer.close(),
+        )
 
         # -------- Inactivity timers (ISO 13400-2 §7.2.2 / §7.2.3) --------
         # The initial inactivity timer runs from connection to Routing
@@ -241,7 +295,15 @@ class EcuSession:
                     pass
                 self._supervisor = None
             await self._stop_uds_worker()
-            self.state.close()
+            # Architecture roadmap P9: state now belongs to the tester, not
+            # this socket -- do NOT unconditionally cancel its S3 timer here
+            # (that used to be what ``state.close()`` did on every socket
+            # close, which would have defeated the whole "reconnect within
+            # S3" feature). Only drop it from the shared table when it is
+            # already tidy; otherwise leave the S3 timer running so a
+            # reconnect can still find it.
+            if self.state is not None:
+                self._ecu.maybe_drop_session_state(self.tester_addr, self.state)
             try:
                 self._writer.close()
                 await self._writer.wait_closed()
@@ -283,7 +345,8 @@ class EcuSession:
         if self._uds_worker_task is not None and not self._uds_worker_task.done():
             self._uds_worker_task.cancel()
             self._uds_worker_task = None
-        self.state.close()
+        if self.state is not None:
+            self._ecu.maybe_drop_session_state(self.tester_addr, self.state)
         try:
             self._writer.close()
         except Exception:
@@ -297,6 +360,37 @@ class EcuSession:
         self._bump_general()
         self._writer.write(raw)
         await self._writer.drain()
+        # DoIP-layer @on_frame_tx observers (architecture roadmap P2) — every
+        # frame this entity sends, including ones a hook itself injected via
+        # ctx.send_raw(); a pathological plugin echoing send_raw from inside
+        # an @on_frame_tx observer can recurse forever, same as it could by
+        # calling itself from any other hook. Not specifically guarded here.
+        await self._ecu.doip_hooks.notify_frame_tx(
+            frame_ptype(raw), frame_payload(raw), self._doip_ctx)
+
+    async def _send_response(self, payload_type: int, payload: bytes) -> None:
+        """
+        Send a frame answering the request currently being handled.
+
+        Architecture roadmap P5: every response is framed in the protocol
+        version of the request it answers (``self._current_req_version``),
+        not always the entity's own default (``doip.VER``) — a tester on
+        version 0x03 gets 0x03-framed responses, one on 0x02 gets 0x02, and
+        (deliberately) a tester that mixes versions on one socket gets each
+        answer in the version it asked in. Stateless per frame on purpose:
+        this is *not* "the version this connection negotiated" — there is no
+        such negotiation in DoIP, and remembering one would be wrong the
+        moment a tester sent a second frame in the other accepted version.
+
+        Not used for frames this entity sends on its own initiative rather
+        than in answer to something just read — the startup/periodic Vehicle
+        Announcement (``udp.py``, always ``doip.VER``) and the Alive Check
+        Request a competing session sends to *probe* this one
+        (``probe_alive``, also always ``doip.VER``) correctly bypass this
+        and call ``build_frame``/``_send`` directly.
+        """
+        await self._send(build_frame(payload_type, payload,
+                                     version=self._current_req_version))
 
     # -----------------------------------------------------------------------
     # Inactivity supervision (§7.2.2, §7.2.3)
@@ -439,7 +533,8 @@ class EcuSession:
                     "Generic NACK 0x02 (message too large) + close",
                     exc.declared_len, self._peer, exc.max_len,
                 )
-                await self._send(build_frame(PT_HEADER_NACK, bytes([0x02])))
+                await self._send(build_frame(
+                    PT_HEADER_NACK, bytes([NACK_GENERIC_MESSAGE_TOO_LARGE])))
                 return
             pt = frame_ptype(raw)
             pload = frame_payload(raw)
@@ -448,19 +543,33 @@ class EcuSession:
             # general inactivity timer.
             self._bump_general()
 
+            # DoIP-layer @on_frame_rx observers (architecture roadmap P2) —
+            # every successfully-read frame, before it is handled.
+            await self._ecu.doip_hooks.notify_frame_rx(pt, pload, self._doip_ctx)
+
             logger.debug(
                 "RX %-40s  %3d bytes  from %s",
                 PTYPE_NAMES.get(pt, "0x%04X" % pt), len(pload), self._peer,
             )
 
-            ver = raw[0]
-            inv = raw[1]
-            if ver not in ACCEPTED_VERSIONS or inv != (0xFF ^ ver):
+            # Architecture roadmap P4: shared with udp.py's datagram_received
+            # via ``testecu.doip.validate_header``. No ``known_types`` here
+            # on purpose — TCP_DATA's own unknown-payload-type handling below
+            # (the ``else`` branch of the dispatch, NACK 0x01 without closing
+            # the socket) is unchanged by this refactor.
+            nack = validate_header(raw)
+            if nack is not None:
                 logger.warning(
-                    "Invalid header ver=0x%02X inv=0x%02X — sending NACK", ver, inv
+                    "Invalid header ver=0x%02X inv=0x%02X — sending NACK",
+                    raw[0], raw[1],
                 )
-                await self._send(build_frame(PT_HEADER_NACK, bytes([0x00])))
+                await self._send(build_frame(PT_HEADER_NACK, bytes([nack])))
                 return
+
+            # Architecture roadmap P5: every response built while handling
+            # this frame echoes its version (see ``_send_response``), from
+            # here until the next frame is read.
+            self._current_req_version = raw[0]
 
             if pt == PT_ROUTING_ACT_REQUEST:
                 try:
@@ -497,7 +606,8 @@ class EcuSession:
                 # answers them on the UDP side.
                 logger.warning("Unknown/unsupported payload type 0x%04X on TCP_DATA "
                                "— sending Header NACK", pt)
-                await self._send(build_frame(PT_HEADER_NACK, bytes([0x01])))
+                await self._send_response(
+                    PT_HEADER_NACK, bytes([NACK_GENERIC_UNKNOWN_PAYLOAD_TYPE]))
 
     # -----------------------------------------------------------------------
     # Routing activation and alive check
@@ -552,7 +662,8 @@ class EcuSession:
                 "Routing Activation Request too short (%d < %d bytes) — Generic NACK",
                 len(payload), ROUTING_ACT_REQUEST_MIN_LEN,
             )
-            await self._send(build_frame(PT_HEADER_NACK, bytes([0x04])))
+            await self._send_response(
+                PT_HEADER_NACK, bytes([NACK_GENERIC_INVALID_PAYLOAD_LENGTH]))
             return
 
         src_addr = struct.unpack("!H", payload[0:2])[0]
@@ -562,6 +673,38 @@ class EcuSession:
             "Routing Activation  src=0x%04X  type=0x%02X  from %s",
             src_addr, activation_type, self._peer,
         )
+
+        # DoIP-layer @on_routing_activation hooks (architecture roadmap P2):
+        # a fault-injection plugin can deny an otherwise-valid request with a
+        # chosen code (0x01 busy, 0x04/0x05 auth/confirmation, 0x11
+        # confirmation required, ...) or delay the response past
+        # T_TCP_Initial_Inactivity via ``await asyncio.sleep(...)`` before
+        # returning. Deliberately restricted to *denial*: a hook is not a
+        # way to accept on the ECU's behalf, because that would bypass the
+        # §9.3 conflict-resolution logic below and the registry bookkeeping
+        # it depends on -- a hook returning 0x10 is logged and ignored
+        # rather than honoured, and the default logic still runs.
+        override = await self._ecu.doip_hooks.resolve_routing_activation(
+            RoutingActivationRequest(source_addr=src_addr,
+                                     activation_type=activation_type, raw=payload),
+            self._doip_ctx,
+        )
+        if override is not None and override != 0x10:
+            logger.info(
+                "DoIP hook denied Routing Activation for SA=0x%04X with code 0x%02X",
+                src_addr, override,
+            )
+            await self._send_response(
+                PT_ROUTING_ACT_RESPONSE, self._activation_response(src_addr, override),
+            )
+            raise _CloseConnection()
+        elif override == 0x10:
+            logger.warning(
+                "on_routing_activation hook returned 0x10 (success) for SA=0x%04X "
+                "— ignoring; a hook may only deny, not accept on the ECU's behalf "
+                "(that would skip the §9.3 conflict-resolution logic below)",
+                src_addr,
+            )
 
         # ISO 13400-2 Table 13 / Table 48 code 0x00: a source address outside
         # the tester (client) logical address range is not a valid tester and
@@ -573,10 +716,10 @@ class EcuSession:
                 "(expected 0x%04X-0x%04X) — denying (0x00)",
                 src_addr, low, high,
             )
-            await self._send(build_frame(
+            await self._send_response(
                 PT_ROUTING_ACT_RESPONSE,
                 self._activation_response(src_addr, 0x00),
-            ))
+            )
             raise _CloseConnection()
 
         # ISO 13400-2 Table 48 code 0x06: only the default (0x00) and the
@@ -587,10 +730,10 @@ class EcuSession:
                 "Routing Activation with unsupported type=0x%02X from %s — "
                 "denying (0x06)", activation_type, self._peer,
             )
-            await self._send(build_frame(
+            await self._send_response(
                 PT_ROUTING_ACT_RESPONSE,
                 self._activation_response(src_addr, 0x06),
-            ))
+            )
             raise _CloseConnection()
 
         # ISO 13400-2 Table 48 code 0x02: this socket is already activated for
@@ -602,10 +745,10 @@ class EcuSession:
                 "for SA=0x%04X, new request is SA=0x%04X — denying (0x02)",
                 self.tester_addr, src_addr,
             )
-            await self._send(build_frame(
+            await self._send_response(
                 PT_ROUTING_ACT_RESPONSE,
                 self._activation_response(src_addr, 0x02),
-            ))
+            )
             raise _CloseConnection()
 
         # A repeat Routing Activation Request for the already-bound SA is
@@ -613,9 +756,9 @@ class EcuSession:
         if self.activated and src_addr == self.tester_addr:
             logger.debug("Repeat Routing Activation for already-active SA=0x%04X "
                          "— re-confirming success", src_addr)
-            await self._send(build_frame(
+            await self._send_response(
                 PT_ROUTING_ACT_RESPONSE, self._activation_response(src_addr, 0x10),
-            ))
+            )
             return
 
         if self._registry is not None:
@@ -625,23 +768,47 @@ class EcuSession:
                     "SA 0x%04X already registered on %s — probing with Alive Check",
                     src_addr, existing._peer,
                 )
-                if await existing.probe_alive(ALIVE_PROBE_TIMEOUT_S):
+                if await existing.probe_alive(self._alive_check_timeout):
                     logger.info(
                         "Existing session %s is alive — denying %s (0x03)",
                         existing._peer, self._peer,
                     )
-                    await self._send(build_frame(
+                    await self._send_response(
                         PT_ROUTING_ACT_RESPONSE,
                         self._activation_response(src_addr, 0x03),
-                    ))
+                    )
                     raise _CloseConnection()
                 logger.info("Existing session %s did not respond — evicting it",
                             existing._peer)
                 existing.evict()
 
+            # ISO 13400-2 Table 25 code 0x01 ("all sockets in use") —
+            # architecture roadmap P3. Checked here, after §9.3 conflict
+            # resolution and any eviction above, so ``len(self._registry)``
+            # is the count of *other* SAs that will remain registered once
+            # this one is added -- an idempotent repeat activation never
+            # reaches this line (it returned early above), and an SA that
+            # just evicted its dead predecessor is not counted twice
+            # (``evict()`` unregisters synchronously, before this check runs).
+            if len(self._registry) >= self._max_concurrent_sessions:
+                logger.warning(
+                    "Routing Activation from SA=0x%04X denied: %d/%d "
+                    "concurrent sessions already registered — denying (0x01)",
+                    src_addr, len(self._registry), self._max_concurrent_sessions,
+                )
+                await self._send_response(
+                    PT_ROUTING_ACT_RESPONSE,
+                    self._activation_response(src_addr, 0x01),
+                )
+                raise _CloseConnection()
+
         self.tester_addr = src_addr
         self.activated = True
-        self.state.tester_addr = src_addr
+        # Architecture roadmap P9: look up (or create) this tester's state
+        # rather than always starting fresh -- a reconnect within S3 picks
+        # up the same session/security state a real ECU would still have,
+        # since that state belongs to the tester, not this socket.
+        self.state = self._ecu.session_for(src_addr, label=str(self._peer))
         self.state.activated = True
 
         if self._registry is not None:
@@ -651,9 +818,9 @@ class EcuSession:
         # timer and start the general inactivity timer for this connection.
         self._arm_general()
 
-        await self._send(build_frame(
+        await self._send_response(
             PT_ROUTING_ACT_RESPONSE, self._activation_response(src_addr, 0x10),
-        ))
+        )
         logger.debug("Sent Routing Activation Response (success) to %s", self._peer)
 
     def _activation_response(self, src_addr: int, code: int) -> bytes:
@@ -667,8 +834,8 @@ class EcuSession:
 
     async def _handle_alive_check(self) -> None:
         # ISO 13400-2 Table 22: payload is the responder's logical address.
-        await self._send(build_frame(PT_ALIVE_CHECK_RESPONSE,
-                                     struct.pack("!H", self._ecu_addr)))
+        await self._send_response(PT_ALIVE_CHECK_RESPONSE,
+                                  struct.pack("!H", self._ecu_addr))
         logger.debug("Sent Alive Check Response (src=0x%04X) to %s",
                      self._ecu_addr, self._peer)
 
@@ -699,7 +866,8 @@ class EcuSession:
                 "Diagnostic Message payload too short (%d bytes) — Generic NACK",
                 len(payload),
             )
-            await self._send(build_frame(PT_HEADER_NACK, bytes([0x04])))
+            await self._send_response(
+                PT_HEADER_NACK, bytes([NACK_GENERIC_INVALID_PAYLOAD_LENGTH]))
             return
 
         src, tgt = struct.unpack("!HH", payload[0:4])
@@ -726,25 +894,25 @@ class EcuSession:
                 src,
                 "0x%04X" % self.tester_addr if self.activated else "<not activated>",
             )
-            await self._send(build_frame(
+            await self._send_response(
                 PT_DIAGNOSTIC_NEGATIVE_ACK,
                 struct.pack("!HHB", self._ecu_addr, src, NACK_INVALID_SOURCE_ADDRESS),
-            ))
+            )
             raise _CloseConnection()
 
         if tgt != self._ecu_addr and not functional:
             logger.warning("Diagnostic Message for unknown target 0x%04X — NACK", tgt)
-            await self._send(build_frame(
+            await self._send_response(
                 PT_DIAGNOSTIC_NEGATIVE_ACK,
                 struct.pack("!HHB", self._ecu_addr, src, NACK_UNKNOWN_TARGET_ADDRESS),
-            ))
+            )
             return
 
         if len(uds) > self._max_data:
-            await self._send(build_frame(
+            await self._send_response(
                 PT_DIAGNOSTIC_NEGATIVE_ACK,
                 struct.pack("!HHB", self._ecu_addr, src, NACK_MESSAGE_TOO_LARGE),
-            ))
+            )
             return
 
         # 1. Positive ACK, sent from the pump right away -- this means "the
@@ -756,28 +924,62 @@ class EcuSession:
         # whatever invalid address the requester sent; using either as our
         # own SA would tell the tester this ECU is answering from an address
         # it doesn't own.
-        await self._send(build_frame(PT_DIAGNOSTIC_POSITIVE_ACK,
-                                     struct.pack("!HHB", self._ecu_addr, src, 0x00)))
+        request = UdsRequest(raw=uds, source_addr=src, target_addr=tgt,
+                             functional=functional)
+
+        # DoIP-layer @on_diagnostic_ack hooks (architecture roadmap P2): a
+        # fault-injection plugin can withhold the ACK entirely
+        # (``WITHHOLD_ACK`` -- the message is then dropped, not queued for
+        # UDS: the tester's own P2 timeout is the only signal it gets),
+        # send a NACK instead of the ACK (any ``int``, ISO 13400-2 Table
+        # 26), or delay it via ``await asyncio.sleep(...)`` before
+        # returning. ``None`` sends the normal, correct ACK below.
+        ack_override = await self._ecu.doip_hooks.resolve_diagnostic_ack(
+            request, self._doip_ctx)
+        if ack_override is WITHHOLD_ACK:
+            logger.info("DoIP hook withheld the Positive ACK for %s — message dropped",
+                        self._peer)
+            return
+        if isinstance(ack_override, int):
+            logger.info("DoIP hook overrode the Positive ACK with NACK 0x%02X for %s",
+                        ack_override, self._peer)
+            await self._send_response(
+                PT_DIAGNOSTIC_NEGATIVE_ACK,
+                struct.pack("!HHB", self._ecu_addr, src, ack_override),
+            )
+            return
+
+        await self._send_response(PT_DIAGNOSTIC_POSITIVE_ACK,
+                                  struct.pack("!HHB", self._ecu_addr, src, 0x00))
         logger.debug("Sent Positive ACK to %s", self._peer)
 
         # 2. Hand off to the worker for the actual UDS dispatch -- the pump
         # must not await this (see the module docstring). ``request.source_addr``
         # is enough for the worker to address its own responses.
-        request = UdsRequest(raw=uds, source_addr=src, target_addr=tgt,
-                             functional=functional)
+        #
+        # Architecture roadmap P5: the response version must be captured
+        # *now*, not read back off ``self._current_req_version`` from inside
+        # ``_uds_worker`` later -- that attribute is this pump's, and the
+        # pump keeps reading (and overwriting it for) further frames while
+        # the worker is still busy with this one (that decoupling is the
+        # entire point of the pump/worker split; see the module docstring
+        # and ``TestPumpWorkerSplit``). Carrying it alongside the request is
+        # what keeps "echo the request's own version" correct under that
+        # split rather than accidentally echoing whatever frame arrived next.
+        req_version = self._current_req_version
         try:
-            self._uds_queue.put_nowait(request)
+            self._uds_queue.put_nowait((request, req_version))
         except asyncio.QueueFull:
             logger.warning(
                 "%s: %d Diagnostic Messages already queued -- answering NRC 0x21 "
                 "busyRepeatRequest instead of queuing another",
                 self._peer, _UDS_QUEUE_MAXSIZE,
             )
-            await self._send(build_frame(
+            await self._send_response(
                 PT_DIAGNOSTIC_MESSAGE,
                 struct.pack("!HH", self._ecu_addr, src)
                 + bytes([0x7F, request.sid & 0xFF, NRC_BUSY_REPEAT_REQUEST]),
-            ))
+            )
 
     async def _uds_worker(self) -> None:
         """
@@ -789,12 +991,14 @@ class EcuSession:
         the split; see the module docstring.
         """
         while True:
-            request = await self._uds_queue.get()
+            request, req_version = await self._uds_queue.get()
             try:
-                async def responder(response: bytes, _src: int = request.source_addr) -> None:
+                async def responder(response: bytes, _src: int = request.source_addr,
+                                    _ver: int = req_version) -> None:
                     await self._send(build_frame(
                         PT_DIAGNOSTIC_MESSAGE,
                         struct.pack("!HH", self._ecu_addr, _src) + response,
+                        version=_ver,
                     ))
 
                 result = await resolve_uds(self._ecu, self.state, request, responder)
@@ -802,6 +1006,16 @@ class EcuSession:
                     await responder(result)
                     logger.debug("Sent Diagnostic response  UDS: %s  to %s",
                                  fmt_hex(result), self._peer)
+            except AbortConnectionAfterResponse as exc:
+                # Architecture roadmap P9: ECUReset with
+                # ``uds.reset_drops_connection`` set -- send the positive
+                # response, then close the socket the way a real ECU
+                # actually disappearing off the bus would, rather than
+                # session.py's usual (deliberate) "keep talking" deviation.
+                await responder(exc.response)
+                logger.info("%s: closing connection abortively -- %s",
+                           self._peer, exc.reason)
+                self._finalize(exc.reason, abortive=True)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -885,40 +1099,69 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
     (``dispatcher.py`` re-raises ``CancelledError`` rather than isolating
     it) — otherwise the abandoned task outlives the connection for good and
     can still call ``responder()`` whenever it eventually wakes up.
+
+    That "never from teardown" guarantee used to hold by accident: before the
+    pump/worker split, the only coroutine that ever awaited this function
+    *was* the connection's own task, so there was nothing else to cancel it
+    out from under. The split introduced a second cancellation source --
+    ``EcuSession._stop_uds_worker`` / ``evict()`` cancelling the worker task
+    on teardown -- that lands on the exact same ``shield``ed ``await`` as the
+    P2 timeout does, but outside the ``except asyncio.TimeoutError`` branch
+    below, so the give-up branch's ``task.cancel()`` never ran for it: the
+    shielded ``task`` kept running detached until it finished on its own,
+    able to call ``responder()`` well after the connection was gone. Verified
+    by closing a connection mid-handler and observing the dispatch task still
+    alive afterward. The outer ``except CancelledError`` below closes this
+    for any cancellation source, present or future, not just the one this
+    function already knew how to name.
     """
     uds_cfg = ecu.uds
     task = asyncio.ensure_future(ecu.dispatcher.dispatch(request, state, responder))
-    if not uds_cfg.auto_response_pending:
-        return await task
+    try:
+        if not uds_cfg.auto_response_pending:
+            return await task
 
-    window = uds_cfg.p2_server_ms / 1000.0
-    pending_sent = 0
-    while True:
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=window)
-        except asyncio.TimeoutError:
-            if uds_cfg.max_response_pending and pending_sent >= uds_cfg.max_response_pending:
-                logger.warning(
-                    "%s: handler still running after %d ResponsePending frames "
-                    "— giving up with NRC 0x10 (uds.max_response_pending)",
-                    request.describe(), pending_sent,
-                )
-                # Cancel rather than detach: shield only protects the handler
-                # from the P2 timeout, not from teardown — plugin code is
-                # already expected to be cancellable (dispatcher.py re-raises
-                # CancelledError instead of isolating it), cancelling runs its
-                # finally blocks, and a merely-slow handler that outlives the
-                # cap must not wake up later and ctx.send() a stray frame onto
-                # a connection the tester has moved on from.
-                task.cancel()
-                task.add_done_callback(_log_abandoned_dispatch)
-                await responder(bytes([0x7F, request.sid & 0xFF, NRC_GENERAL_REJECT]))
-                return NO_RESPONSE
-            logger.debug("P2 elapsed for %s — sending ResponsePending",
-                         request.describe())
-            await responder(bytes([0x7F, request.sid & 0xFF, NRC_RESPONSE_PENDING]))
-            pending_sent += 1
-            window = (uds_cfg.p2_star_server_ms / 1000.0) * 0.9
+        window = uds_cfg.p2_server_ms / 1000.0
+        pending_sent = 0
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=window)
+            except asyncio.TimeoutError:
+                if uds_cfg.max_response_pending and pending_sent >= uds_cfg.max_response_pending:
+                    logger.warning(
+                        "%s: handler still running after %d ResponsePending frames "
+                        "— giving up with NRC 0x10 (uds.max_response_pending)",
+                        request.describe(), pending_sent,
+                    )
+                    # Cancel rather than detach: shield only protects the handler
+                    # from the P2 timeout, not from teardown — plugin code is
+                    # already expected to be cancellable (dispatcher.py re-raises
+                    # CancelledError instead of isolating it), cancelling runs its
+                    # finally blocks, and a merely-slow handler that outlives the
+                    # cap must not wake up later and ctx.send() a stray frame onto
+                    # a connection the tester has moved on from.
+                    task.cancel()
+                    task.add_done_callback(_log_abandoned_dispatch)
+                    await responder(bytes([0x7F, request.sid & 0xFF, NRC_GENERAL_REJECT]))
+                    return NO_RESPONSE
+                logger.debug("P2 elapsed for %s — sending ResponsePending",
+                             request.describe())
+                await responder(bytes([0x7F, request.sid & 0xFF, NRC_RESPONSE_PENDING]))
+                pending_sent += 1
+                window = (uds_cfg.p2_star_server_ms / 1000.0) * 0.9
+    except asyncio.CancelledError:
+        # This coroutine itself was cancelled (worker teardown on connection
+        # close/eviction is the known case today) -- not the P2-timeout path
+        # above, which handles its own give-up separately and returns rather
+        # than raising. ``task`` is still shielded from *that* cancellation
+        # by definition, so it must be cancelled explicitly here too, or it
+        # outlives the connection exactly like the give-up branch was written
+        # to prevent. Cancelling a ``task`` the give-up branch already
+        # cancelled is a safe no-op.
+        if not task.done():
+            task.cancel()
+            task.add_done_callback(_log_abandoned_dispatch)
+        raise
 
 
 def _log_abandoned_dispatch(task: "asyncio.Task") -> None:

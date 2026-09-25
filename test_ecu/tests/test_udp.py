@@ -34,6 +34,7 @@ from testecu.config import parse_config
 from testecu.doip import (
     PT_ENTITY_STATUS_REQUEST,
     PT_ENTITY_STATUS_RESPONSE,
+    PT_HEADER_NACK,
     PT_POWER_MODE_REQUEST,
     PT_POWER_MODE_RESPONSE,
     PT_VEHICLE_ID_REQUEST,
@@ -297,11 +298,74 @@ def test_vin_request_not_matching_is_ignored():
     run(scenario())
 
 
-def test_unknown_payload_type_is_ignored():
+def test_unknown_payload_type_gets_a_header_nack():
+    # Architecture roadmap P4: previously silently ignored; now shares
+    # session.py's Header NACK behaviour via ``validate_header``.
     protocol, transport = _protocol()
     protocol.datagram_received(build_frame(0x00FF, b""), ADDR)
 
-    assert transport.sent == []
+    assert len(transport.sent) == 1
+    data, addr = transport.sent[0]
+    assert struct.unpack("!H", data[2:4])[0] == PT_HEADER_NACK
+    assert data[8:] == b"\x01"
+    assert addr == ADDR
+
+
+def test_bad_version_inverse_gets_a_header_nack_0x00():
+    protocol, transport = _protocol()
+    # A real version paired with the wrong inverse -- Table 2's basic check.
+    bad = struct.pack("!BBHI", 0x02, 0x02, PT_ENTITY_STATUS_REQUEST, 0)
+    protocol.datagram_received(bad, ADDR)
+
+    assert len(transport.sent) == 1
+    data, addr = transport.sent[0]
+    assert struct.unpack("!H", data[2:4])[0] == PT_HEADER_NACK
+    assert data[8:] == b"\x00"
+
+
+def test_unsupported_version_gets_a_header_nack_0x00():
+    protocol, transport = _protocol()
+    # 0x01 is a well-formed version/inverse pair, just not one this entity
+    # accepts (ACCEPTED_VERSIONS is (0x02, 0x03)), and Entity Status is not
+    # one of the payload types the 0xFF wildcard carve-out applies to anyway.
+    bad = struct.pack("!BBHI", 0x01, 0xFE, PT_ENTITY_STATUS_REQUEST, 0)
+    protocol.datagram_received(bad, ADDR)
+
+    assert len(transport.sent) == 1
+    data, addr = transport.sent[0]
+    assert struct.unpack("!H", data[2:4])[0] == PT_HEADER_NACK
+    assert data[8:] == b"\x00"
+
+
+def test_version_0xff_wildcard_is_accepted_for_vehicle_id_request():
+    # ISO 13400-2 Figure 8: a Vehicle Identification Request may use protocol
+    # version 0xFF ("not yet known") -- must NOT be Header-NACKed. The
+    # matching identification response is scheduled (A_DoIP_Announce_Wait),
+    # so this needs a running loop like the other VIR-matching tests.
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+    frame = struct.pack("!BBHI", 0xFF, 0x00, PT_VEHICLE_ID_REQUEST, 0)
+
+    async def scenario():
+        protocol.datagram_received(frame, ADDR)
+        await asyncio.sleep(0)
+        assert len(transport.sent) == 1
+        data, addr = transport.sent[0]
+        # Answered as a normal Vehicle Identification Response, not a NACK.
+        assert struct.unpack("!H", data[2:4])[0] == PT_VEHICLE_ID_RESPONSE
+
+    run(scenario())
+
+
+def test_version_0xff_wildcard_is_rejected_for_entity_status():
+    # The wildcard is VIR-specific -- Entity Status must still be denied.
+    protocol, transport = _protocol()
+    frame = struct.pack("!BBHI", 0xFF, 0x00, PT_ENTITY_STATUS_REQUEST, 0)
+    protocol.datagram_received(frame, ADDR)
+
+    assert len(transport.sent) == 1
+    data, addr = transport.sent[0]
+    assert struct.unpack("!H", data[2:4])[0] == PT_HEADER_NACK
+    assert data[8:] == b"\x00"
 
 
 def test_short_datagram_is_ignored():
