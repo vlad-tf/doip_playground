@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Protocol version
@@ -116,10 +117,45 @@ def build_frame(payload_type: int, payload: bytes, version: int = VER) -> bytes:
     return struct.pack("!BBHI", version, inv, payload_type, len(payload)) + payload
 
 
-async def read_frame(reader: asyncio.StreamReader) -> bytes:
-    """Read exactly one DoIP frame (header + payload) from ``reader``."""
+class FrameTooLarge(Exception):
+    """
+    Raised by ``read_frame`` when the declared payload length exceeds
+    ``max_len`` — before any of that payload has been read.
+
+    The generic header's length field is 32 bits (ISO 13400-2 Table 2), so a
+    peer that sends a genuine 8-byte header but lies in that field — up to
+    ~4 GiB — makes a trusting ``readexactly(plen)`` wait for the rest of
+    those bytes forever. That ties up the connection (and its task)
+    indefinitely: the general inactivity timer (DoIP-080) only resets once a
+    full frame has actually been read, so a stalled read like this never
+    times out on its own. Raising here instead of reading lets the caller
+    send a Generic NACK and close the connection, rather than hang.
+    """
+
+    def __init__(self, declared_len: int, max_len: int) -> None:
+        self.declared_len = declared_len
+        self.max_len = max_len
+        super().__init__(
+            f"declared payload length {declared_len} exceeds max_len {max_len}"
+        )
+
+
+async def read_frame(reader: asyncio.StreamReader,
+                      max_len: Optional[int] = None) -> bytes:
+    """
+    Read exactly one DoIP frame (header + payload) from ``reader``.
+
+    ``max_len``, when given, bounds the declared payload length: anything
+    over it raises ``FrameTooLarge`` immediately, without attempting
+    ``readexactly`` on that many bytes (see that exception's docstring for
+    why this matters). Callers that omit it get the original, unbounded
+    behaviour — this is opt-in so it stays a byte-identical port for anyone
+    diffing against ``echo_ecu``'s framing.
+    """
     hdr = await reader.readexactly(8)
     plen = struct.unpack("!I", hdr[4:8])[0]
+    if max_len is not None and plen > max_len:
+        raise FrameTooLarge(plen, max_len)
     if plen == 0:
         return hdr
     payload = await reader.readexactly(plen)

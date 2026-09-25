@@ -78,6 +78,17 @@ class Client:
                         struct.pack("!HH", tester, target) + uds)
         return await self.recv()
 
+    async def send_raw_header(self, payload_type, declared_len, real_bytes=b""):
+        """
+        Write a generic header whose length field may not match ``real_bytes``.
+
+        Used to simulate a peer that lies about the payload length — see
+        ``TestFrameLengthCap`` below.
+        """
+        hdr = struct.pack("!BBHI", 0x02, 0xFD, payload_type, declared_len)
+        self.writer.write(hdr + real_bytes)
+        await self.writer.drain()
+
     async def close(self):
         self.writer.close()
         try:
@@ -454,3 +465,75 @@ class TestInactivityTimers:
             return True
 
         assert run(with_server(scenario, extra=self.TIMERS))
+
+
+class TestFrameLengthCap:
+    """
+    ``read_frame`` bounds the declared payload length before reading it.
+
+    Without this, a peer that sends a genuine 8-byte header with a hostile
+    32-bit length (up to ~4 GiB, ISO 13400-2 Table 2) makes ``readexactly``
+    wait for the rest of those bytes forever — hanging the connection open
+    indefinitely, since the general inactivity timer only resets once a full
+    frame has actually been read.
+    """
+
+    #: Small on purpose so "at the cap" / "one byte over" are cheap to set up.
+    SMALL_MAX = {"doip": {"max_payload_bytes": 64}}
+
+    def test_hostile_declared_length_is_nacked_and_socket_closed(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+
+            # Declare ~4 GiB of payload but only actually send 3 bytes. Before
+            # the fix this would hang here until the timeout, every time.
+            await client.send_raw_header(PT_DIAGNOSTIC_MESSAGE, 0xFFFFFFFF,
+                                          b"\x0E\x00\x00")
+            ptype, payload = await client.recv(timeout=2.0)
+            assert ptype == PT_HEADER_NACK
+            assert payload == b"\x02"    # Generic NACK 0x02: message too large
+
+            # ISO 13400-2 Table 14 pairs 0x02 with "discard message", not a
+            # forced close -- but we bail before reading the declared bytes,
+            # so the stream is desynced. Closing is the only safe option.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
+                                asyncio.TimeoutError)):
+                await client.recv(timeout=1.0)
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=self.SMALL_MAX))
+
+    def test_message_exactly_at_the_cap_is_accepted_normally(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            max_data = self.SMALL_MAX["doip"]["max_payload_bytes"]
+            uds = b"\x22\xF1\x90" + b"\xAA" * (max_data - 3)
+            assert len(uds) == max_data
+            ptype, payload = await client.diagnostic(uds)
+            # Must NOT be caught by the framing-level cap.
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=self.SMALL_MAX))
+
+    def test_message_one_byte_over_the_business_limit_still_gets_the_existing_nack(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            max_data = self.SMALL_MAX["doip"]["max_payload_bytes"]
+            uds = b"\x22\xF1\x90" + b"\xAA" * (max_data - 2)   # max_data + 1 bytes
+            assert len(uds) == max_data + 1
+            ptype, payload = await client.diagnostic(uds)
+            # A merely-oversized (not hostile) request must still reach the
+            # existing business-level "message too large" NACK, not be cut
+            # off by the framing-level sanity cap this fix adds.
+            assert ptype == PT_DIAGNOSTIC_NEGATIVE_ACK
+            assert payload[4] == 0x04    # NACK_MESSAGE_TOO_LARGE
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=self.SMALL_MAX))

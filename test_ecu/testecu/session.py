@@ -40,6 +40,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 from testecu.doip import (
     ACCEPTED_VERSIONS,
     ALIVE_PROBE_TIMEOUT_S,
+    FrameTooLarge,
     NACK_INVALID_SOURCE_ADDRESS,
     NACK_MESSAGE_TOO_LARGE,
     NACK_UNKNOWN_TARGET_ADDRESS,
@@ -71,6 +72,13 @@ from testecu.uds import (
 )
 
 logger = logging.getLogger("testecu.session")
+
+#: Slack added on top of ``max_payload_bytes`` when bounding a declared
+#: frame length in ``_loop`` (see there). Generous enough to let a merely
+#: oversized-but-real Diagnostic Message reach the existing business-level
+#: "message too large" NACK; nowhere near the multi-GB territory a hostile
+#: length field would need to actually hang the connection.
+_FRAME_LEN_SLACK = 65536
 
 
 class SessionRegistry:
@@ -348,7 +356,37 @@ class EcuSession:
 
     async def _loop(self) -> None:
         while True:
-            raw = await read_frame(self._reader)
+            # ISO 13400-2 Table 2's length field is 32 bits; a peer that puts
+            # a hostile value there (far more than any real message on this
+            # socket could be) must not make us block on ``readexactly`` for
+            # that many bytes. Bound it to the largest Diagnostic Message
+            # frame (SA(2)+TA(2)+business payload) plus generous slack: the
+            # slack matters because a tester that merely sends an oversized
+            # request (misconfigured, not malicious) still needs to reach
+            # the existing "message too large" NACK in ``_handle_diagnostic``
+            # below rather than being cut off here instead — this cap is
+            # only meant to catch lengths no real message would ever have.
+            try:
+                raw = await read_frame(
+                    self._reader, max_len=self._max_data + 4 + _FRAME_LEN_SLACK,
+                )
+            except FrameTooLarge as exc:
+                # ISO 13400-2 Table 14 / DoIP-043: a declared length beyond
+                # what this entity supports is "message too large" (0x02),
+                # not "invalid payload length" (0x04, DoIP-045) — that code
+                # is for a length that doesn't match what a *specific*
+                # payload type expects (the too-short Routing Activation
+                # Request above is the real 0x04 case). Table 14 pairs 0x02
+                # with "discard message", not a forced close, but we bail
+                # before consuming the declared bytes, so the stream is
+                # desynced — closing is the only safe option here.
+                logger.warning(
+                    "Declared payload length %d from %s exceeds max_len %d — "
+                    "Generic NACK 0x02 (message too large) + close",
+                    exc.declared_len, self._peer, exc.max_len,
+                )
+                await self._send(build_frame(PT_HEADER_NACK, bytes([0x02])))
+                return
             pt = frame_ptype(raw)
             pload = frame_payload(raw)
 
