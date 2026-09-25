@@ -23,7 +23,9 @@ import struct
 import pytest
 
 from conftest import ECU_ADDR, TESTER_ADDR, make_ecu, run
+from testecu import Plugin, on_service
 from testecu.doip import (
+    PT_ALIVE_CHECK_REQUEST,
     PT_ALIVE_CHECK_RESPONSE,
     PT_DIAGNOSTIC_MESSAGE,
     PT_DIAGNOSTIC_NEGATIVE_ACK,
@@ -558,3 +560,166 @@ class TestFrameLengthCap:
             return True
 
         assert run(with_server(scenario, extra=self.SMALL_MAX))
+
+
+class PumpingClient(Client):
+    """
+    A ``Client`` with its own background reader, so a scenario can wait on
+    something else (another connection's ``activate()``, say) while this
+    connection still needs to answer an incoming Alive Check Request the
+    instant it arrives.
+
+    asyncio allows only one coroutine at a time to wait on a given
+    ``StreamReader``, so the background reader is the *only* thing that ever
+    calls ``read_frame`` on this socket: it auto-answers Alive Check Requests
+    and skips ``7F <sid> 78`` ResponsePending frames (expected noise from a
+    slow handler, not a failure), and puts everything else on a queue that
+    ``recv()`` reads from instead of the socket directly.
+    """
+
+    def __init__(self, reader, writer):
+        super().__init__(reader, writer)
+        self._queue: "asyncio.Queue[tuple]" = asyncio.Queue()
+        self._pump_task = asyncio.ensure_future(self._pump())
+
+    async def _pump(self):
+        while True:
+            raw = await read_frame(self.reader)
+            pt = struct.unpack("!H", raw[2:4])[0]
+            payload = raw[8:]
+            if pt == PT_ALIVE_CHECK_REQUEST:
+                await self.send(PT_ALIVE_CHECK_RESPONSE,
+                                struct.pack("!H", TESTER_ADDR))
+                continue
+            if pt == PT_DIAGNOSTIC_MESSAGE and payload[4:5] == b"\x7F" \
+                    and len(payload) >= 7 and payload[6] == 0x78:
+                continue    # ResponsePending -- expected noise, not the answer
+            await self._queue.put((pt, payload))
+
+    async def recv(self, timeout=2.0):
+        return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+
+    async def close(self):
+        self._pump_task.cancel()
+        try:
+            await self._pump_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await super().close()
+
+
+class TestPumpWorkerSplit:
+    """
+    The frame pump (``_loop``) must keep answering DoIP-layer traffic while a
+    slow UDS handler is still running in the worker task.
+
+    Baseline this beats (measured against the pre-split code): an Alive
+    Check Response took 1401 ms behind a 1.5 s handler, and a competing
+    Routing Activation during that handler evicted the still-alive session
+    (denial code 0x10 instead of 0x03).
+    """
+
+    SLOW_HANDLER_DELAY_S = 1.5
+
+    @staticmethod
+    def _slow_plugin():
+        class Slow(Plugin):
+            name = "Slow"
+
+            @on_service(0x22)
+            async def read(self, req, ctx):
+                await asyncio.sleep(TestPumpWorkerSplit.SLOW_HANDLER_DELAY_S)
+                return req.positive(b"\x01")
+
+        return Slow()
+
+    def test_alive_check_is_answered_promptly_during_a_slow_handler(self):
+        async def scenario(port):
+            client = await PumpingClient.connect(port)
+            await client.activate()
+
+            # Kick off the slow request but don't wait for its response yet.
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x22\xF1\x90")
+            ptype, _ = await client.recv()
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK   # "received", sent by the pump
+
+            # While the handler is still running, an Alive Check Request on
+            # the SAME socket must get its response promptly -- well under
+            # the alive-probe timeout, not after the handler finally returns.
+            start = asyncio.get_event_loop().time()
+            await client.send(PT_ALIVE_CHECK_REQUEST, b"")
+            ptype, payload = await client.recv(timeout=2.0)
+            elapsed = asyncio.get_event_loop().time() - start
+            assert ptype == PT_ALIVE_CHECK_RESPONSE
+            assert struct.unpack("!H", payload)[0] == ECU_ADDR
+            assert elapsed < 0.2
+
+            # The handler's own (delayed) response must still show up.
+            ptype, payload = await client.recv(timeout=2.0)
+            assert ptype == PT_DIAGNOSTIC_MESSAGE
+            assert payload[4:] == b"\x62\x01"
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, plugins=[self._slow_plugin()]))
+
+    def test_a_session_mid_handler_is_not_evicted_by_a_competing_activation(self):
+        async def scenario(port):
+            first = await PumpingClient.connect(port)
+            ptype, payload = await first.activate()
+            assert payload[4] == 0x10
+
+            # Kick off the slow request; do not await its response yet.
+            await first.send(PT_DIAGNOSTIC_MESSAGE,
+                             struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x22\xF1\x90")
+            ptype, _ = await first.recv()
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+
+            # A second connection tries to activate the SAME tester SA while
+            # the first is still mid-handler but alive (``first.recv()``
+            # transparently answers the resulting probe). It must be
+            # denied, not accepted at the first connection's expense.
+            second = await Client.connect(port)
+            ptype, payload = await second.activate(tester=TESTER_ADDR)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x03    # SA already registered and alive
+            await second.close()
+
+            # The first connection's slow request must still complete
+            # normally -- it was never evicted.
+            ptype, payload = await first.recv(timeout=2.0)
+            assert ptype == PT_DIAGNOSTIC_MESSAGE
+            assert payload[4:] == b"\x62\x01"
+            await first.close()
+            return True
+
+        assert run(with_server(scenario, plugins=[self._slow_plugin()]))
+
+    def test_pipelined_diagnostic_messages_are_acked_before_either_is_answered(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+
+            # Two requests, back to back, without waiting for either response.
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x3E\x00")
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x3E\x00")
+
+            ptype1, _ = await client.recv()
+            ptype2, _ = await client.recv()
+            assert ptype1 == PT_DIAGNOSTIC_POSITIVE_ACK
+            assert ptype2 == PT_DIAGNOSTIC_POSITIVE_ACK
+
+            # Responses arrive afterwards, in request order.
+            ptype3, payload3 = await client.recv()
+            ptype4, payload4 = await client.recv()
+            assert ptype3 == PT_DIAGNOSTIC_MESSAGE
+            assert ptype4 == PT_DIAGNOSTIC_MESSAGE
+            assert payload3[4:] == b"\x7E\x00"
+            assert payload4[4:] == b"\x7E\x00"
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))

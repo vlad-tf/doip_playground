@@ -15,18 +15,34 @@
 """
 The DoIP connection state machine.
 
-Ported from ``echo_ecu.ECUSession``: routing activation (including the ISO
-13400-2 §9.3 source-address conflict resolution and alive probe) and alive
-check are unchanged. Three differences from the port: ``_handle_diagnostic``
-hands the UDS bytes to the dispatcher instead of building a canned echo;
-this class also runs the ISO 13400-2 §7.2.2/§7.2.3 initial/general
-inactivity timers (see ``_supervise``), which ``echo_ecu`` does not
-implement; and Entity Status Request (0x4001) and Power Mode Info Request
-(0x4003) are *not* answered here — ISO 13400-2 classes both as UDP_DISCOVERY
-messages, so a TCP_DATA socket receiving either now gets the same Header
-NACK 0x01 as any other payload type this socket doesn't accept (``udp.py``
-answers the UDP side). ``echo_ecu`` still answers them over TCP; that's a
-deliberate divergence, not a bug to sync back.
+Ported from ``echo_ecu.ECUSession``: routing activation (including
+source-address conflict resolution and the alive probe) and alive check are
+unchanged. Differences from the port: ``_handle_diagnostic`` hands the UDS
+bytes to the dispatcher instead of building a canned echo; this class also
+runs the initial/general inactivity timers (see ``_supervise``), which
+``echo_ecu`` does not implement; Entity Status Request (0x4001) and Power
+Mode Info Request (0x4003) are *not* answered here — both are
+discovery-only message types, so a TCP_DATA socket receiving either now gets
+the same Header NACK 0x01 as any other payload type this socket doesn't
+accept (``udp.py`` answers the UDP side), which ``echo_ecu`` does not do
+(deliberate divergence, not a bug to sync back); and the frame pump is
+split from the UDS executor (see below), which ``echo_ecu`` has no reason
+to need since it never runs a UDS dispatcher that can legitimately take
+seconds.
+
+**Pump / worker split.** ``_loop`` is the frame pump: it reads one frame at
+a time and handles every DoIP-layer type (Header NACKs, Routing Activation,
+Alive Check Request/Response) synchronously, inline, and never awaits UDS
+work. A validated Diagnostic Message is hand-parsed and ACKed by the pump
+right away — the Positive ACK means "received", not "processed" — and then
+handed to ``_uds_worker`` through a small bounded ``asyncio.Queue``
+(``_UDS_QUEUE_MAXSIZE``). The worker is the only coroutine that ever awaits
+``resolve_uds``; keeping it single (not a pool) preserves in-order
+processing within one tester's session. Without this split, an Alive Check
+Request arriving on this same socket — or an Alive Check *Response* this
+socket needs to read because a competing Routing Activation elsewhere is
+probing it — would sit behind whatever UDS handler is still running,
+starving liveness checking generally.
 """
 
 from __future__ import annotations
@@ -63,6 +79,7 @@ from testecu.doip import (
 from testecu.uds import (
     FUNCTIONAL_SUPPRESSED_NRCS,
     NO_RESPONSE,
+    NRC_BUSY_REPEAT_REQUEST,
     NRC_GENERAL_REJECT,
     NRC_RESPONSE_PENDING,
     NegativeResponse,
@@ -79,6 +96,13 @@ logger = logging.getLogger("testecu.session")
 #: "message too large" NACK; nowhere near the multi-GB territory a hostile
 #: length field would need to actually hang the connection.
 _FRAME_LEN_SLACK = 65536
+
+#: Bound on Diagnostic Messages queued for ``_uds_worker`` at once (the
+#: pump / UDS executor split). A well-behaved tester never has more than one
+#: request outstanding, so this is a misbehaviour budget, not a throughput
+#: knob: once full, the pump answers the offending request directly with
+#: NRC 0x21 busyRepeatRequest instead of growing memory or dropping the frame.
+_UDS_QUEUE_MAXSIZE = 8
 
 
 class SessionRegistry:
@@ -161,6 +185,14 @@ class EcuSession:
         self._alive_probe_pending: bool = False
         self._alive_probe_event: Optional[asyncio.Event] = None
 
+        #: Validated Diagnostic Messages waiting for ``_uds_worker`` (pump /
+        #: UDS executor split — see the module docstring). The pump only
+        #: ever ``put_nowait``s here and goes straight back to ``read_frame``;
+        #: it never awaits the worker.
+        self._uds_queue: "asyncio.Queue[UdsRequest]" = asyncio.Queue(
+            maxsize=_UDS_QUEUE_MAXSIZE)
+        self._uds_worker_task: Optional[asyncio.Task] = None
+
         # -------- Inactivity timers (ISO 13400-2 §7.2.2 / §7.2.3) --------
         # The initial inactivity timer runs from connection to Routing
         # Activation; the general inactivity timer runs from Routing Activation
@@ -190,6 +222,7 @@ class EcuSession:
         if self._initial_timeout > 0:
             self._initial_deadline = self._loop_ref.time() + self._initial_timeout
         self._supervisor = asyncio.ensure_future(self._supervise())
+        self._uds_worker_task = asyncio.ensure_future(self._uds_worker())
         try:
             await self._loop()
         except asyncio.IncompleteReadError:
@@ -207,6 +240,7 @@ class EcuSession:
                 except (asyncio.CancelledError, Exception):
                     pass
                 self._supervisor = None
+            await self._stop_uds_worker()
             self.state.close()
             try:
                 self._writer.close()
@@ -216,6 +250,23 @@ class EcuSession:
             if self._registry is not None and self.tester_addr is not None:
                 self._registry.unregister(self.tester_addr, self)
             logger.info("Session closed for %s", self._peer)
+
+    async def _stop_uds_worker(self) -> None:
+        """
+        Cancel ``_uds_worker`` and whatever dispatch it currently has in flight.
+
+        The worker task's cancellation propagates into ``resolve_uds``'s
+        ``_dispatch_with_p2``, which already shields/cancels its own inner
+        dispatch task correctly, so one ``.cancel()`` here is enough to stop
+        a slow handler from outliving the connection.
+        """
+        if self._uds_worker_task is not None and not self._uds_worker_task.done():
+            self._uds_worker_task.cancel()
+            try:
+                await self._uds_worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._uds_worker_task = None
 
     def evict(self) -> None:
         """
@@ -229,6 +280,9 @@ class EcuSession:
         if self._supervisor is not None and not self._supervisor.done():
             self._supervisor.cancel()
             self._supervisor = None
+        if self._uds_worker_task is not None and not self._uds_worker_task.done():
+            self._uds_worker_task.cancel()
+            self._uds_worker_task = None
         self.state.close()
         try:
             self._writer.close()
@@ -626,9 +680,11 @@ class EcuSession:
         """
         Diagnostic Message (0x8001): src (2) + tgt (2) + UDS bytes.
 
-        Sends the Positive ACK (0x8002), then whatever the dispatcher produces.
-        A handler may emit extra frames of its own before the final one via
-        ``ctx.send()`` / ``ctx.response_pending()``.
+        Runs entirely in the pump: every check up to and including the
+        Positive ACK (0x8002) happens here, synchronously, the instant the
+        frame is read. The request is then queued for ``_uds_worker``, which
+        is the only place the dispatcher actually runs -- this method never
+        awaits a UDS handler.
         """
         if len(payload) < 5:
             # Minimum viable Diagnostic Message: SA(2) + TA(2) + at least one
@@ -691,11 +747,12 @@ class EcuSession:
             ))
             return
 
-        # 1. Positive ACK.  ISO 13400-2 Table 28 / DoIP-066: the ack's SA is
-        # always this entity's own logical address — never the request's
-        # ``tgt`` field, which is only *this* ECU's address in the plain
-        # physical-addressing case. A functional request's ``tgt`` is the
-        # functional address, and an unknown-target NACK's ``tgt`` is
+        # 1. Positive ACK, sent from the pump right away -- this means "the
+        # frame was received", not "the request has been processed"; the SA
+        # here is always this entity's own logical address -- never the
+        # request's ``tgt`` field, which is only *this* ECU's address in the
+        # plain physical-addressing case. A functional request's ``tgt`` is
+        # the functional address, and an unknown-target NACK's ``tgt`` is
         # whatever invalid address the requester sent; using either as our
         # own SA would tell the tester this ECU is answering from an address
         # it doesn't own.
@@ -703,22 +760,55 @@ class EcuSession:
                                      struct.pack("!HHB", self._ecu_addr, src, 0x00)))
         logger.debug("Sent Positive ACK to %s", self._peer)
 
-        # 2. UDS response, with src/tgt swapped
+        # 2. Hand off to the worker for the actual UDS dispatch -- the pump
+        # must not await this (see the module docstring). ``request.source_addr``
+        # is enough for the worker to address its own responses.
         request = UdsRequest(raw=uds, source_addr=src, target_addr=tgt,
                              functional=functional)
-
-        async def responder(response: bytes) -> None:
+        try:
+            self._uds_queue.put_nowait(request)
+        except asyncio.QueueFull:
+            logger.warning(
+                "%s: %d Diagnostic Messages already queued -- answering NRC 0x21 "
+                "busyRepeatRequest instead of queuing another",
+                self._peer, _UDS_QUEUE_MAXSIZE,
+            )
             await self._send(build_frame(
-                PT_DIAGNOSTIC_MESSAGE, struct.pack("!HH", self._ecu_addr, src) + response
+                PT_DIAGNOSTIC_MESSAGE,
+                struct.pack("!HH", self._ecu_addr, src)
+                + bytes([0x7F, request.sid & 0xFF, NRC_BUSY_REPEAT_REQUEST]),
             ))
 
-        result = await resolve_uds(self._ecu, self.state, request, responder)
-        if result is None:
-            return
+    async def _uds_worker(self) -> None:
+        """
+        Drain ``_uds_queue`` sequentially, one Diagnostic Message at a time.
 
-        await responder(result)
-        logger.debug("Sent Diagnostic response  UDS: %s  to %s",
-                     fmt_hex(result), self._peer)
+        The only coroutine that ever awaits ``resolve_uds`` -- including a
+        slow handler's ResponsePending loop, which can legitimately run for
+        seconds. Keeping this off the pump (``_loop``) is the whole point of
+        the split; see the module docstring.
+        """
+        while True:
+            request = await self._uds_queue.get()
+            try:
+                async def responder(response: bytes, _src: int = request.source_addr) -> None:
+                    await self._send(build_frame(
+                        PT_DIAGNOSTIC_MESSAGE,
+                        struct.pack("!HH", self._ecu_addr, _src) + response,
+                    ))
+
+                result = await resolve_uds(self._ecu, self.state, request, responder)
+                if result is not None:
+                    await responder(result)
+                    logger.debug("Sent Diagnostic response  UDS: %s  to %s",
+                                 fmt_hex(result), self._peer)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Unhandled error dispatching %s for %s",
+                                 request.describe(), self._peer)
+            finally:
+                self._uds_queue.task_done()
 
 
 # ---------------------------------------------------------------------------
