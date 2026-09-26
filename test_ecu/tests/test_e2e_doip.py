@@ -22,7 +22,7 @@ import struct
 
 import pytest
 
-from conftest import ECU_ADDR, TESTER_ADDR, make_ecu, run
+from conftest import ECU_ADDR, TESTER_ADDR, make_ecu, merge, run
 from testecu import Plugin, on_service
 from testecu.doip import (
     PT_ALIVE_CHECK_REQUEST,
@@ -59,8 +59,8 @@ class Client:
         self.writer = writer
 
     @classmethod
-    async def connect(cls, port):
-        reader, writer = await asyncio.open_connection("::1", port)
+    async def connect(cls, port, host="::1"):
+        reader, writer = await asyncio.open_connection(host, port)
         return cls(reader, writer)
 
     async def send(self, payload_type, payload, version=0x02):
@@ -123,6 +123,46 @@ async def with_server(scenario, extra=None, plugins=None):
         except Exception:
             pass
         await server_wrapper.stop()
+
+
+async def with_server_ipv4(scenario, plugins=None):
+    """Start a server on an ephemeral 127.0.0.1 port over IPv4, run ``scenario(port)``."""
+    # UDP is disabled so the announcer doesn't try to broadcast on 255.255.255.255
+    # during the test — this test targets the v4 TCP listener only.
+    extra = merge(CONFIG, {"listen": {"host": "127.0.0.1", "family": "ipv4"},
+                           "udp": {"enabled": False}})
+    ecu = make_ecu(extra, plugins if plugins is not None else [])
+    server_wrapper = TestEcuServer(ecu)
+    server = await server_wrapper.start(serve_forever=False)
+    port = server_wrapper.port
+    try:
+        return await scenario(port)
+    finally:
+        server.close()
+        try:
+            await server.wait_closed()
+        except Exception:
+            pass
+        await server_wrapper.stop()
+
+
+class TestIPv4:
+    def test_activation_then_read_vin_over_ipv4(self):
+        async def scenario(port):
+            client = await Client.connect(port, host="127.0.0.1")
+            ptype, payload = await client.activate()
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+
+            ptype, payload = await client.diagnostic(b"\x22\xF1\x90")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            ptype, payload = await client.recv()
+            assert ptype == PT_DIAGNOSTIC_MESSAGE
+            assert payload[4:] == b"\x62\xF1\x90" + b"1HGBH41JXMN109186"
+            await client.close()
+            return True
+
+        assert run(with_server_ipv4(scenario))
 
 
 class TestLifecycle:

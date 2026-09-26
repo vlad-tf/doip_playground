@@ -270,7 +270,9 @@ example in about fifteen lines.
 ## Configuration reference
 
 Sections `listen`, `doip` and `udp` are identical to
-[`echo_ecu/config.yaml`](../echo_ecu/config.yaml). The rest:
+[`echo_ecu/config.yaml`](../echo_ecu/config.yaml) — except TestEcu's `listen`
+adds the `family` and `discovery_family` keys (see "IPv4 / IPv6 listener"
+below). The rest:
 
 ### `uds:`
 
@@ -382,22 +384,30 @@ volumes:
   - /path/to/my_plugins:/app/plugins:ro
 ```
 
-### Why TestEcu is IPv6-only
+### IPv4 / IPv6 listener
 
-TestEcu binds `AF_INET6` only, with no IPv4 fallback — a deliberate decision
-(architecture roadmap P8), not an oversight. The top-level
-[`docker-compose.yml`](../docker-compose.yml) does have an IPv4 network
-(`doip_frontend`, 172.30.100.0/24), which can look like tension with an
-IPv6-only ECU, but that network sits between `doip-pc-tester` and
-`doip-edgenode` only — TestEcu is attached solely to `doip_backend`
-(`fd2e:646f:6970::/64`), the same IPv6 ULA the frozen `echo_ecu` node uses.
-The EdgeNode is the IPv4/IPv6 bridge in this topology; nothing ever needs to
-reach TestEcu directly over IPv4. If that changes — a future test target that
-puts an IPv4-only tester or gateway directly on TestEcu's own network — IPv4
-support becomes a real `listen.family` option at that point (`server.py`'s
-socket setup and `udp.py`'s announcer would both need a genuine second code
-path, not a one-line family swap); until then, adding it speculatively would
-just be more surface with no test target to exercise it against.
+TestEcu defaults to an IPv6-only listener (`listen.family: ipv6`), matching the
+topology in [`docker-compose.yml`](../docker-compose.yml): TestEcu sits on the
+`doip_backend` ULA (`fd2e:646f:6970::/64`), the same IPv6 network as the frozen
+`echo_ecu` node, and nothing needs to reach it over IPv4 today.
+
+That changed into a real config option so the same binary also serves an
+IPv4-only in-vehicle network:
+
+| `listen.family` | Listener socket | Notes |
+|---|---|---|
+| `ipv6` (default) | `AF_INET6`, `IPV6_V6ONLY` on | only IPv6 |
+| `dual` | `AF_INET6`, `V6ONLY` off | accepts IPv4 and IPv6 (v4-mapped) |
+| `ipv4` | `AF_INET` | only IPv4; the default `host` `::` becomes `0.0.0.0` |
+
+`listen.discovery_family` (`ipv6` | `ipv4`) controls where startup Vehicle
+Announcements and Vehicle Identification handling listen/send. It defaults to
+follow `family` — `ipv4` when the listener is `ipv4`, `ipv6` otherwise — and
+only needs to be set explicitly to decouple the two (e.g. dual-stack TCP but
+IPv6 announcements). IPv4 discovery uses the limited-broadcast address
+(ISO 13400-2 DoIP-125), which requires `SO_BROADCAST`; there is no multicast
+group to join and no scope id. Replies to identification requests are always
+unicast to the requester regardless of family.
 
 ---
 

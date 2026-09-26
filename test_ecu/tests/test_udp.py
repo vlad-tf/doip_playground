@@ -68,6 +68,24 @@ def _protocol(extra=None, registry=None, max_sockets=1) -> tuple:
 ADDR = ("::1", 54321, 0, 0)
 
 
+def test_announcement_defaults_to_ipv6_multicast():
+    protocol, transport = _protocol()
+    protocol.send_announcement()
+    assert len(transport.sent) == 1
+    _, addr = transport.sent[0]
+    assert addr[0] == udp_module.DOIP_MCAST_ADDR
+
+
+def test_announcement_aims_at_ipv4_broadcast_when_discovery_is_ipv4():
+    # ISO 13400-2 DoIP-125: IPv4 announcements target the limited-broadcast
+    # address; sending must not require an IPv6 socket at all.
+    protocol, transport = _protocol({"listen": {"discovery_family": "ipv4"}})
+    protocol.send_announcement()
+    assert len(transport.sent) == 1
+    _, addr = transport.sent[0]
+    assert addr[0] == udp_module.DOIP_V4_BROADCAST_ADDR
+
+
 def test_entity_status_request_gets_a_response():
     protocol, transport = _protocol()
     protocol.datagram_received(build_frame(PT_ENTITY_STATUS_REQUEST, b""), ADDR)

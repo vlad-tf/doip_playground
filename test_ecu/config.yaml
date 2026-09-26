@@ -12,6 +12,13 @@ listen:
   port:      13400      # plain DoIP port (match the EdgeNode routing table)
   interface: "eth0"     # used for the multicast join, outgoing announcements,
                         # and the IPv6 scope_id when binding a link-local address
+  family:    "ipv6"     # TCP listener family: ipv6 | dual | ipv4 (see README)
+                        #   dual = AF_INET6 without V6ONLY (also accepts IPv4)
+                        #   ipv4 = AF_INET only; host default becomes 0.0.0.0
+  discovery_family: "ipv6"   # announcement target for Vehicle ID/announcements:
+                             # ipv6 = ff02::1 multicast (DoIP-155)
+                             # ipv4 = 255.255.255.255 broadcast (DoIP-125)
+                             # defaults: ipv4 when family=ipv4, else ipv6
 
 doip:
   ecu_logical_addr:  0x0002   # must match ecu_logical_addr in the EdgeNode routing table

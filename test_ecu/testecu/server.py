@@ -51,12 +51,24 @@ class TestEcuServer:
 
     def _build_socket(self) -> socket.socket:
         listen = self._ecu.config.listen
+        if listen.family == "ipv4":
+            host = listen.host if listen.host not in ("", "::") else "0.0.0.0"
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, listen.port))
+            sock.listen(self._backlog)
+            return sock
+
         sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-        except (AttributeError, OSError):
-            pass  # not available everywhere
+        # Single-family IPv6 listens on v6 only; ``dual`` leaves V6ONLY off so
+        # the same socket also accepts v4-mapped connections (ListenConfig's
+        # "family" default is ipv6).
+        if listen.family != "dual":
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except (AttributeError, OSError):
+                pass  # not available everywhere
 
         scope_id = 0
         if listen.interface:

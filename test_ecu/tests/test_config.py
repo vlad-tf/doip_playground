@@ -231,6 +231,40 @@ class TestUdsRanges:
         assert cfg({"uds": {"s3_server_ms": 0}}).uds.s3_server_ms == 0
 
 
+class TestListenSection:
+    def test_family_defaults_to_ipv6(self):
+        parsed = cfg({"listen": {}})
+        assert parsed.listen.family == "ipv6"
+        assert parsed.listen.discovery_family == "ipv6"
+
+    def test_ipv4_family_defaults_discovery_to_ipv4(self):
+        parsed = cfg({"listen": {"family": "ipv4"}})
+        assert parsed.listen.family == "ipv4"
+        # a pure-IPv4 listener announces over IPv4 unless told otherwise
+        assert parsed.listen.discovery_family == "ipv4"
+
+    def test_dual_family_defaults_discovery_to_ipv6(self):
+        parsed = cfg({"listen": {"family": "dual"}})
+        assert parsed.listen.family == "dual"
+        assert parsed.listen.discovery_family == "ipv6"
+
+    def test_explicit_discovery_family_wins_over_the_default(self):
+        # dual-stack TCP but IPv6 announcements
+        parsed = cfg({"listen": {"family": "ipv4", "discovery_family": "ipv6"}})
+        assert parsed.listen.family == "ipv4"
+        assert parsed.listen.discovery_family == "ipv6"
+
+    def test_family_rejects_unknown_value(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"listen": {"family": "ethernet"}})
+        assert "listen.family" in str(exc.value)
+
+    def test_discovery_family_rejects_unknown_value(self):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"listen": {"discovery_family": "ipx"}})
+        assert "listen.discovery_family" in str(exc.value)
+
+
 class TestUdpRanges:
     def test_announce_count_negative_is_rejected(self):
         with pytest.raises(ConfigError) as exc:

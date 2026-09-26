@@ -118,6 +118,17 @@ class ListenConfig:
     host: str = "::"
     port: int = 13400
     interface: str = ""
+    #: TCP listener address family (IPv4-support roadmap). ``ipv6`` (default),
+    #: ``ipv4``, or ``dual`` (an IPv6 socket without V6ONLY, so it also accepts
+    #: v4-mapped connections).
+    family: str = "ipv6"
+    #: UDP discovery family used by the announcer / Vehicle Identification
+    #: (``ipv6`` | ``ipv4``). Defaults to follow ``family``: IPv4 when the
+    #: listener is IPv4-only, IPv6 otherwise. An IPv4-only in-vehicle network
+    #: sets ``family: ipv4`` and this follows automatically; set it explicitly
+    #: only to decouple the listener family from discovery (e.g. dual-stack
+    #: TCP with IPv6 announcements).
+    discovery_family: str = "ipv6"
 
 
 @dataclass
@@ -303,10 +314,20 @@ class EcuConfig:
 
 def _load_listen(raw: dict) -> ListenConfig:
     section = _section(raw, "listen")
+    family = _one_of(section.get("family", "ipv6"), ("ipv6", "ipv4", "dual"),
+                     "listen.family")
+    # Discovery family defaults to peer the listener family: a pure-IPv4
+    # listener announces on IPv4 (broadcast) unless told otherwise.
+    default_discovery = "ipv4" if family == "ipv4" else "ipv6"
+    discovery_family = _one_of(
+        section.get("discovery_family", default_discovery),
+        ("ipv6", "ipv4"), "listen.discovery_family")
     return ListenConfig(
         host=_to_str(section.get("host", "::"), "listen.host") or "::",
         port=_to_int(section.get("port", 13400), "listen.port"),
         interface=_to_str(section.get("interface", ""), "listen.interface"),
+        family=family,
+        discovery_family=discovery_family,
     )
 
 

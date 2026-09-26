@@ -113,7 +113,13 @@ TESTER_ADDR_RANGE = (0x0E00, 0x0FFF)
 ROUTING_ACT_REQUEST_MIN_LEN = 7
 
 # IPv6 DoIP multicast group (all-nodes link-local) used for announcements
+# (ISO 13400-2 DoIP-155) -- TestEcu's default discovery family.
 DOIP_MCAST_ADDR = "ff02::1"
+
+# IPv4 DoIP vehicle announcements target the *limited broadcast* address,
+# not a multicast group (ISO 13400-2 DoIP-125). Used when discovery_family
+# is "ipv4"; sending to it requires SO_BROADCAST (see udp.py).
+DOIP_V4_BROADCAST_ADDR = "255.255.255.255"
 
 # Timeout for the Alive Check probe used during SA-conflict resolution
 ALIVE_PROBE_TIMEOUT_S = 0.5

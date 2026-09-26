@@ -33,6 +33,7 @@ from testecu.config import EcuConfig
 from testecu.plugin import DoipContext, IdentificationRequest
 from testecu.doip import (
     DOIP_MCAST_ADDR,
+    DOIP_V4_BROADCAST_ADDR,
     PT_ENTITY_STATUS_REQUEST,
     PT_ENTITY_STATUS_RESPONSE,
     PT_HEADER_NACK,
@@ -130,6 +131,11 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         self._payload = build_announcement_payload(config)
         self._if_index = if_index
         self._port = config.listen.port
+        #: Discovery family (``ipv6`` | ``ipv4``) — decides where startup
+        #: Vehicle Announcements are aimed (link-local multicast vs. limited
+        #: broadcast). Replies to identification requests always go unicast
+        #: to the requester, so they are family-agnostic.
+        self._discovery_family = config.listen.discovery_family
         self._node_type = config.doip.node_type
         self._power_mode = config.doip.power_mode
         self._max_data = config.doip.max_payload_bytes
@@ -289,11 +295,16 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         logger.warning("UDP: error: %s", exc)
 
     def send_announcement(self) -> None:
-        """Send one Vehicle Announcement to the DoIP multicast group."""
+        """Send one Vehicle Announcement to the DoIP discovery group/broadcast."""
         if not self._transport:
             return
         frame = build_frame(PT_VEHICLE_ID_RESPONSE, self._payload)
-        dest = (DOIP_MCAST_ADDR, self._port, 0, self._if_index)
+        if self._discovery_family == "ipv4":
+            # ISO 13400-2 DoIP-125: IPv4 announcements target limited broadcast.
+            dest = (DOIP_V4_BROADCAST_ADDR, self._port)
+        else:
+            # ISO 13400-2 DoIP-155: IPv6 announcements target link-local multicast.
+            dest = (DOIP_MCAST_ADDR, self._port, 0, self._if_index)
         try:
             self._transport.sendto(frame, dest)
         except Exception as exc:
@@ -303,10 +314,10 @@ class _UDPProtocol(asyncio.DatagramProtocol):
 async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
                         max_sockets: int = 1, doip_hooks: Optional[Any] = None) -> None:
     """
-    Bind UDP/IPv6, join the DoIP multicast group, wait out
-    A_DoIP_Announce_Wait, send the configured number of announcements, then
-    run until cancelled, answering Vehicle Identification Requests, and close
-    the transport on the way out.
+    Bind the UDP discovery socket (IPv6 multicast or IPv4 limited-broadcast,
+    per ``listen.discovery_family``), wait out A_DoIP_Announce_Wait, send the
+    configured number of announcements, then run until cancelled, answering
+    Vehicle Identification Requests, and close the transport on the way out.
 
     Every step that depends on the interface is best-effort: on a developer
     machine there is no ``eth0`` and no multicast on loopback, and that must not
@@ -320,6 +331,7 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
     """
     interface = config.listen.interface
     port = config.listen.port
+    discovery_family = config.listen.discovery_family
 
     if_index = 0
     if interface:
@@ -331,32 +343,59 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
                 interface, exc,
             )
 
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except (AttributeError, OSError):
-        pass
-
-    try:
-        mreq = socket.inet_pton(socket.AF_INET6, DOIP_MCAST_ADDR) + struct.pack("I", if_index)
-        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
-    except OSError as exc:
-        logger.warning("UDP: multicast join failed: %s", exc)
-
-    if if_index:
+    if discovery_family == "ipv4":
+        # IPv4 discovery (ISO 13400-2 DoIP-125) uses the *limited broadcast*
+        # address, which needs SO_BROADCAST on the sending socket — there is
+        # no multicast group to join and no scope id. Identification requests
+        # arrive as ordinary unicast datagrams to this bound socket either way.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF,
-                            struct.pack("I", if_index))
-        except OSError:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError as exc:
+            logger.warning("UDP: cannot enable SO_BROADCAST: %s", exc)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError as exc:
+            sock.close()
+            logger.warning(
+                "UDP: cannot bind 0.0.0.0:%d: %s — announcements disabled",
+                port, exc,
+            )
+            return
+        bind_text = "0.0.0.0"
+    else:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
             pass
 
-    try:
-        sock.bind(("::", port, 0, 0))
-    except OSError as exc:
-        sock.close()
-        logger.warning("UDP: cannot bind [::]:%d: %s — announcements disabled", port, exc)
-        return
+        try:
+            mreq = socket.inet_pton(socket.AF_INET6, DOIP_MCAST_ADDR) + struct.pack("I", if_index)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+        except OSError as exc:
+            logger.warning("UDP: multicast join failed: %s", exc)
+
+        if if_index:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF,
+                                struct.pack("I", if_index))
+            except OSError:
+                pass
+
+        try:
+            sock.bind(("::", port, 0, 0))
+        except OSError as exc:
+            sock.close()
+            logger.warning("UDP: cannot bind [::]:%d: %s — announcements disabled", port, exc)
+            return
+        bind_text = "[::]"
 
     loop = asyncio.get_running_loop()
     transport, protocol = await loop.create_datagram_endpoint(
@@ -365,7 +404,8 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
         sock=sock,
     )
 
-    logger.info("UDP: listening on [::]:%d  interface=%s", port, interface or "any")
+    logger.info("UDP: listening on %s:%d  interface=%s  discovery=%s",
+                bind_text, port, interface or "any", str(discovery_family))
 
     # Everything below runs inside the try so that closing the transport
     # (in the finally) covers every exit path — including cancellation
