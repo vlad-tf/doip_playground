@@ -97,6 +97,23 @@ def _stagger_delay_ms(key: tuple, max_ms: int) -> int:
     return seed % (max_ms + 1)
 
 
+def _local_ips() -> set:
+    """Set of this host's own interface addresses (both families).
+
+    Used to tell a datagram the announcer sent itself from a peer's request:
+    the announcer's own sends always carry a local source address on its
+    discovery port.
+    """
+    ips = {"127.0.0.1", "::1"}
+    try:
+        for res in socket.getaddrinfo(socket.gethostname(), None,
+                                      socket.AF_UNSPEC, socket.SOCK_DGRAM):
+            ips.add(res[4][0])
+    except OSError:
+        pass
+    return ips
+
+
 def build_announcement_payload(config: EcuConfig) -> bytes:
     """
     Vehicle Identification Response / Announcement payload (33 bytes).
@@ -136,6 +153,10 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         #: broadcast). Replies to identification requests always go unicast
         #: to the requester, so they are family-agnostic.
         self._discovery_family = config.listen.discovery_family
+        #: This host's own interface addresses. Used to recognise datagrams the
+        #: announcer originated itself (see ``_is_self_origin``) so it never
+        #: turns its own broadcast/multicast announcements into a reply storm.
+        self._local_ips = _local_ips()
         self._node_type = config.doip.node_type
         self._power_mode = config.doip.power_mode
         self._max_data = config.doip.max_payload_bytes
@@ -160,6 +181,17 @@ class _UDPProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         if len(data) < 8:
+            return
+
+        # A datagram whose source is this entity's own discovery socket is one
+        # of our own Vehicle Announcements that the kernel looped back to us —
+        # Linux delivers a unicast-source broadcast to the bound socket, unlike
+        # macOS. It is not a peer's request: answering it (or NACKing it, since
+        # the announcement payload type isn't one we handle over UDP) would echo
+        # back to ourselves and become an infinite reply storm. Drop it
+        # silently so the announcer never re-triggers itself.
+        if self._is_self_origin(addr):
+            logger.debug("UDP: ignoring self-originated datagram from %s", addr)
             return
 
         # Architecture roadmap P4: shared with session.py's TCP_DATA loop via
@@ -211,6 +243,15 @@ class _UDPProtocol(asyncio.DatagramProtocol):
                          pt, addr)
             self._schedule_identification_response(addr, pt, req)
             return
+
+    def _is_self_origin(self, addr: tuple) -> bool:
+        """True if ``addr`` is this host speaking from our own discovery port.
+
+        Only our own announcements are emitted from exactly our bound port on a
+        local interface address; a real tester always uses its own ephemeral
+        source port, so this can't accidentally swallow a peer's request.
+        """
+        return addr[1] == self._port and addr[0] in self._local_ips
 
     def _matches(self, req: bytes, pt: int) -> bool:
         """DoIP-051/-052/-053: does this identification request target this entity?"""

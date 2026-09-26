@@ -142,6 +142,21 @@ def test_power_mode_info_request_gets_a_response():
     assert frame_payload(raw) == b"\x01"            # power_mode (default config)
 
 
+def test_self_originated_datagram_is_ignored():
+    # On Linux the announcer's own broadcast/multicast announcements loop back
+    # to its bound socket; since the announcement payload type (0x0004) isn't a
+    # request type this responder handles, NACKing it would echo back to
+    # ourselves forever. The guard must drop anything that came from this
+    # host's own discovery port without replying at all.
+    protocol, transport = _protocol({"listen": {"port": 13400}})
+    self_addr = ("127.0.0.1", 13400)   # local IP + our own bound discovery port
+    protocol.datagram_received(build_frame(PT_VEHICLE_ID_RESPONSE, b"\x00" * 32),
+                               self_addr)
+    protocol.datagram_received(build_frame(PT_VEHICLE_ID_REQUEST, b"\x00\x00\x00"),
+                               self_addr)
+    assert transport.sent == []
+
+
 def test_vehicle_id_request_still_works():
     protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
 
