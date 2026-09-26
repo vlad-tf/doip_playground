@@ -147,9 +147,13 @@ def test_self_originated_datagram_is_ignored():
     # to its bound socket; since the announcement payload type (0x0004) isn't a
     # request type this responder handles, NACKing it would echo back to
     # ourselves forever. The guard must drop anything that came from this
-    # host's own discovery port without replying at all.
+    # host's own discovery port, using a *real* local LAN address (hostname
+    # resolution maps to 127.0.1.1 on many Linux boxes, so the guard must not
+    # rely on it).
     protocol, transport = _protocol({"listen": {"port": 13400}})
-    self_addr = ("127.0.0.1", 13400)   # local IP + our own bound discovery port
+    local = next(ip for ip in sorted(udp_module._local_ips())
+                 if not ip.startswith(("127.", "::")))
+    self_addr = (local, 13400)   # local interface IP + our own bound discovery port
     protocol.datagram_received(build_frame(PT_VEHICLE_ID_RESPONSE, b"\x00" * 32),
                                self_addr)
     protocol.datagram_received(build_frame(PT_VEHICLE_ID_REQUEST, b"\x00\x00\x00"),

@@ -102,9 +102,31 @@ def _local_ips() -> set:
 
     Used to tell a datagram the announcer sent itself from a peer's request:
     the announcer's own sends always carry a local source address on its
-    discovery port.
+    discovery port. ``gethostname()`` is *not* a reliable source for this —
+    /etc/hosts commonly maps a Linux box's hostname to ``127.0.1.1``, hiding
+    the real LAN address — so the live interface addresses are enumerated via
+    SIOCGIFADDR, with ``getaddrinfo`` kept as a best-effort fallback.
     """
+    import fcntl
+    import struct as _struct
+
     ips = {"127.0.0.1", "::1"}
+    probe = None
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _index, name in socket.if_nameindex():
+            try:
+                packed = fcntl.ioctl(
+                    probe.fileno(), 0x8915, _struct.pack("256s", name[:15].encode()))
+                ips.add(socket.inet_ntoa(packed[20:24]))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    finally:
+        if probe is not None:
+            probe.close()
+
     try:
         for res in socket.getaddrinfo(socket.gethostname(), None,
                                       socket.AF_UNSPEC, socket.SOCK_DGRAM):
