@@ -26,6 +26,10 @@ Interactive commands:
                                  (default: tester_logical_addr from config)
     diag [hex bytes...]          Send Diagnostic Message
                                  e.g.  diag 10 01   or  diag 1001
+    target [addr_hex]            Show or change the diagnostic target address
+                                 (ecu_logical_addr) used by 'diag', e.g.
+                                 'target 0x0002'. No arg shows the current
+                                 target. Takes effect immediately, no restart.
     alive                        Send Alive Check Request
     status                       Send Entity Status Request
     power                        Send Power Mode Info Request
@@ -404,6 +408,22 @@ class DoIPTester:
             except asyncio.TimeoutError:
                 pass  # no follow-up message
 
+    def cmd_target(self, new_addr: int | None = None) -> None:
+        """
+        Show or change the diagnostic target logical address (self.ecu_addr)
+        used by cmd_diag.  Purely local state — no frame is sent, so this
+        works whether or not the session is activated and takes effect on
+        the very next 'diag' command.
+        """
+        if new_addr is None:
+            print(f"  Current diagnostic target: 0x{self.ecu_addr:04X}")
+            return
+        if not (0x0000 <= new_addr <= 0xFFFF):
+            raise ValueError(f"Target address out of range: 0x{new_addr:X}")
+        old_addr = self.ecu_addr
+        self.ecu_addr = new_addr
+        print(f"  Diagnostic target changed: 0x{old_addr:04X} → 0x{new_addr:04X}")
+
     async def cmd_alive(self) -> None:
         # Alive Check Request has no payload (0x0007); the EdgeNode replies
         # with Alive Check Response (0x0008) + its own logical address (2 bytes).
@@ -436,6 +456,8 @@ HELP_TEXT = """\
 Commands:
   activate [addr_hex]    Routing Activation (addr optional, default from config)
   diag <hex bytes>       Diagnostic Message  e.g. 'diag 10 01' or 'diag 1001'
+  target [addr_hex]      Show, or change, the diag target address used by
+                          'diag' (e.g. 'target 0x0002'). No arg shows current.
   alive                  Alive Check Request
   status                 Entity Status Request
   power                  Power Mode Info Request
@@ -492,6 +514,10 @@ async def repl(tester: DoIPTester, auto_activate: bool = True) -> None:
                     continue
                 uds = _parse_hex_input(parts[1:])
                 await tester.cmd_diag(uds)
+
+            elif cmd == "target":
+                addr = int(parts[1], 0) if len(parts) > 1 else None
+                tester.cmd_target(addr)
 
             elif cmd == "alive":
                 await tester.cmd_alive()
