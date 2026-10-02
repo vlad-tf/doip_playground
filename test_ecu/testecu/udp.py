@@ -67,6 +67,15 @@ _VERSION_WILDCARD_TYPES = (
     PT_VEHICLE_ID_REQUEST_WITH_VIN,
 )
 
+#: Response/NACK payload types a UDP_DISCOVERY listener may see but must never
+#: answer — not even with a Header NACK (see ``datagram_received``).
+_UDP_NEVER_NACK_TYPES = (
+    PT_HEADER_NACK,
+    PT_VEHICLE_ID_RESPONSE,
+    PT_ENTITY_STATUS_RESPONSE,
+    PT_POWER_MODE_RESPONSE,
+)
+
 logger = logging.getLogger("testecu.udp")
 
 
@@ -127,10 +136,25 @@ def _local_ips() -> set:
         if probe is not None:
             probe.close()
 
+    # SIOCGIFADDR above is IPv4-only, so in IPv6 discovery mode the link-local
+    # source of our own looped-back multicast announcement (fe80::<EUI-64>)
+    # was never recognised as local — the announcement got Header-NACKed to
+    # ourselves, then that NACK got NACKed, forever. Linux lists every IPv6
+    # interface address in /proc/net/if_inet6 (32 hex digits per line).
+    try:
+        with open("/proc/net/if_inet6", "r", encoding="ascii") as fh:
+            for line in fh:
+                fields = line.split()
+                if fields and len(fields[0]) == 32:
+                    ips.add(socket.inet_ntop(socket.AF_INET6,
+                                             bytes.fromhex(fields[0])))
+    except (OSError, ValueError):
+        pass
+
     try:
         for res in socket.getaddrinfo(socket.gethostname(), None,
                                       socket.AF_UNSPEC, socket.SOCK_DGRAM):
-            ips.add(res[4][0])
+            ips.add(res[4][0].split("%", 1)[0])
     except OSError:
         pass
     return ips
@@ -221,6 +245,16 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         # checked the generic header at all — a bad version/inverse or a
         # payload type it doesn't handle just silently fell through every
         # ``if`` below instead of getting the Header NACK ISO 13400-2 expects.
+        # A response-type datagram (Header NACK, another entity's Vehicle
+        # Announcement, ...) is never answered with a NACK: two entities that
+        # both NACK unknown types would otherwise ping-pong NACKs indefinitely.
+        # This is the backstop for the self-origin guard above, and also stops
+        # TestEcu NACKing peer ECUs' announcements on the shared segment.
+        if len(data) >= 4 and struct.unpack("!H", data[2:4])[0] in _UDP_NEVER_NACK_TYPES:
+            logger.debug("UDP: ignoring response-type datagram (pt=0x%04X) from %s",
+                         struct.unpack("!H", data[2:4])[0], addr)
+            return
+
         nack = validate_header(data, _UDP_KNOWN_TYPES,
                                version_wildcard_types=_VERSION_WILDCARD_TYPES)
         if nack is not None:
@@ -273,7 +307,8 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         local interface address; a real tester always uses its own ephemeral
         source port, so this can't accidentally swallow a peer's request.
         """
-        return addr[1] == self._port and addr[0] in self._local_ips
+        # Link-local IPv6 may come back as "fe80::...%eth1" — compare bare.
+        return addr[1] == self._port and addr[0].split("%", 1)[0] in self._local_ips
 
     def _matches(self, req: bytes, pt: int) -> bool:
         """DoIP-051/-052/-053: does this identification request target this entity?"""

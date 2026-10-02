@@ -161,6 +161,36 @@ def test_self_originated_datagram_is_ignored():
     assert transport.sent == []
 
 
+def test_self_originated_ipv6_link_local_is_ignored():
+    # Regression: _local_ips() was IPv4-only (SIOCGIFADDR), so in IPv6
+    # discovery mode our own looped-back multicast announcement from
+    # fe80::<EUI-64> was NACKed to ourselves and the NACK NACKed forever.
+    protocol, transport = _protocol({"listen": {"port": 13400}})
+    protocol._local_ips = protocol._local_ips | {"fe80::84cc:acff:fefe:4143"}
+    for host in ("fe80::84cc:acff:fefe:4143", "fe80::84cc:acff:fefe:4143%eth1"):
+        protocol.datagram_received(build_frame(0x00FF, b""), (host, 13400, 0, 2))
+    assert transport.sent == []
+
+
+def test_local_ips_includes_ipv6_interface_addresses(tmp_path, monkeypatch):
+    import builtins
+    proc = tmp_path / "if_inet6"
+    proc.write_text("fe8000000000000084ccacfffefe4143 02 40 20 80     eth1\n")
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: real_open(
+        proc if p == "/proc/net/if_inet6" else p, *a, **k))
+    assert "fe80::84cc:acff:fefe:4143" in udp_module._local_ips()
+
+
+def test_response_types_are_never_nacked():
+    # A Header NACK or a peer's Vehicle Announcement must not be NACKed back —
+    # otherwise two NACK-happy entities ping-pong indefinitely.
+    protocol, transport = _protocol()
+    protocol.datagram_received(build_frame(PT_HEADER_NACK, b"\x01"), ADDR)
+    protocol.datagram_received(build_frame(PT_VEHICLE_ID_RESPONSE, b"\x00" * 33), ADDR)
+    assert transport.sent == []
+
+
 def test_vehicle_id_request_still_works():
     protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
 
