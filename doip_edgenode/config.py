@@ -68,6 +68,13 @@ class TLSConfig:
 #: tester address range.
 DEFAULT_TESTER_ADDR_RANGE: tuple[int, int] = (0x0E00, 0x0FFF)
 
+#: Default for doip.node_logical_addr (EdgeNode's own address) when absent
+#: from config.yaml. 0x0000 is ISO/SAE reserved (ISO 13400-2) and must never
+#: be assigned to a real node, so this is a real address, not a sentinel —
+#: 0x1234, a deliberately high value in the VM-specific range, distinct from
+#: the low ECU addresses (0x0002/0x0003) and the tester range (0x0E00-0x0FFF).
+DEFAULT_NODE_LOGICAL_ADDR = 0x1234
+
 
 @dataclass
 class DoIPConfig:
@@ -270,14 +277,22 @@ def _load_doip(raw: dict) -> DoIPConfig:
                 )
         tester_addr_list = tuple(values)
 
+    node_logical_addr = _to_int(
+        raw.get("node_logical_addr", DEFAULT_NODE_LOGICAL_ADDR),
+        "doip.node_logical_addr",
+    )
+    if node_logical_addr == 0x0000:
+        raise ConfigError(
+            "doip.node_logical_addr must not be 0x0000 — ISO/SAE reserved "
+            "(ISO 13400-2), never a valid node address"
+        )
+
     return DoIPConfig(
         vin=vin,
         eid=eid,
         gid=gid,
         node_type=_to_int(_require(raw, "node_type", sec), "doip.node_type"),
-        node_logical_addr=_to_int(
-            raw.get("node_logical_addr", 0x0000), "doip.node_logical_addr"
-        ),
+        node_logical_addr=node_logical_addr,
         power_mode=_to_int(_require(raw, "power_mode", sec), "doip.power_mode"),
         max_payload_bytes=int(_require(raw, "max_payload_bytes", sec)),
         tester_addr_range=tester_addr_range,

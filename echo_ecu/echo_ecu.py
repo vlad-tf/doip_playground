@@ -124,7 +124,7 @@ def _build_announcement_payload(config: dict) -> bytes:
     vin  = str(doip.get("vin",  "00000000000000000")).encode("ascii")[:17].ljust(17, b"\x00")
     eid  = bytes.fromhex(str(doip.get("eid", "000000000000")))
     gid  = bytes.fromhex(str(doip.get("gid", "000000000000")))
-    ecu_addr = int(str(doip.get("ecu_logical_addr", "0x0001")), 0)
+    ecu_addr = int(str(doip.get("ecu_logical_addr", "0x0002")), 0)
     return (
         vin
         + struct.pack("!H", ecu_addr)
@@ -308,7 +308,7 @@ class ECUSession:
         self.activated = False
         self.tester_addr: int | None = None
 
-        self._ecu_addr   = int(str(config["doip"].get("ecu_logical_addr",  "0x0001")), 0)
+        self._ecu_addr   = int(str(config["doip"].get("ecu_logical_addr",  "0x0002")), 0)
         self._node_type  = int(str(config["doip"].get("node_type",          "0x01")),  0)
         self._power_mode = int(str(config["doip"].get("power_mode",         "0x01")),  0)
         self._max_data   = int(config["doip"].get("max_payload_bytes", 4096))

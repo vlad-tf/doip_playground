@@ -21,7 +21,7 @@ listen:
                              # defaults: ipv4 when family=ipv4, else ipv6
 
 doip:
-  ecu_logical_addr:  0x0002   # must match ecu_logical_addr in the EdgeNode routing table
+  ecu_logical_addr:  0x0003   # must match ecu_logical_addr in the EdgeNode routing table
   node_type:         0x01     # 0x01 = gateway
   power_mode:        0x01     # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
   max_payload_bytes: 4096

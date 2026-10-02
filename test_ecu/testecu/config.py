@@ -133,7 +133,7 @@ class ListenConfig:
 
 @dataclass
 class DoipConfig:
-    ecu_logical_addr: int = 0x0002
+    ecu_logical_addr: int = 0x0003
     node_type: int = 0x01
     power_mode: int = 0x01
     #: Business-level max UDS payload for a Diagnostic Message. Since commit
@@ -334,7 +334,7 @@ def _load_listen(raw: dict) -> ListenConfig:
 def _load_doip(raw: dict) -> DoipConfig:
     section = _section(raw, "doip")
     cfg = DoipConfig(
-        ecu_logical_addr=_to_int(section.get("ecu_logical_addr", 0x0002),
+        ecu_logical_addr=_to_int(section.get("ecu_logical_addr", 0x0003),
                                  "doip.ecu_logical_addr"),
         node_type=_to_int(section.get("node_type", 0x01), "doip.node_type"),
         power_mode=_to_int(section.get("power_mode", 0x01), "doip.power_mode"),

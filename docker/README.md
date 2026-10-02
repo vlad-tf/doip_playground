@@ -5,17 +5,23 @@ Runs the four components in two isolated networks:
 ```
                  doip_frontend (IPv4)            doip_backend (IPv6)
  PC-Tester  ───────────────────────────►  EdgeNode  ─────┬─────────────────►  EchoNode
- 172.30.100.20                            172.30.100.10  │   fd2e:646f:6970::10 / ::2
-                                                         └─────────────────►  TestEcu
+ 172.30.100.20                            172.30.100.10  │   fd2e:646f:6970::2
+                                      fd2e:646f:6970::10  └─────────────────►  TestEcu
                                                                      fd2e:646f:6970::3
 ```
 
 | Component | Container | Frontend (IPv4) | Backend (IPv6) | Logical addr | Ports |
 |---|---|---|---|---|---|
-| EdgeNode | `doip-edgenode` | `172.30.100.10` (eth0) | `fd2e:646f:6970::10` (eth1) | — | 13400/tcp, 3496/tcp, 13400/udp |
-| EchoNode | `doip-echonode` | — | `fd2e:646f:6970::2` | `0x0001` | 13400/tcp, 13400/udp |
-| TestEcu | `doip-testecu` | — | `fd2e:646f:6970::3` | `0x0002` | 13400/tcp, 13400/udp |
+| EdgeNode | `doip-edgenode` | `172.30.100.10` (eth0) | `fd2e:646f:6970::10` (eth1) | `0x1234` | 13400/tcp, 3496/tcp, 13400/udp |
+| EchoNode | `doip-echonode` | — | `fd2e:646f:6970::2` | `0x0002` | 13400/tcp, 13400/udp |
+| TestEcu | `doip-testecu` | — | `fd2e:646f:6970::3` | `0x0003` | 13400/tcp, 13400/udp |
 | PC-Tester | `doip-pc-tester` | `172.30.100.20` | — | — | — |
+
+ECU logical addresses match each node's IPv6 suffix (`::2` → `0x0002`, `::3`
+→ `0x0003`) for easy cross-reference; EdgeNode's own address (`0x1234`) is
+unrelated to its IP and is just a high value in the VM-specific range, kept
+clear of the ECUs and the tester range (`0x0E00`-`0x0FFF`). `0x0000` is never
+used — ISO/SAE reserved (ISO 13400-2), rejected by EdgeNode's config loader.
 
 The tester talks DoIP plain (TCP 13400) to the EdgeNode over IPv4. The EdgeNode
 proxies to a backend ECU over IPv6. TLS (3496) is exposed but not yet negotiated
@@ -28,15 +34,16 @@ not by the activated tester SA. The EdgeNode resolves routes with
 
 | Diag target address | Reaches |
 |---|---|
-| `0x0001` | `doip-echonode` |
-| `0x0002` | `doip-testecu` |
+| `0x0002` | `doip-echonode` |
+| `0x0003` | `doip-testecu` |
 
 Any tester SA the EdgeNode accepts (`doip.tester_addr_range`/`tester_addr_list`
 in `edgenode.config.yaml`, default `0x0E00`-`0x0FFF`) can reach either ECU in the
 same session — no separate Routing Activation per ECU. With the bundled
-`pc_tester`, just use the interactive REPL's `target <addr_hex>` command (e.g.
-`target 0x0002`) to switch which ECU your next `diag` goes to; no config edit
-or container restart needed.
+`pc_tester` (default diag target: `0x0003`, TestEcu), just use the
+interactive REPL's `target <addr_hex>` command (e.g. `target 0x0002`) to
+switch which ECU your next `diag` goes to; no config edit or container
+restart needed.
 
 ## Address ranges (chosen to avoid overlap)
 
@@ -184,6 +191,6 @@ names instead of hardcoded IPs.
 - `priority` on the EdgeNode networks pins the tester side to `eth0` and the ECU
   side to `eth1`, matching `ecu_interface: eth1` in `edgenode.config.yaml`.
 - Both ECUs send UDP Vehicle Announcements to `ff02::1` on the backend network, so a
-  tester doing vehicle discovery there will see two entities (`0x0001` and `0x0002`).
+  tester doing vehicle discovery there will see two entities (`0x0002` and `0x0003`).
 - `doip-echonode` and `doip-testecu` are independent: stopping one does not affect the
   other, and TestEcu changes never touch `echo_ecu/`.

@@ -7,7 +7,7 @@ listen:
   interface: "eth0"     # backend interface toward the EdgeNode
 
 doip:
-  ecu_logical_addr:  0x0001
+  ecu_logical_addr:  0x0002
   node_type:         0x01
   power_mode:        0x01
   max_payload_bytes: 4096

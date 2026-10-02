@@ -30,7 +30,9 @@ doip:
   eid:       "AABBCCDDEEFF"
   gid:       "000000000000"
   node_type:         0x01
-  node_logical_addr: 0x0000
+  node_logical_addr: 0x1234   # VM-specific range, distinct from the ECUs (0x0002/0x0003)
+                              # and the tester range (0x0E00-0x0FFF); 0x0000 is ISO/SAE
+                              # reserved and rejected by load_config()
   power_mode: 0x01
   max_payload_bytes: 4096
   # Accepted tester (client) source addresses for Routing Activation (ISO
@@ -71,14 +73,14 @@ udp:
 # one SA against the same ECU: that is an ISO 13400-2 §9.3 conflict and the
 # ECU will alive-probe, then deny or evict.
 routing_table:
-  - ecu_logical_addr:    0x0001
+  - ecu_logical_addr:    0x0002
     ecu_ipv6:            "fd2e:646f:6970::2"   # Echo ECU static IPv6 on doip_backend
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
     ecu_port_tls:        3496
     ecu_sni:             ""
 
-  - ecu_logical_addr:    0x0002
+  - ecu_logical_addr:    0x0003
     ecu_ipv6:            "fd2e:646f:6970::3"   # TestEcu static IPv6 on doip_backend
     ecu_interface:       "eth1"
     ecu_port_plain:      13400

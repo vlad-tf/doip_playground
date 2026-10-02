@@ -604,7 +604,7 @@ def main() -> None:
     port         = int(target.get("port",  13400))
     timeout      = float(target.get("timeout_s", 5.0))
     tester_addr  = int(str(doip.get("tester_logical_addr", "0x0E00")), 0)
-    ecu_addr     = int(str(doip.get("ecu_logical_addr",    "0x0001")), 0)
+    ecu_addr     = int(str(doip.get("ecu_logical_addr",    "0x0003")), 0)
 
     tester = DoIPTester(
         host=host,

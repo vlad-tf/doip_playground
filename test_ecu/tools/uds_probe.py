@@ -130,7 +130,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--host", default="::1")
     parser.add_argument("--port", type=int, default=13400)
     parser.add_argument("--tester", default="0x0E00", help="tester logical address")
-    parser.add_argument("--target", default="0x0002", help="ECU logical address")
+    parser.add_argument("--target", default="0x0003", help="ECU logical address")
     parser.add_argument("--timeout", type=float, default=6.0)
     parser.add_argument("--uds", action="append", default=[], metavar="HEX",
                         help='UDS request, e.g. "22 F1 90"; repeatable')

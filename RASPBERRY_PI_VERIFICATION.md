@@ -133,8 +133,10 @@ Expected output:
 Loaded config OK
   VIN       : 1HGBH41JXMN109186
   ...
-Routing table:
-  tester 0x0E00 -> ECU 0x0001  [fe80::1%eth1]  plain=13400  tls=3496  sni=''
+Accepted tester SAs:
+  range : 0x0E00-0x0FFF
+Routing table (resolved by Diagnostic Message target address):
+  ECU 0x0002 -> [fe80::1%eth1]  plain=13400  tls=3496  sni=''
 ```
 
 ---
@@ -207,7 +209,7 @@ print('RA response type:', hex(struct.unpack('!H', resp[2:4])[0]))
 print('RA response code:', hex(resp[12]))   # byte 12 = response code
 
 # Diagnostic Message
-diag = frame(0x8001, struct.pack('!HH', 0x0E00, 0x0001) + b'\x10\x01')
+diag = frame(0x8001, struct.pack('!HH', 0x0E00, 0x0002) + b'\x10\x01')
 s.sendall(diag)
 time.sleep(0.5)
 resp = s.recv(1024)

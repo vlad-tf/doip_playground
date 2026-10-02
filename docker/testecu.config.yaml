@@ -2,15 +2,15 @@
 # Mounted at /app/config.yaml in the doip-testecu container.
 # Only attached to the IPv6 backend network, so its single interface is eth0.
 #
-# Runs alongside doip-echonode: the echo node keeps 0x0001 / fd2e:646f:6970::2,
-# TestEcu is 0x0002 / fd2e:646f:6970::3.
+# Runs alongside doip-echonode: the echo node keeps 0x0002 / fd2e:646f:6970::2,
+# TestEcu is 0x0003 / fd2e:646f:6970::3.
 listen:
   host:      "::"       # bind all IPv6 interfaces (V6ONLY)
   port:      13400
   interface: "eth0"     # backend interface toward the EdgeNode
 
 doip:
-  ecu_logical_addr:  0x0002
+  ecu_logical_addr:  0x0003
   node_type:         0x01
   power_mode:        0x01
   max_payload_bytes: 4096

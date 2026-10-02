@@ -141,8 +141,7 @@ network:
   ecu_interface: "eth1"           # update if your adapter has a different name
 
 routing_table:
-  - tester_logical_addr: 0x0E00
-    ecu_logical_addr:    0x0001
+  - ecu_logical_addr:    0x0002
     ecu_ipv6:            "fe80::XXXX:XXXX:XXXX:XXXX"   # ← ECU link-local address (see §2.1)
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
@@ -208,7 +207,7 @@ listen:
   interface: "eth0"     # interface connected to RPi eth1 — update if different
 
 doip:
-  ecu_logical_addr: 0x0001   # must match ecu_logical_addr in EdgeNode routing table
+  ecu_logical_addr: 0x0002   # must match ecu_logical_addr in EdgeNode routing table
 ```
 
 ### 2.4 Start the Echo ECU
@@ -253,7 +252,7 @@ DoIP transport; `udsoncan` is client-oriented. The UDS layer here is stdlib.
 
 ```yaml
 doip:
-  ecu_logical_addr: 0x0002        # 0x0001 is the Echo ECU — give TestEcu its own
+  ecu_logical_addr: 0x0003        # 0x0002 is the Echo ECU — give TestEcu its own
 
 uds:                              # session/security/timing behaviour and the
   unknown_service: nrc            # policies for unhandled requests
@@ -270,9 +269,10 @@ plugins:                          # your business logic
       params: {idle_rpm: 800}
 ```
 
-If you point the EdgeNode at TestEcu, its `routing_table` entry needs
-`ecu_logical_addr: 0x0002` and its own `tester_logical_addr` — the EdgeNode resolves
-routes by tester address and takes the first match, so two ECUs cannot share one.
+If you point the EdgeNode at TestEcu, add its own `routing_table` entry with
+`ecu_logical_addr: 0x0003` (no `tester_logical_addr` field — routing is
+resolved by the Diagnostic Message's own target address, first match wins,
+so just give TestEcu its own entry alongside the Echo ECU's).
 
 ### 2b.3 Check the configuration
 
@@ -352,7 +352,8 @@ target:
 
 doip:
   tester_logical_addr: 0x0E00
-  ecu_logical_addr:    0x0001
+  ecu_logical_addr:    0x0002   # or 0x0003 for TestEcu — change anytime with the
+                                # REPL's 'target' command, no restart needed
 ```
 
 Make sure your PC's Ethernet adapter is in the `10.250.250.x` subnet (e.g. `10.250.250.1/24`).
@@ -413,11 +414,11 @@ At this point, behind the scenes the EdgeNode has also performed its own Routing
 **Send a diagnostic message**
 ```
 doip> diag 10 01
-  → Diagnostic Message  src=0x0E00  tgt=0x0001  UDS: 10 01
+  → Diagnostic Message  src=0x0E00  tgt=0x0002  UDS: 10 01
   ← Diagnostic Message Positive ACK  (0x8002)
-       src=0x0E00  tgt=0x0001  ack_code=0x00
+       src=0x0E00  tgt=0x0002  ack_code=0x00
   ← Diagnostic Message  (0x8001)
-       src=0x0001  tgt=0x0E00
+       src=0x0002  tgt=0x0E00
        UDS: 10 01
 ```
 
@@ -578,7 +579,10 @@ python3 tester.py
 - Check no firewall is blocking port 13400: `sudo ufw status`
 
 **Routing Activation denied (code 0x00 — unknown source address)**
-- `tester_logical_addr` in the EdgeNode `config.yaml` routing table must match what the tester sends (default `0x0E00`)
+- The tester's source address must fall inside the EdgeNode's
+  `doip.tester_addr_range` (default `0x0E00`-`0x0FFF`) or `doip.tester_addr_list`
+  in `config.yaml` — not the `routing_table`, which no longer gates testers at
+  all (it's resolved by the diag target address instead)
 
 **`T_TCP_Initial_Inactivity` fires before activation**
 - This means the Routing Activation Request arrived more than 2 seconds after TCP connect

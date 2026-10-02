@@ -27,7 +27,8 @@ doip:
   eid:       "AABBCCDDEEFF"        # 6-byte entity ID (12 hex chars)
   gid:       "000000000000"        # 6-byte group ID (12 hex chars)
   node_type:         0x01          # DoIP node type: 0x01 = gateway
-  node_logical_addr: 0x0000       # EdgeNode's own logical address (used in UDP announcements)
+  node_logical_addr: 0x1234       # EdgeNode's own logical address (used in UDP announcements);
+                                   # 0x0000 is ISO/SAE reserved and rejected by load_config()
   power_mode: 0x01                 # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
   max_payload_bytes: 4096          # reject DoIP payloads larger than this
   # Accepted tester (client) source addresses for Routing Activation (ISO
@@ -58,7 +59,7 @@ udp:
   announce_interval_ms: 500
 
 routing_table:
-  - ecu_logical_addr:    0x0001
+  - ecu_logical_addr:    0x0002   # matches echo_ecu/config.yaml's default
     ecu_ipv6:            "fe80::1"
     ecu_interface:       "eth1"
     ecu_port_plain:      13400

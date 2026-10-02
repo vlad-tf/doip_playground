@@ -5,4 +5,5 @@ target:
 
 doip:
   tester_logical_addr: 0x0E00   # logical address this tester presents to the EdgeNode
-  ecu_logical_addr:    0x0001   # logical address of the target ECU
+  ecu_logical_addr:    0x0003   # logical address of the target ECU (default diag target;
+                                # can be changed mid-session with the REPL's 'target' command)

@@ -236,11 +236,16 @@ Both timers are configurable in `config.yaml`.
 
 ### Routing table
 
+Routing is resolved by the Diagnostic Message's own target address
+(`ecu_logical_addr`), not by the activated tester SA — one `routing_table`
+entry per physical ECU, first match wins. Which tester SAs EdgeNode accepts
+at Routing Activation is a separate, unrelated check (`doip.tester_addr_range`
+/ `doip.tester_addr_list`), not part of this table.
+
 ```python
 # config.yaml structure
 routing_table:
-  - tester_logical_addr: 0x0E00   # source addr seen from tester
-    ecu_logical_addr:    0x0001   # target addr on ECU side
+  - ecu_logical_addr:    0x0002   # target addr on ECU side
     ecu_ipv6:            "fe80::aabb:ccdd:eeff:0011"
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
@@ -356,8 +361,17 @@ doip:
   eid:       "AABBCCDDEEFF"        # 6-byte entity ID (hex string)
   gid:       "000000000000"        # 6-byte group ID
   node_type: 0x01                  # DoIP node type: gateway
+  node_logical_addr: 0x1234        # EdgeNode's own logical address (self-diagnostics,
+                                    # UDP announcements); 0x0000 is ISO/SAE reserved
+                                    # and rejected by load_config()
   power_mode: 0x01                 # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
   max_payload_bytes: 4096          # reject DoIP payloads larger than this
+  # Accepted tester (client) source addresses for Routing Activation — a
+  # source address matching neither is denied with response code 0x00. Both
+  # optional; default is the range alone. Gates Routing Activation only, not
+  # diagnostic routing (that's routing_table below, by target address).
+  tester_addr_range: [0x0E00, 0x0FFF]
+  tester_addr_list: []              # individual extra SAs outside the range
 
 timers:
   t_tcp_initial_inactivity_s: 2
@@ -369,8 +383,7 @@ udp:
   announce_interval_ms: 500
 
 routing_table:
-  - tester_logical_addr: 0x0E00
-    ecu_logical_addr:    0x0001
+  - ecu_logical_addr:    0x0002
     ecu_ipv6:            "fe80::1"
     ecu_interface:       "eth1"
     ecu_port_plain:      13400

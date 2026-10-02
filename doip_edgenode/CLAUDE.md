@@ -249,13 +249,17 @@ failures · `CRITICAL` unhandled exceptions.
 - `doip.tester_addr_range` not a `[low, high]` pair, or `low > high`, or
   either value outside `0x0000`-`0xFFFF`
 - any `doip.tester_addr_list` value outside `0x0000`-`0xFFFF`
+- `doip.node_logical_addr == 0x0000` — ISO/SAE reserved (ISO 13400-2), never
+  a valid node address; the Docker testbed uses `0x1234` (see the address
+  table in `../docker/README.md`)
 
 `node_logical_addr` (EdgeNode's own logical address) is optional and
-defaults to `0x0000` if absent — it is used both in UDP Vehicle Announcements
+defaults to `0x1234` if absent — it is used both in UDP Vehicle Announcements
 and as the source address in Routing Activation Responses / Alive Check
-Responses / self-diagnostic replies. If a Wireshark capture shows `0x0000`
-as the EdgeNode's source address where a distinct address was expected,
-check this config value before assuming a code bug.
+Responses / self-diagnostic replies. `0x0000` is ISO/SAE reserved (ISO
+13400-2) and rejected by `load_config()`, so if a Wireshark capture shows
+`0x0000` as the EdgeNode's source address, check this config value before
+assuming a code bug.
 
 ---
 
@@ -341,7 +345,9 @@ relying on CI here:
 - **`tests/test_session.py`'s `_make_app_config()` omitted `node_logical_addr`**
   (no default on that `DoIPConfig` field) — every test in the file failed to
   even construct the fixture. Fixed as part of this review pass (added
-  `node_logical_addr=0x0000`).
+  `node_logical_addr=0x1234` — not `0x0000`, which is now rejected by
+  `load_config()` as ISO/SAE reserved; see the 2026-10-03 address
+  renumbering above).
 - **`test_full_lifecycle` still can't complete**: `tests/mock_ecu.py`'s
   `MockECU` binds plain IPv4 (`127.0.0.1`), but `_make_app_config()`'s
   routing entry points `ecu_client.py`'s `ECUConnection.connect()` at IPv6

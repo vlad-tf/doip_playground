@@ -55,9 +55,11 @@ component's* existing style, not TestEcu's — do not silently reformat
   is the only thing enforcing this for TestEcu vs Echo ECU — there is no
   equivalent check against `doip_edgenode/session.py`.
 - **Logical addresses / Docker network layout** are documented in
-  [`docker/README.md`](docker/README.md) — EchoNode is `0x0001`, TestEcu is
-  `0x0002`. If you add a new simulated ECU, give it its own logical address and
-  update that table, `docker-compose.yml`, and `docker/edgenode.config.yaml`.
+  [`docker/README.md`](docker/README.md) — EchoNode is `0x0002`, TestEcu is
+  `0x0003`, EdgeNode itself answers self-diagnostics as `0x1234` (`0x0000` is
+  ISO/SAE reserved and must never be assigned to a node). If you add a new
+  simulated ECU, give it its own logical address and update that table,
+  `docker-compose.yml`, and `docker/edgenode.config.yaml`.
 - **IPv6 link-local requires an explicit scope id everywhere** (`eth1`,
   `%eth1`, `socket.if_nametoindex`). Do not "simplify" this away — it is
   mandatory for `AF_INET6` connect on link-local addresses.

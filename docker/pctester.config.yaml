@@ -5,16 +5,17 @@ target:
   port:      13400            # plain DoIP
   timeout_s: 5.0
 
-# ecu_logical_addr below is just this tester's *default* diag target — the
-# EdgeNode resolves routing by the target address in each Diagnostic
-# Message, not by tester_logical_addr, so you don't need to edit this file
-# or restart the container to reach a different backend ECU: use the
-# interactive REPL's `target <addr_hex>` command instead, e.g.
-# `target 0x0002` to switch to doip-testecu mid-session. tester_logical_addr
-# just needs to fall inside the EdgeNode's accepted range (default
-# 0x0E00-0x0FFF, see docker/edgenode.config.yaml's doip.tester_addr_range).
-#   0x0001 -> doip-echonode (fixed echo)
-#   0x0002 -> doip-testecu  (pluggable UDS simulator)
+# ecu_logical_addr below is just this tester's *default* diag target (set to
+# TestEcu, the one that's actively extended) — the EdgeNode resolves routing
+# by the target address in each Diagnostic Message, not by
+# tester_logical_addr, so you don't need to edit this file or restart the
+# container to reach a different backend ECU: use the interactive REPL's
+# `target <addr_hex>` command instead, e.g. `target 0x0002` to switch to
+# doip-echonode mid-session. tester_logical_addr just needs to fall inside
+# the EdgeNode's accepted range (default 0x0E00-0x0FFF, see
+# docker/edgenode.config.yaml's doip.tester_addr_range).
+#   0x0002 -> doip-echonode (fixed echo)
+#   0x0003 -> doip-testecu  (pluggable UDS simulator)
 doip:
   tester_logical_addr: 0x0E00
-  ecu_logical_addr:    0x0001
+  ecu_logical_addr:    0x0003

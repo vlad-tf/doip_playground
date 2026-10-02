@@ -114,7 +114,7 @@ def _make_app_config(initial_s: float = 2.0, general_s: float = 300.0):
             eid="AABBCCDDEEFF",
             gid="000000000000",
             node_type=0x01,
-            node_logical_addr=0x0000,
+            node_logical_addr=0x1234,  # 0x0000 is ISO/SAE reserved, never valid
             power_mode=0x01,
             max_payload_bytes=4096,
         ),

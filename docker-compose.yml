@@ -4,12 +4,17 @@
 #                                                                           \-> TestEcu
 #
 # Two ECUs sit on the backend network:
-#   doip-echonode  fd2e:646f:6970::2  logical 0x0001  — fixed echo, unchanged
-#   doip-testecu   fd2e:646f:6970::3  logical 0x0002  — pluggable UDS simulator
+#   doip-echonode  fd2e:646f:6970::2  logical 0x0002  — fixed echo, unchanged
+#   doip-testecu   fd2e:646f:6970::3  logical 0x0003  — pluggable UDS simulator
+# EdgeNode itself (fd2e:646f:6970::10) answers self-diagnostics as 0x1234
+# (VM-specific range, deliberately distinct from the ECUs and the tester
+# range). 0x0000 is ISO/SAE reserved — ISO 13400-2 — and must never be
+# assigned to a node.
 #
-# The EdgeNode picks a route by TESTER logical address (first match wins), so each
-# ECU needs its own tester address in edgenode.config.yaml:
-#   SA 0x0E00 -> echonode (0x0001)   SA 0x0E01 -> testecu (0x0002)
+# The EdgeNode picks a route by the Diagnostic Message's own TARGET address
+# (first match wins in edgenode.config.yaml's routing_table) — not by the
+# activated tester SA, so any accepted tester can reach either ECU in the
+# same session just by addressing a diag request to 0x0002 or 0x0003.
 #
 # Networks use dedicated, non-overlapping ranges so they don't clash with the
 # real bench networks (10.250.250.0/24, 192.168.1.0/24) or the default Docker

@@ -371,9 +371,13 @@ docker compose logs -f doip-testecu    # the hook table is printed at INFO
 ```
 
 TestEcu runs alongside the echo node: echo node keeps `fd2e:646f:6970::2` /
-logical address `0x0001`, TestEcu takes `fd2e:646f:6970::3` / `0x0002`. To reach it
-through the EdgeNode from the PC tester, set `ecu_logical_addr: 0x0002` in
-[`docker/pctester.config.yaml`](../docker/pctester.config.yaml).
+logical address `0x0002`, TestEcu takes `fd2e:646f:6970::3` / `0x0003`. Routing
+is resolved by the diag target address, not by tester SA, so no separate
+Routing Activation is needed to switch — just address a `diag` request to
+`0x0003` (e.g. `target 0x0003` in `pc_tester`'s REPL), or set
+`ecu_logical_addr: 0x0003` in
+[`docker/pctester.config.yaml`](../docker/pctester.config.yaml) to make it
+the default.
 
 Your own plugins go in without a rebuild — `./test_ecu/plugins` is mounted at
 `/app/plugins`, so drop a `.py` in and `docker compose restart doip-testecu`. Point the

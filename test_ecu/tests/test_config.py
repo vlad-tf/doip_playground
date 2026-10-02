@@ -320,7 +320,7 @@ class TestShippedConfig:
     def test_the_config_we_ship_loads(self):
         """The default config.yaml must always be valid — it is the example."""
         parsed = load_config(os.path.join(REPO_TEST_ECU, "config.yaml"))
-        assert parsed.doip.ecu_logical_addr == 0x0002
+        assert parsed.doip.ecu_logical_addr == 0x0003
         assert parsed.dids[0xF190].value == b"1HGBH41JXMN109186"
         assert parsed.dids[0xF186].dynamic
         assert parsed.routines[0x0201].results == b"\x00\x01"
