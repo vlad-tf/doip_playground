@@ -285,15 +285,23 @@ class DoIPTester:
         self._writer.write(raw)
         await self._writer.drain()
 
-    async def _recv(self) -> bytes:
+    async def _recv(self, timeout: float | None = None) -> bytes:
         """
         Get the next response frame queued by the background reader.
-        Raises asyncio.TimeoutError if nothing arrives within self.timeout.
-        Raises ConnectionResetError if the connection was closed.
+        Raises asyncio.TimeoutError if nothing arrives within `timeout`
+        (defaults to self.timeout). Raises ConnectionResetError if the
+        connection was closed.
+
+        Always reads via _recv_queue, never directly from the socket —
+        _background_reader is perpetually blocked in a readexactly() on
+        self._reader, so a second, concurrent direct read here would race
+        it and asyncio would raise "readexactly() called while another
+        coroutine is already waiting for incoming data".
         """
         try:
             return await asyncio.wait_for(
-                self._recv_queue.get(), timeout=self.timeout
+                self._recv_queue.get(),
+                timeout=self.timeout if timeout is None else timeout,
             )
         except asyncio.TimeoutError:
             if self._closed_event.is_set():
@@ -403,7 +411,7 @@ class DoIPTester:
         # If ACK, try to receive the UDS response too (with a short timeout)
         if _ptype(resp1) == PT_DIAGNOSTIC_POSITIVE_ACK:
             try:
-                resp2 = await asyncio.wait_for(_read_frame(self._reader), timeout=2.0)
+                resp2 = await self._recv(timeout=2.0)
                 self._print_response(resp2)
             except asyncio.TimeoutError:
                 pass  # no follow-up message
