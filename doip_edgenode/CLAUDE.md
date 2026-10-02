@@ -158,17 +158,43 @@ connectivity to the EdgeNode itself without a downstream ECU — extend
 `_build_uds_response()` (not `_handle_self_diagnostic()`) if you add more
 supported DIDs/services.
 
+### Diagnostic routing is resolved by target address, not tester SA
+
+`_handle_diagnostic()` picks the ECU connection via
+`routing_table.lookup_by_ecu_addr(target_address)` — the Diagnostic
+Message's own target address (read from the post-middleware bytes, so
+`AddressMiddleware`'s `tgt_override` is honored) — **not** by the activated
+tester SA. This means one tester session can reach every ECU listed in
+`routing_table` just by addressing a `diag` request to that ECU's logical
+address; no separate Routing Activation per target ECU is needed.
+`RoutingEntry` carries no tester address at all — which tester SAs are
+accepted is a separate, unrelated check in `_handle_routing_activation()`:
+`config.doip.is_tester_allowed(src_addr)`, driven by `doip.tester_addr_range`
+(inclusive `[low, high]`) and/or `doip.tester_addr_list` (individual extra
+SAs), both in `config.yaml`. A session opens ECU
+connections lazily and caches them in `self._ecu_conns`, keyed by target
+ecu_logical_addr (one dict per `DoIPSession` instance — never shared across
+tester sessions, so a reply read on one session's `ECUConnection` can never
+be confused with another tester's request; see `send_to_ecu()` and
+`_cleanup()` for the same per-target bookkeeping). If no routing entry
+matches the target at all, send Diag Negative ACK `0x03` (unknown target
+address); if an entry exists but the TCP connect to the ECU fails, send
+`0x06` (target unreachable) — do not collapse these into a single code, ISO
+13400-2 Table 26 distinguishes them and the two cases need different
+operator-facing diagnostics (bad config vs. network/ECU down).
+
 ### Two-frame ECU response relay
 
 Real ECUs (and `echo_ecu.py`) send **two** frames per Diagnostic Message:
 Positive ACK (`0x8002`) first, then the actual Diagnostic Message (`0x8001`)
-response. `_handle_diagnostic()` must call `_ecu_conn.recv()` once, relay it,
-then — only if that first frame's payload type was `PT_DIAGNOSTIC_POSITIVE_ACK`
-— call `recv()` again (with a short timeout) for the follow-up response and
-relay that too via the shared `_relay_ecu_frame()` helper. Do not assume a
-single `recv()` is sufficient; a previous bug silently returned the *previous*
-request's queued response instead of the current one because only one `recv()`
-was performed per diagnostic request.
+response. `_handle_diagnostic()` must call the target's `ecu_conn.recv()`
+once, relay it, then — only if that first frame's payload type was
+`PT_DIAGNOSTIC_POSITIVE_ACK` — call `_recv_ecu_frame(target_ecu_addr,
+ecu_conn, timeout)` again for the follow-up response and relay that too via
+the shared `_relay_ecu_frame()` helper. Do not assume a single `recv()` is
+sufficient; a previous bug silently returned the *previous* request's queued
+response instead of the current one because only one `recv()` was performed
+per diagnostic request.
 
 ### Alive Check Response payload
 
@@ -198,7 +224,8 @@ Wireshark (`Length: 0` where `Length: 2` was expected).
 | Unknown payload type | Header NACK `0x01` | close, log WARNING |
 | Diagnostic message before Routing Activation | Diag Negative ACK `0x8003` code `0x02` | close, log WARNING |
 | TLS handshake failure | (TLS layer sends its own alert) | close, log ERROR, no DoIP message |
-| ECU unreachable | Diag Negative ACK `0x8003` code `0x03` | keep tester session open |
+| No routing entry for the message's target ecu_logical_addr | Diag Negative ACK `0x8003` code `0x03` (unknown target address) | keep tester session open |
+| Routing entry exists but TCP connect to the ECU fails, or `send()`/`recv()` errors on an established ECU connection | Diag Negative ACK `0x8003` code `0x06` (target unreachable) | keep tester session open |
 | RA request SA already active & old session alive | RA Response `0x0006` code `0x03` | keep both — new socket closes, old stays |
 | RA request SA already active & old session dead | RA Response `0x0006` code `0x10` (after evicting old) | old session's own cleanup runs; new session activates |
 | Unhandled exception in session | — | log CRITICAL with traceback, close, server keeps accepting |
@@ -217,6 +244,11 @@ failures · `CRITICAL` unhandled exceptions.
 - `header_fault.fault` not one of `wrong_version`/`bad_inverse`/`bad_length`/`unknown_type`
 - `inject_on_nth` < 1 · `announce_count` < 1
 - routing entry referencing an interface not present in `network.*_interface`
+- two routing entries with the same `ecu_logical_addr` (would silently make
+  the second one dead config — routing picks the first match)
+- `doip.tester_addr_range` not a `[low, high]` pair, or `low > high`, or
+  either value outside `0x0000`-`0xFFFF`
+- any `doip.tester_addr_list` value outside `0x0000`-`0xFFFF`
 
 `node_logical_addr` (EdgeNode's own logical address) is optional and
 defaults to `0x0000` if absent — it is used both in UDP Vehicle Announcements
@@ -265,3 +297,82 @@ pytest tests/test_session.py -v      # uses tests/mock_ecu.py over loopback
 No `pytest-asyncio` — coroutines are driven through `asyncio.run()` inside
 each test or a small helper, matching the pattern used by
 `test_ecu/tests/conftest.py:run`. Do not add `pytest-asyncio` as a dependency.
+
+## Backlog (known gaps, not yet implemented — do not silently build these)
+
+Raised 2026-10-02 while reworking diagnostic routing (see "Diagnostic
+routing is resolved by target address, not tester SA" above). Each of these
+is a real gap, intentionally deferred; a future task should pick one at a
+time rather than bundling them, since each has its own protocol-correctness
+tradeoffs to think through:
+
+- **Serialize concurrent testers against one ECU.** Now that routing can
+  send two different tester sessions' Diagnostic Messages to the same
+  physical ECU (e.g. both land on TestEcu via two separate ECUConnections),
+  nothing stops EdgeNode from forwarding tester A's request and tester B's
+  request to that ECU back-to-back before the ECU has answered the first —
+  the ECU itself may not tolerate interleaved requests on separate sockets.
+  Need a per-ECU (not per-session) mutex/queue in front of
+  `ECUConnection.send()`/the ACK+response wait, so a second tester's request
+  to the same ecu_logical_addr blocks until the first exchange (ACK through
+  final response, including any `0x78` ResponsePending chain) completes.
+  Open questions to resolve when this is picked up: what EdgeNode sends
+  tester 2 while it's waiting (hold the socket silently vs. some interim
+  signal — DoIP itself has no "busy" NACK, so this likely means tester 2's
+  request simply isn't ACKed until its turn), and what timeout applies to
+  that wait (distinct from `ecu_pending_max_wait_s`, which is scoped to one
+  already-admitted request).
+- **TesterPresent (`3E`) serialization.** Same mutual-exclusion problem
+  applies to keep-alive TesterPresent traffic from one tester interleaving
+  with another tester's real diagnostic exchange on the same ECU.
+- **Functional (broadcast) addressing.** DoIP functional requests must reach
+  every ECU behind the gateway, not just the one routing entry currently
+  matched by `lookup_by_ecu_addr()`. This likely needs EdgeNode to hold a
+  connection open to every configured ECU proactively (rather than today's
+  lazy, first-diag-message connect) so a functional request can fan out
+  without incurring a connect delay per target, and to merge/relay however
+  many responses come back.
+
+Raised 2026-10-03 during code review of the routing rework above — confirmed
+present at HEAD before that change too, so none of these are regressions,
+but they block trusting `pytest tests/` results and should be fixed before
+relying on CI here:
+
+- **`tests/test_session.py`'s `_make_app_config()` omitted `node_logical_addr`**
+  (no default on that `DoIPConfig` field) — every test in the file failed to
+  even construct the fixture. Fixed as part of this review pass (added
+  `node_logical_addr=0x0000`).
+- **`test_full_lifecycle` still can't complete**: `tests/mock_ecu.py`'s
+  `MockECU` binds plain IPv4 (`127.0.0.1`), but `_make_app_config()`'s
+  routing entry points `ecu_client.py`'s `ECUConnection.connect()` at IPv6
+  (`ecu_ipv6="::1"`) — and `connect()` always opens an `AF_INET6` socket
+  with a scope id from `socket.if_nametoindex(entry.ecu_interface)`
+  regardless of whether the address is link-local or loopback, so it can
+  never reach an IPv4-only `MockECU`. (The interface-name part is also
+  platform-specific: `"lo"` doesn't exist on macOS, only `"lo0"`.) Needs
+  either an IPv6-capable `MockECU`, or a `connect()` path that skips the
+  scope-id lookup for non-link-local addresses — not decided here.
+- **5 `test_middleware.py` failures**: `patch.object(header_fault, "DoIP",
+  ...)` fails because `header_fault.py` imports Scapy's `DoIP` lazily inside
+  a method rather than at module scope, so there's no module-level `DoIP`
+  attribute for `patch.object` to replace. Fix is either to patch at the
+  import site actually used, or hoist the import to module scope if nothing
+  about the lazy-import rationale (if any) depends on deferring it.
+- **`pytest-asyncio` policy contradiction**: this file and the root
+  `CLAUDE.md` both say "no `pytest-asyncio`", and `requirements.txt` doesn't
+  list it, but `pytest.ini` sets `asyncio_mode = auto` and every test in
+  `test_session.py` carries `@pytest.mark.asyncio` — both of which require
+  `pytest-asyncio` to be installed to run at all (`conftest.py`'s own
+  try/except around importing it is dead code: the `pytest_ini_options`
+  variable it sets on import success is never read by pytest, so it doesn't
+  actually make the plugin optional). A clean `pip install -r
+  requirements.txt && pytest` fails as a result. Either add `pytest-asyncio`
+  to `requirements.txt` and fix the docs (reverses the stated policy), or
+  rewrite `test_session.py` to use the `run()`-helper pattern this file
+  prescribes (matching `test_ecu/tests/conftest.py:run`) and remove
+  `pytest.ini`'s `asyncio_mode` / the `@pytest.mark.asyncio` decorators —
+  pick one deliberately rather than leaving the contradiction.
+
+None of this is implemented yet. Flag it rather than building it
+speculatively — each needs its own design pass on the wire-level contract
+(what EdgeNode actually sends a waiting tester) before writing code.

@@ -21,18 +21,22 @@ The tester talks DoIP plain (TCP 13400) to the EdgeNode over IPv4. The EdgeNode
 proxies to a backend ECU over IPv6. TLS (3496) is exposed but not yet negotiated
 (PoC — see the repo README §10).
 
-**Which ECU you reach is decided by the tester logical address.** The EdgeNode resolves
-routes with `lookup_by_tester_addr()` and takes the first match, so each backend ECU has
-its own tester SA in `docker/edgenode.config.yaml`:
+**Which ECU you reach is decided by the Diagnostic Message's own target address**,
+not by the activated tester SA. The EdgeNode resolves routes with
+`lookup_by_ecu_addr()` against `docker/edgenode.config.yaml`'s `routing_table`
+(one entry per physical ECU) and takes the first match:
 
-| Activate with SA | Reaches | ECU logical addr |
-|---|---|---|
-| `0x0E00` | `doip-echonode` | `0x0001` |
-| `0x0E01` | `doip-testecu` | `0x0002` |
+| Diag target address | Reaches |
+|---|---|
+| `0x0001` | `doip-echonode` |
+| `0x0002` | `doip-testecu` |
 
-To point the bundled tester at TestEcu, set both lines in `docker/pctester.config.yaml`
-to `tester_logical_addr: 0x0E01` / `ecu_logical_addr: 0x0002` and
-`docker compose restart doip-pc-tester`.
+Any tester SA the EdgeNode accepts (`doip.tester_addr_range`/`tester_addr_list`
+in `edgenode.config.yaml`, default `0x0E00`-`0x0FFF`) can reach either ECU in the
+same session — no separate Routing Activation per ECU. With the bundled
+`pc_tester`, just use the interactive REPL's `target <addr_hex>` command (e.g.
+`target 0x0002`) to switch which ECU your next `diag` goes to; no config edit
+or container restart needed.
 
 ## Address ranges (chosen to avoid overlap)
 

@@ -38,11 +38,16 @@ print(f"  GID       : {cfg.doip.gid}")
 print(f"  TLS ver   : {cfg.tls.tls_version}")
 print(f"  Max bytes : {cfg.doip.max_payload_bytes}")
 print()
-print("Routing table:")
+low, high = cfg.doip.tester_addr_range
+print(f"Accepted tester SAs:")
+print(f"  range : 0x{low:04X}-0x{high:04X}")
+if cfg.doip.tester_addr_list:
+    print(f"  list  : {', '.join(f'0x{a:04X}' for a in cfg.doip.tester_addr_list)}")
+print()
+print("Routing table (resolved by Diagnostic Message target address):")
 for e in rt.all_entries():
     print(
-        f"  tester 0x{e.tester_logical_addr:04X} -> "
-        f"ECU 0x{e.ecu_logical_addr:04X}  "
+        f"  ECU 0x{e.ecu_logical_addr:04X} -> "
         f"[{e.ecu_ipv6}%{e.ecu_interface}]  "
         f"plain={e.ecu_port_plain}  tls={e.ecu_port_tls}  "
         f"sni={e.ecu_sni!r}"

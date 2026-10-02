@@ -114,6 +114,7 @@ def _make_app_config(initial_s: float = 2.0, general_s: float = 300.0):
             eid="AABBCCDDEEFF",
             gid="000000000000",
             node_type=0x01,
+            node_logical_addr=0x0000,
             power_mode=0x01,
             max_payload_bytes=4096,
         ),
@@ -125,7 +126,6 @@ def _make_app_config(initial_s: float = 2.0, general_s: float = 300.0):
         udp=UDPConfig(announce_count=1, announce_interval_ms=100),
         routing_table=[
             RoutingEntry(
-                tester_logical_addr=0x0E00,
                 ecu_logical_addr=0x0001,
                 ecu_ipv6="::1",
                 ecu_interface="lo",

@@ -30,6 +30,11 @@ doip:
   node_logical_addr: 0x0000       # EdgeNode's own logical address (used in UDP announcements)
   power_mode: 0x01                 # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
   max_payload_bytes: 4096          # reject DoIP payloads larger than this
+  # Accepted tester (client) source addresses for Routing Activation (ISO
+  # 13400-2 Table 13) — denied with response code 0x00 if neither matches.
+  # Both are optional; defaults to [0x0E00, 0x0FFF] / no extra list.
+  tester_addr_range: [0x0E00, 0x0FFF]
+  tester_addr_list: []             # individual extra SAs outside the range
 
 timers:
   t_tcp_initial_inactivity_s: 2
@@ -53,8 +58,7 @@ udp:
   announce_interval_ms: 500
 
 routing_table:
-  - tester_logical_addr: 0x0E00
-    ecu_logical_addr:    0x0001
+  - ecu_logical_addr:    0x0001
     ecu_ipv6:            "fe80::1"
     ecu_interface:       "eth1"
     ecu_port_plain:      13400

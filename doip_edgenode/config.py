@@ -62,6 +62,13 @@ class TLSConfig:
     cipher_suites: list[str]
 
 
+#: Default accepted tester (client) logical address range, used when
+#: doip.tester_addr_range is absent from config.yaml. Matches TestEcu's
+#: TESTER_ADDR_RANGE (testecu/doip.py) — ISO 13400-2 Table 13's example
+#: tester address range.
+DEFAULT_TESTER_ADDR_RANGE: tuple[int, int] = (0x0E00, 0x0FFF)
+
+
 @dataclass
 class DoIPConfig:
     vin: str
@@ -71,6 +78,19 @@ class DoIPConfig:
     node_logical_addr: int   # EdgeNode's own logical address, used in UDP announcements
     power_mode: int
     max_payload_bytes: int
+    #: Accepted tester (client) source addresses for Routing Activation (ISO
+    #: 13400-2 Table 13) — a source address matching neither is denied with
+    #: response code 0x00. The two combine with OR (see is_tester_allowed()):
+    #:   tester_addr_range: inclusive [low, high] contiguous block
+    #:   tester_addr_list:  explicit individual addresses outside that block
+    tester_addr_range: tuple[int, int] = DEFAULT_TESTER_ADDR_RANGE
+    tester_addr_list: tuple[int, ...] = ()
+
+    def is_tester_allowed(self, addr: int) -> bool:
+        low, high = self.tester_addr_range
+        if low <= addr <= high:
+            return True
+        return addr in self.tester_addr_list
 
 
 @dataclass
@@ -99,7 +119,6 @@ class UDPConfig:
 
 @dataclass
 class RoutingEntry:
-    tester_logical_addr: int
     ecu_logical_addr: int
     ecu_ipv6: str
     ecu_interface: str
@@ -154,6 +173,15 @@ def _require(mapping: dict, key: str, section: str):
     if key not in mapping:
         raise ConfigError(f"Missing required config key '{key}' in section '{section}'")
     return mapping[key]
+
+
+def _to_int_list(value, field_name: str) -> list[int]:
+    """Convert a YAML list of ints/hex-strings to a list[int]."""
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(
+            f"Field '{field_name}' must be a list, got: {type(value).__name__}"
+        )
+    return [_to_int(item, f"{field_name}[{i}]") for i, item in enumerate(value)]
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +243,33 @@ def _load_doip(raw: dict) -> DoIPConfig:
         raise ConfigError(
             f"doip.gid must be exactly 12 hex characters; got: {gid!r}"
         )
+    tester_addr_range = DEFAULT_TESTER_ADDR_RANGE
+    if "tester_addr_range" in raw:
+        bounds = _to_int_list(raw["tester_addr_range"], "doip.tester_addr_range")
+        if len(bounds) != 2:
+            raise ConfigError(
+                f"doip.tester_addr_range: expected [low, high], got "
+                f"{len(bounds)} value(s)"
+            )
+        low, high = bounds
+        if not (0 <= low <= high <= 0xFFFF):
+            raise ConfigError(
+                f"doip.tester_addr_range: [0x{low:04X}, 0x{high:04X}] is not "
+                "a valid ascending 16-bit range"
+            )
+        tester_addr_range = (low, high)
+
+    tester_addr_list: tuple[int, ...] = ()
+    if "tester_addr_list" in raw:
+        values = _to_int_list(raw["tester_addr_list"], "doip.tester_addr_list")
+        for v in values:
+            if not (0 <= v <= 0xFFFF):
+                raise ConfigError(
+                    f"doip.tester_addr_list: 0x{v:X} is not a valid 16-bit "
+                    "address"
+                )
+        tester_addr_list = tuple(values)
+
     return DoIPConfig(
         vin=vin,
         eid=eid,
@@ -225,6 +280,8 @@ def _load_doip(raw: dict) -> DoIPConfig:
         ),
         power_mode=_to_int(_require(raw, "power_mode", sec), "doip.power_mode"),
         max_payload_bytes=int(_require(raw, "max_payload_bytes", sec)),
+        tester_addr_range=tester_addr_range,
+        tester_addr_list=tester_addr_list,
     )
 
 
@@ -266,6 +323,7 @@ def _load_udp(raw: dict) -> UDPConfig:
 def _load_routing_table(raw_list: list, network: NetworkConfig) -> list[RoutingEntry]:
     valid_interfaces = {network.tester_interface, network.ecu_interface}
     entries = []
+    seen_ecu_addrs: set[int] = set()
     for i, raw in enumerate(raw_list):
         iface = str(raw.get("ecu_interface", ""))
         if iface not in valid_interfaces:
@@ -273,16 +331,26 @@ def _load_routing_table(raw_list: list, network: NetworkConfig) -> list[RoutingE
                 f"routing_table[{i}].ecu_interface={iface!r} is not one of the "
                 f"declared interfaces {valid_interfaces}"
             )
+        ecu_addr = _to_int(
+            _require(raw, "ecu_logical_addr", f"routing_table[{i}]"),
+            f"routing_table[{i}].ecu_logical_addr",
+        )
+        # Diagnostic routing picks the first entry whose ecu_logical_addr
+        # matches a Diagnostic Message's target address (see
+        # RoutingTable.lookup_by_ecu_addr / session.py's _connect_to_ecu) —
+        # a second entry for the same address would silently be dead
+        # config, so this is a hard error rather than a silent first-match.
+        if ecu_addr in seen_ecu_addrs:
+            raise ConfigError(
+                f"routing_table[{i}].ecu_logical_addr=0x{ecu_addr:04X} "
+                "duplicates an earlier entry; each ECU needs exactly one "
+                "routing_table entry"
+            )
+        seen_ecu_addrs.add(ecu_addr)
+
         entries.append(
             RoutingEntry(
-                tester_logical_addr=_to_int(
-                    _require(raw, "tester_logical_addr", f"routing_table[{i}]"),
-                    f"routing_table[{i}].tester_logical_addr",
-                ),
-                ecu_logical_addr=_to_int(
-                    _require(raw, "ecu_logical_addr", f"routing_table[{i}]"),
-                    f"routing_table[{i}].ecu_logical_addr",
-                ),
+                ecu_logical_addr=ecu_addr,
                 ecu_ipv6=str(_require(raw, "ecu_ipv6", f"routing_table[{i}]")),
                 ecu_interface=iface,
                 ecu_port_plain=int(

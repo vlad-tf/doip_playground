@@ -40,7 +40,6 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 from config import AppConfig
 from routing import RoutingTable
@@ -141,10 +140,21 @@ class DoIPSession:
         self.activated: bool = False
         self.tester_logical_addr: int | None = None
 
-        self._ecu_conn = None  # ECUConnection, set on first Diagnostic Message
-        # Outstanding ECU read, carried across ResponsePending waits so that a
-        # timeout never cancels a read in flight.  See _recv_ecu_frame().
-        self._ecu_read_task: Optional[asyncio.Task] = None
+        # ECUConnections for this session, keyed by target ecu_logical_addr.
+        # Routing is resolved per-message by the Diagnostic Message's own
+        # target address (see _connect_to_ecu), not by the activated tester
+        # SA, so one tester session can reach every ECU in the routing table
+        # without a separate Routing Activation per ECU. One entry is opened
+        # lazily the first time this session sends a diag to that address.
+        # This dict is private to this DoIPSession instance — a second tester
+        # session targeting the same ECU gets its own ECUConnection on its
+        # own socket, so a response read here can never be mixed up with
+        # another tester's response (see session.py top-of-class note).
+        self._ecu_conns: dict[int, "ECUConnection"] = {}
+        # Outstanding ECU reads, carried across ResponsePending waits so that
+        # a timeout never cancels a read in flight. Keyed the same way as
+        # _ecu_conns. See _recv_ecu_frame().
+        self._ecu_read_tasks: dict[int, asyncio.Task] = {}
         self._initial_timer_task: asyncio.Task | None = None
         self._inactivity_task: asyncio.Task | None = None
         self._session_start = time.monotonic()
@@ -336,11 +346,15 @@ class DoIPSession:
             await self._send_routing_activation_response(0x00, 0x0000)
             raise DoIPProtocolError("malformed Routing Activation Request")
 
-        # Validate: source address must be in routing table
-        entry = self.routing_table.lookup_by_tester_addr(src_addr)
-        if entry is None:
+        # Validate: source address must be an accepted tester SA (ISO 13400-2
+        # Table 13) — config.doip.tester_addr_range / tester_addr_list, not
+        # the routing table. Diagnostic routing (which ECU a tester reaches)
+        # is a separate, later decision keyed by the message's own target
+        # address; see _connect_to_ecu().
+        if not self.config.doip.is_tester_allowed(src_addr):
             logger.warning(
-                "DoIPSession: unknown tester logical addr 0x%04X from %s",
+                "DoIPSession: tester logical addr 0x%04X from %s is outside "
+                "the accepted range/list",
                 src_addr,
                 self._peer,
             )
@@ -632,20 +646,37 @@ class DoIPSession:
             logger.debug("DoIPSession: diagnostic packet dropped by middleware")
             return
 
-        # Ensure ECU connection exists
-        if self._ecu_conn is None:
-            await self._connect_to_ecu()
+        # Re-read the target address from the *processed* (post-middleware)
+        # bytes, not the pre-middleware `tgt` above — AddressMiddleware can
+        # override the target for fault injection, and routing must follow
+        # whatever address is actually being sent, matching the "match
+        # against the bytes we actually sent" rule used for SID checking
+        # further down.
+        processed_bytes = bytes(processed)
+        route_tgt = (
+            int.from_bytes(processed_bytes[10:12], "big")
+            if len(processed_bytes) >= 12 else None
+        )
+        if route_tgt is None:
+            logger.warning(
+                "DoIPSession: Diagnostic Message too short to read target address"
+            )
+            await self._send_diag_nack(0x03)  # unknown target address
+            return
 
-        if self._ecu_conn is None:
-            # ECU unreachable
-            # ISO 13400-2 Table 26: code 0x06 covers a target that cannot be
-            # reached at all, distinct from 0x03 (target address not recognised).
-            await self._send_diag_nack(0x06)  # target unreachable
+        # Ensure an ECU connection exists for this target (opens and caches
+        # one lazily, keyed by target address — see _connect_to_ecu).
+        ecu_conn = self._ecu_conns.get(route_tgt)
+        if ecu_conn is None:
+            ecu_conn = await self._connect_to_ecu(route_tgt)
+        if ecu_conn is None:
+            # _connect_to_ecu already sent the appropriate Diag Negative ACK
+            # (0x03 unknown target / 0x06 target unreachable).
             return
 
         # Forward to ECU
         try:
-            await self._ecu_conn.send(bytes(processed))
+            await ecu_conn.send(processed_bytes)
         except Exception as exc:
             logger.error("DoIPSession: ECU send error: %s", exc)
             await self._send_diag_nack(0x06)  # target unreachable
@@ -665,7 +696,7 @@ class DoIPSession:
         # pumped recv(), which stranded the real answer and then delivered it
         # as the response to an unrelated request for the rest of the session.
         try:
-            ecu_raw = await self._ecu_conn.recv()
+            ecu_raw = await ecu_conn.recv()
         except Exception as exc:
             logger.error("DoIPSession: ECU recv error: %s", exc)
             return
@@ -696,7 +727,8 @@ class DoIPSession:
                 return
             try:
                 ecu_raw2 = await self._recv_ecu_frame(
-                    min(self.config.timers.ecu_response_timeout_s, remaining)
+                    route_tgt, ecu_conn,
+                    min(self.config.timers.ecu_response_timeout_s, remaining),
                 )
             except Exception as exc:
                 logger.error("DoIPSession: ECU recv error (follow-up): %s", exc)
@@ -725,28 +757,31 @@ class DoIPSession:
             await self._relay_ecu_frame(ecu_raw2)
             return
 
-    async def _recv_ecu_frame(self, timeout: float):
+    async def _recv_ecu_frame(self, target_ecu_addr: int, ecu_conn, timeout: float):
         """
-        Read one ECU frame, returning None if ``timeout`` elapses first.
+        Read one frame from ecu_conn (the connection for target_ecu_addr),
+        returning None if ``timeout`` elapses first.
 
         Never cancels a read that is already in flight.  ``asyncio.wait_for``
         would, and for a stream-backed connection that either discards bytes it
         has already pulled out of the buffer or restarts the read from scratch
         — so a frame slower than the timeout would never arrive at all.  The
-        outstanding task is kept on the session and awaited again on the next
+        outstanding task is kept on the session (keyed by target_ecu_addr,
+        same as _ecu_conns — a session may have one such task in flight per
+        ECU it is concurrently talking to) and awaited again on the next
         call instead.
         """
-        if self._ecu_read_task is None:
-            self._ecu_read_task = asyncio.ensure_future(self._ecu_conn.recv())
+        task = self._ecu_read_tasks.get(target_ecu_addr)
+        if task is None:
+            task = asyncio.ensure_future(ecu_conn.recv())
+            self._ecu_read_tasks[target_ecu_addr] = task
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(self._ecu_read_task), timeout=timeout
-            )
+            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except asyncio.TimeoutError:
             return None
         finally:
-            if self._ecu_read_task is not None and self._ecu_read_task.done():
-                self._ecu_read_task = None
+            if task.done():
+                self._ecu_read_tasks.pop(target_ecu_addr, None)
 
     def _response_matches(self, ecu_raw: bytes, request_sid: int | None) -> bool:
         """
@@ -788,21 +823,34 @@ class DoIPSession:
     # ECU connection management
     # ------------------------------------------------------------------
 
-    async def _connect_to_ecu(self) -> None:
-        """Open a connection to the ECU for the activated tester address."""
+    async def _connect_to_ecu(self, target_ecu_addr: int):
+        """
+        Open (and cache) an ECUConnection for target_ecu_addr, returning it.
+
+        Routing is resolved by the Diagnostic Message's own target address
+        (ecu_logical_addr), via routing_table.lookup_by_ecu_addr() — not by
+        the activated tester SA. This lets one tester session reach every
+        ECU in the routing table just by changing the target address in a
+        diag request, with no separate Routing Activation per ECU. On
+        failure this sends the Diag Negative ACK itself (the caller just
+        returns when None comes back):
+
+          - no routing entry at all for target_ecu_addr -> NACK 0x03
+            (unknown target address)
+          - entry exists but the TCP connect to the ECU failed -> NACK 0x06
+            (target unreachable) — ISO 13400-2 Table 26 distinguishes these.
+        """
         from ecu_client import ECUConnection
         from tls_bridge import TLSFaultPolicy
 
-        if self.tester_logical_addr is None:
-            return
-
-        entry = self.routing_table.lookup_by_tester_addr(self.tester_logical_addr)
+        entry = self.routing_table.lookup_by_ecu_addr(target_ecu_addr)
         if entry is None:
-            logger.error(
-                "DoIPSession: no routing entry for tester 0x%04X",
-                self.tester_logical_addr,
+            logger.warning(
+                "DoIPSession: no routing entry for target ECU 0x%04X (tester 0x%04X)",
+                target_ecu_addr, self.tester_logical_addr,
             )
-            return
+            await self._send_diag_nack(0x03)  # unknown target address
+            return None
 
         conn = ECUConnection(
             entry=entry,
@@ -814,14 +862,16 @@ class DoIPSession:
         )
         try:
             await conn.connect(tester_logical_addr=self.tester_logical_addr or 0x0E00)
-            self._ecu_conn = conn
         except Exception as exc:
             logger.error(
-                "DoIPSession: failed to connect to ECU for tester 0x%04X: %s",
-                self.tester_logical_addr,
-                exc,
+                "DoIPSession: failed to connect to ECU 0x%04X for tester 0x%04X: %s",
+                target_ecu_addr, self.tester_logical_addr, exc,
             )
-            self._ecu_conn = None
+            await self._send_diag_nack(0x06)  # target unreachable
+            return None
+
+        self._ecu_conns[target_ecu_addr] = conn
+        return conn
 
     # ------------------------------------------------------------------
     # Public helper for ReplayMiddleware
@@ -830,11 +880,27 @@ class DoIPSession:
     async def send_to_ecu(self, pkt) -> None:
         """
         Inject a packet directly to the ECU (used by ReplayMiddleware).
+
+        Routes by the packet's own target address, same as a normal
+        Diagnostic Message — reuses a cached connection for that ECU or
+        opens one.
         """
-        if self._ecu_conn is None:
-            logger.warning("DoIPSession.send_to_ecu: no ECU connection")
+        raw = bytes(pkt)
+        if len(raw) < 12:
+            logger.warning(
+                "DoIPSession.send_to_ecu: packet too short to read target address"
+            )
             return
-        await self._ecu_conn.send(bytes(pkt))
+        tgt = int.from_bytes(raw[10:12], "big")
+        ecu_conn = self._ecu_conns.get(tgt)
+        if ecu_conn is None:
+            ecu_conn = await self._connect_to_ecu(tgt)
+        if ecu_conn is None:
+            logger.warning(
+                "DoIPSession.send_to_ecu: no ECU connection for target 0x%04X", tgt
+            )
+            return
+        await ecu_conn.send(raw)
 
     # ------------------------------------------------------------------
     # Frame builders
@@ -944,20 +1010,21 @@ class DoIPSession:
     # ------------------------------------------------------------------
 
     async def _cleanup(self) -> None:
-        """Tear down the session: cancel timers, close ECU conn, close tester socket."""
+        """Tear down the session: cancel timers, close all ECU conns, close tester socket."""
         if self._initial_timer_task and not self._initial_timer_task.done():
             self._initial_timer_task.cancel()
         if self._inactivity_task and not self._inactivity_task.done():
             self._inactivity_task.cancel()
-        if self._ecu_read_task and not self._ecu_read_task.done():
-            self._ecu_read_task.cancel()
-        self._ecu_read_task = None
-        if self._ecu_conn:
+        for task in self._ecu_read_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._ecu_read_tasks.clear()
+        for conn in self._ecu_conns.values():
             try:
-                await self._ecu_conn.close()
+                await conn.close()
             except Exception:
                 pass
-            self._ecu_conn = None
+        self._ecu_conns.clear()
         try:
             self.writer.close()
             await self.writer.wait_closed()

@@ -33,6 +33,13 @@ doip:
   node_logical_addr: 0x0000
   power_mode: 0x01
   max_payload_bytes: 4096
+  # Accepted tester (client) source addresses for Routing Activation (ISO
+  # 13400-2 Table 13) — a source address matching neither is denied with
+  # response code 0x00. This is the only thing that gates which testers
+  # EdgeNode accepts; it has no effect on diagnostic routing (see
+  # routing_table below). Both are optional; default is the range alone.
+  tester_addr_range: [0x0E00, 0x0FFF]
+  tester_addr_list: []             # individual extra SAs outside the range
 
 timers:
   t_tcp_initial_inactivity_s: 2
@@ -48,35 +55,31 @@ udp:
   announce_count:    3
   announce_interval_ms: 500
 
-# Routing is resolved by TESTER logical address and the first match wins, so each
-# backend ECU needs its own tester address:
-#   activate with SA 0x0E00 -> Echo ECU     activate with SA 0x0E01 -> TestEcu
+# Routing is resolved by the Diagnostic Message's own TARGET address
+# (ecu_logical_addr), one entry per physical ECU, first match wins. Any
+# tester accepted above (doip.tester_addr_range/tester_addr_list) can reach
+# any ECU listed here just by addressing a diag request to that ECU's
+# logical address — no separate Routing Activation per ECU, and no tester
+# binding in this table (that's gated entirely by doip: above). The SA
+# EdgeNode presents to the ECU is always the activated session's own tester
+# SA (see ecu_client.py's connect()).
+#
+# Several testers may share one ECU: each gets its own independent TCP
+# session/ECUConnection to it (session.py's _ecu_conns, keyed per
+# DoIPSession), so their diagnostic session and security level stay separate
+# even though both resolve to this same entry. Two testers must NOT reuse
+# one SA against the same ECU: that is an ISO 13400-2 §9.3 conflict and the
+# ECU will alive-probe, then deny or evict.
 routing_table:
-  - tester_logical_addr: 0x0E00
-    ecu_logical_addr:    0x0001
+  - ecu_logical_addr:    0x0001
     ecu_ipv6:            "fd2e:646f:6970::2"   # Echo ECU static IPv6 on doip_backend
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
     ecu_port_tls:        3496
     ecu_sni:             ""
 
-  - tester_logical_addr: 0x0E01
-    ecu_logical_addr:    0x0002
+  - ecu_logical_addr:    0x0002
     ecu_ipv6:            "fd2e:646f:6970::3"   # TestEcu static IPv6 on doip_backend
-    ecu_interface:       "eth1"
-    ecu_port_plain:      13400
-    ecu_port_tls:        3496
-    ecu_sni:             ""
-
-  # Several testers may share one ECU — give each its own tester address and
-  # its own entry.  Each gets an independent TCP session to the ECU, so their
-  # diagnostic session and security level are separate, while the ECU's data
-  # is shared (one ECU).  Two testers must NOT reuse one SA against the same
-  # ECU: that is an ISO 13400-2 §9.3 conflict and the ECU will alive-probe,
-  # then deny or evict.
-  - tester_logical_addr: 0x0E02
-    ecu_logical_addr:    0x0002
-    ecu_ipv6:            "fd2e:646f:6970::3"   # same TestEcu, second tester
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
     ecu_port_tls:        3496
