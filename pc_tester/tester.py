@@ -36,6 +36,12 @@ Interactive commands:
     help                         Show this list
     quit / exit / q              Disconnect and exit
 
+The EdgeNode closes idle TCP sessions after its inactivity timer (default
+5 min).  If a command then hits a dropped connection, the tester
+automatically reconnects, re-activates and retries the command instead of
+exiting.  Disable with 'target.auto_reconnect: false' in the config, or
+'--no-auto-reconnect' on the command line.
+
 Examples:
     diag 10 01          DiagnosticSessionControl — switch to default session
     diag 22 F1 90       ReadDataByIdentifier — VIN
@@ -195,19 +201,24 @@ class DoIPTester:
         tester_addr: int,
         ecu_addr: int,
         timeout: float = 5.0,
+        auto_reconnect: bool = True,
     ) -> None:
         self.host = host
         self.port = port
         self.tester_addr = tester_addr
         self.ecu_addr = ecu_addr
         self.timeout = timeout
+        self.auto_reconnect = auto_reconnect
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self.activated = False
 
         # Background reader feeds responses here; REPL consumes via _recv()
-        self._recv_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        # Created lazily in connect() so it binds to the event loop that is
+        # actually running (on Python <3.10 building it in __init__, before
+        # asyncio.run() makes its loop, binds it to the wrong loop).
+        self._recv_queue: asyncio.Queue[bytes] | None = None
         self._reader_task: asyncio.Task | None = None
         # Set when the background reader exits (connection closed or error)
         self._closed_event: asyncio.Event = asyncio.Event()
@@ -219,6 +230,7 @@ class DoIPTester:
             timeout=self.timeout,
         )
         self._closed_event.clear()
+        self._recv_queue = asyncio.Queue()
         self._reader_task = asyncio.create_task(
             self._background_reader(), name="tester-reader"
         )
@@ -240,7 +252,40 @@ class DoIPTester:
         self._reader = None
         self._writer = None
         self.activated = False
+        # Drop any stale responses from the old (dead) connection so they
+        # can't be mistaken for answers on a future, fresh session.
+        if self._recv_queue is not None:
+            while not self._recv_queue.empty():
+                self._recv_queue.get_nowait()
         logger.info("Disconnected.")
+
+    async def reconnect(self) -> bool:
+        """
+        Close the dead connection, open a new one, and re-activate.
+
+        The EdgeNode closes idle TCP sessions after its inactivity timer
+        (default 5 min), so a command typed after a long pause can hit a
+        socket the EdgeNode already dropped.  This re-establishes the
+        session (reconnecting also re-sends Routing Activation, per
+        auto-activate-on-connect) so the command can simply be retried.
+
+        Returns True on success, False if the reconnect (or re-activation)
+        failed and the underlying problem is likely persistent.
+        """
+        print("  ! Connection lost — reconnecting …")
+        try:
+            await self.disconnect()
+            await self.connect()
+            ok = await self.cmd_activate()
+            if not ok:
+                print("  ! Reconnected, but Routing Activation failed.")
+                return False
+            print("  Reconnected and re-activated.")
+            return True
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError,
+                OSError, asyncio.TimeoutError) as exc:
+            print(f"  ! Reconnect failed: {exc}")
+            return False
 
     async def _background_reader(self) -> None:
         """
@@ -299,6 +344,7 @@ class DoIPTester:
         coroutine is already waiting for incoming data".
         """
         try:
+            assert self._recv_queue is not None, "Not connected"
             return await asyncio.wait_for(
                 self._recv_queue.get(),
                 timeout=self.timeout if timeout is None else timeout,
@@ -505,53 +551,61 @@ async def repl(tester: DoIPTester, auto_activate: bool = True) -> None:
         parts = line.split()
         cmd = parts[0].lower()
 
-        try:
-            if cmd in ("quit", "exit", "q"):
+        if cmd in ("quit", "exit", "q"):
+            break
+
+        # The EdgeNode drops idle TCP sessions after its inactivity timer
+        # (default 5 min) and marks the socket closed.  A command typed after
+        # a long pause can then hit a dead connection.  When auto-reconnect
+        # is enabled, transparently reconnect + re-activate and retry the
+        # command instead of exiting.
+        attempts = 3 if tester.auto_reconnect else 1
+
+        while True:
+            try:
+                if cmd == "help":
+                    print(HELP_TEXT)
+                elif cmd == "activate":
+                    addr = int(parts[1], 0) if len(parts) > 1 else None
+                    await tester.cmd_activate(addr)
+                elif cmd == "diag":
+                    if len(parts) < 2:
+                        print("  Usage: diag <hex bytes>   e.g. diag 10 01")
+                        break
+                    uds = _parse_hex_input(parts[1:])
+                    await tester.cmd_diag(uds)
+                elif cmd == "target":
+                    addr = int(parts[1], 0) if len(parts) > 1 else None
+                    tester.cmd_target(addr)
+                elif cmd == "alive":
+                    await tester.cmd_alive()
+                elif cmd == "status":
+                    await tester.cmd_status()
+                elif cmd == "power":
+                    await tester.cmd_power()
+                else:
+                    print(f"  Unknown command: {cmd!r}  (type 'help')")
+                break  # command finished without a connection error
+
+            except asyncio.TimeoutError:
+                print("  ! Timeout waiting for response.")
                 break
-
-            elif cmd == "help":
-                print(HELP_TEXT)
-
-            elif cmd == "activate":
-                addr = int(parts[1], 0) if len(parts) > 1 else None
-                await tester.cmd_activate(addr)
-
-            elif cmd == "diag":
-                if len(parts) < 2:
-                    print("  Usage: diag <hex bytes>   e.g. diag 10 01")
-                    continue
-                uds = _parse_hex_input(parts[1:])
-                await tester.cmd_diag(uds)
-
-            elif cmd == "target":
-                addr = int(parts[1], 0) if len(parts) > 1 else None
-                tester.cmd_target(addr)
-
-            elif cmd == "alive":
-                await tester.cmd_alive()
-
-            elif cmd == "status":
-                await tester.cmd_status()
-
-            elif cmd == "power":
-                await tester.cmd_power()
-
-            else:
-                print(f"  Unknown command: {cmd!r}  (type 'help')")
-
-        except asyncio.TimeoutError:
-            print("  ! Timeout waiting for response.")
-        except asyncio.IncompleteReadError:
-            print("  ! Connection closed by remote.")
+            except (asyncio.IncompleteReadError, ConnectionResetError,
+                    BrokenPipeError, ConnectionError):
+                attempts -= 1
+                if attempts > 0 and await tester.reconnect():
+                    continue  # re-run this command on the fresh connection
+                print("  ! Connection lost and could not reconnect — exiting.")
+                await tester.disconnect()
+                return
+            except ValueError as exc:
+                print(f"  ! Input error: {exc}")
+                break
+            except Exception as exc:
+                logger.debug("Command error", exc_info=True)
+                print(f"  ! Error: {exc}")
+                break
             break
-        except ConnectionResetError:
-            print("  ! Connection reset.")
-            break
-        except ValueError as exc:
-            print(f"  ! Input error: {exc}")
-        except Exception as exc:
-            logger.debug("Command error", exc_info=True)
-            print(f"  ! Error: {exc}")
 
     await tester.disconnect()
 
@@ -589,6 +643,12 @@ def main() -> None:
              "(you must type 'activate' manually before the EdgeNode's "
              "T_TCP_Initial_Inactivity timer fires)",
     )
+    parser.add_argument(
+        "--no-auto-reconnect", action="store_true",
+        help="Exit after a dropped connection (e.g. EdgeNode inactivity "
+             "timer) instead of transparently reconnecting + re-activating "
+             "and retrying the command",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -603,6 +663,7 @@ def main() -> None:
     host         = target.get("host",  "192.168.1.1")
     port         = int(target.get("port",  13400))
     timeout      = float(target.get("timeout_s", 5.0))
+    auto_reconnect = bool(target.get("auto_reconnect", True))
     tester_addr  = int(str(doip.get("tester_logical_addr", "0x0E00")), 0)
     ecu_addr     = int(str(doip.get("ecu_logical_addr",    "0x0003")), 0)
 
@@ -612,6 +673,7 @@ def main() -> None:
         tester_addr=tester_addr,
         ecu_addr=ecu_addr,
         timeout=timeout,
+        auto_reconnect=auto_reconnect and not args.no_auto_reconnect,
     )
 
     async def run():

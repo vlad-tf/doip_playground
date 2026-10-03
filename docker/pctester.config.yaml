@@ -4,6 +4,7 @@ target:
   host:      "172.30.100.10"  # EdgeNode tester-facing IPv4 (doip_frontend)
   port:      13400            # plain DoIP
   timeout_s: 5.0
+  auto_reconnect: true   # re-activate automatically if the EdgeNode drops an idle session
 
 # ecu_logical_addr below is just this tester's *default* diag target (set to
 # TestEcu, the one that's actively extended) — the EdgeNode resolves routing
