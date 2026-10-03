@@ -19,8 +19,8 @@ machine over a real link) is for when you need the actual hardware topology.
 ## Quick start — Docker
 
 ```bash
-git clone https://github.com/vlad-tf/doip_playground.git "DoIP EdgeNode"
-cd "DoIP EdgeNode"
+git clone https://github.com/vlad-tf/doip_playground.git
+cd doip_playground
 docker compose up --build -d          # builds and starts EdgeNode + EchoNode + a tester
 docker attach doip-pc-tester           # drop into the tester REPL
 ```
