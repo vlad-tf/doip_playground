@@ -182,12 +182,47 @@ names instead of hardcoded IPs.
 > Start this stack first (`docker compose up`) so the networks exist before the
 > tests project references them as `external`.
 
+## Running as non-root
+
+All four containers run their Python process as a dedicated, unprivileged
+`doip` user (UID/GID `10001`), not root, set directly via `USER doip` in each
+Dockerfile. None of the services need raw sockets or a privileged port
+(everything is 13400/udp, 13400/tcp or 3496/tcp, all well above 1024), so this
+was a drop-in change — no `cap_add`, `privileged`, or kernel capabilities are
+required anywhere in `docker-compose.yml`, and none of the containers need to
+start as root at any point.
+
+```bash
+docker compose exec doip-edgenode id      # uid=10001(doip) gid=10001(doip)
+```
+
+`doip-edgenode`'s frame log (`/app/logs/doip.log`) is container-internal only
+— it's not bind-mounted to the host, so there's no host-owned directory to
+fight over permissions with. The logger middleware also writes every frame to
+stdout, so `docker compose logs -f doip-edgenode` (or `docker logs
+doip-edgenode`) gets you the same stream live; the in-container file just
+adds a bonus copy that lives and dies with the container. If you want the log
+file to persist across container recreation, mount a named volume instead of
+a host bind mount (`docker volume create edgenode-logs`, then
+`edgenode-logs:/app/logs`) — Docker initializes named volumes with the
+image's existing ownership (already `doip:doip` here), unlike host bind
+mounts which show up as `root:root`.
+
+If you need the container UID to line up with a specific host UID for some
+other mount, override it at build time:
+
+```bash
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
+```
+
 ## Notes
 
 - The EdgeNode is single-session (PoC): only one tester connection at a time.
   Don't leave the bundled tester attached while running your test suite against
   the same EdgeNode.
-- EdgeNode frame logs are written to `docker/logs/doip.log` on the host.
+- EdgeNode frame logs go to stdout (`docker logs doip-edgenode` / `docker compose
+  logs -f doip-edgenode`) and to `/app/logs/doip.log` inside the container;
+  neither is persisted on the host.
 - `priority` on the EdgeNode networks pins the tester side to `eth0` and the ECU
   side to `eth1`, matching `ecu_interface: eth1` in `edgenode.config.yaml`.
 - Both ECUs send UDP Vehicle Announcements to `ff02::1` on the backend network, so a

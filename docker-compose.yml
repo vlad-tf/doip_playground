@@ -43,6 +43,8 @@ services:
         ipv6_address: fd2e:646f:6970::2
     volumes:
       - ./docker/echonode.config.yaml:/app/config.yaml:ro
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   doip-testecu:
@@ -65,6 +67,8 @@ services:
       # in and `docker compose restart doip-testecu`, no rebuild needed.
       # Point this at a directory outside the repo to use your own plugins.
       - ./test_ecu/plugins:/app/plugins:ro
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   doip-edgenode:
@@ -88,10 +92,11 @@ services:
     volumes:
       - ./docker/edgenode.config.yaml:/app/config.yaml:ro
       - ./docker/edgenode-entrypoint.sh:/usr/local/bin/edgenode-entrypoint.sh:ro
-      - ./docker/logs:/app/logs
     # Auto-detect the real backend (IPv6) interface at startup, since Docker
     # names interfaces by network name alphabetically, not by `priority`.
     entrypoint: ["sh", "/usr/local/bin/edgenode-entrypoint.sh"]
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       - doip-echonode
       - doip-testecu
@@ -112,6 +117,8 @@ services:
         ipv4_address: 172.30.100.20
     volumes:
       - ./docker/pctester.config.yaml:/app/config.yaml:ro
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       - doip-edgenode
     stdin_open: true            # keep STDIN open for the interactive REPL

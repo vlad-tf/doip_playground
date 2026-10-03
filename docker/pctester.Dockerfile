@@ -9,9 +9,19 @@ RUN apt-get update \
         python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
+# Dedicated non-root user -- config.yaml is mounted :ro and this image never
+# writes to disk at runtime, so no chown-on-startup dance is needed here.
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN groupadd -g "$APP_GID" doip \
+    && useradd -u "$APP_UID" -g "$APP_GID" -M -s /usr/sbin/nologin doip
+
 WORKDIR /app
 
 COPY . /app/
+RUN chown -R doip:doip /app
+
+USER doip
 
 # Interactive tester. It auto-sends Routing Activation on connect,
 # then drops into the "doip>" REPL. Attach a terminal to interact:

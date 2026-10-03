@@ -2,6 +2,10 @@
 # EdgeNode startup shim: make the config's interface names match whatever
 # Docker actually assigned, so the IPv6 connect to the Echo ECU uses the real
 # backend interface regardless of eth0/eth1 ordering.
+#
+# Runs as the image's non-root `doip` user throughout -- /app/logs is a
+# container-internal directory (not bind-mounted), so there's no host-owned
+# path to fix permissions on here.
 set -e
 
 SRC=/app/config.yaml
