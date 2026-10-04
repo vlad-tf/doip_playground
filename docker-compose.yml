@@ -40,6 +40,7 @@ services:
     hostname: doip-echonode
     networks:
       doip_backend:
+        mac_address: "02:6e:6c:61:62:02"
         ipv6_address: fd2e:646f:6970::2
     volumes:
       - ./docker/echonode.config.yaml:/app/config.yaml:ro
@@ -60,6 +61,7 @@ services:
     hostname: doip-testecu
     networks:
       doip_backend:
+        mac_address: "02:6e:6c:61:62:03"
         ipv6_address: fd2e:646f:6970::3
     volumes:
       - ./docker/testecu.config.yaml:/app/config.yaml:ro
@@ -87,6 +89,7 @@ services:
         ipv4_address: 172.30.100.10
         priority: 1000          # -> becomes eth0 (tester-facing)
       doip_backend:
+        mac_address: "02:6e:6c:61:62:10"
         ipv6_address: fd2e:646f:6970::10
         priority: 900           # -> becomes eth1 (ECU-facing)
     volumes:
@@ -129,6 +132,8 @@ networks:
   doip_frontend:
     name: doip_frontend         # fixed name -> attachable from other projects
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: doip_frontend
     ipam:
       config:
         - subnet: 172.30.100.0/24
@@ -138,6 +143,9 @@ networks:
     name: doip_backend          # fixed name -> attachable from other projects
     driver: bridge
     enable_ipv6: true
+
+    driver_opts:
+      com.docker.network.bridge.name: doip_backend
     ipam:
       config:
         - subnet: fd2e:646f:6970::/64
