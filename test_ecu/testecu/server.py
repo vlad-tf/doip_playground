@@ -23,6 +23,7 @@ interface scope id.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import socket
 from typing import Optional
@@ -77,6 +78,16 @@ class TestEcuServer:
             except OSError as exc:
                 logger.warning("Cannot get scope_id for interface %r: %s  (using 0)",
                                listen.interface, exc)
+
+        # The sockaddr_in6 scope/zone field is meaningful for link-local and
+        # multicast addresses. Global/ULA unicast addresses must use scope 0;
+        # Windows rejects a non-zero scope there with WSAEADDRNOTAVAIL.
+        try:
+            address = ipaddress.IPv6Address(listen.host.split("%", 1)[0])
+        except ipaddress.AddressValueError:
+            address = None
+        if address is None or not (address.is_link_local or address.is_multicast):
+            scope_id = 0
 
         sock.bind((listen.host, listen.port, 0, scope_id))
         sock.listen(self._backlog)
