@@ -57,10 +57,10 @@ Tester ──RA(0x0E00)──► EdgeNode ──RA(0x0E00)──► ECU
 - Two network interfaces: `eth0` (onboard, tester side) and `eth1` (USB-Ethernet adapter or HAT, ECU/IVN side)
 - Run as root or with `CAP_NET_RAW` + `CAP_NET_BIND_SERVICE`
 
-### Echo ECU / TestEcu (Linux machine)
+### Echo ECU / VirtualEcu (Linux machine)
 - Any Linux machine with Python 3.10+ (Ubuntu 22.04 and Debian Bookworm both qualify)
 - One network interface connected to the RPi `eth1` network
-- TestEcu needs PyYAML and nothing else; tests additionally need `pytest`
+- VirtualEcu needs PyYAML and nothing else; tests additionally need `pytest`
 
 ### PC Tester
 - Windows 10/11 or Linux
@@ -230,16 +230,16 @@ Press Ctrl+C to stop.
 
 ---
 
-## 2b — TestEcu setup (pluggable ECU simulator)
+## 2b — VirtualEcu setup (pluggable ECU simulator)
 
-TestEcu is a drop-in alternative to the Echo ECU that implements a real UDS server and
+VirtualEcu is a drop-in alternative to the Echo ECU that implements a real UDS server and
 lets other people plug their own business logic into it. Same DoIP layer, same config
 schema for `listen` / `doip` / `udp`; the difference is everything above the transport.
 
 ### 2b.1 Install dependencies
 
 ```bash
-cd test_ecu
+cd virtual_ecu
 pip3 install pyyaml          # that is the entire dependency list
 ```
 
@@ -248,11 +248,11 @@ DoIP transport; `udsoncan` is client-oriented. The UDS layer here is stdlib.
 
 ### 2b.2 Edit the configuration
 
-`test_ecu/config.yaml` keeps the familiar sections and adds three more:
+`virtual_ecu/config.yaml` keeps the familiar sections and adds three more:
 
 ```yaml
 doip:
-  ecu_logical_addr: 0x0003        # 0x0002 is the Echo ECU — give TestEcu its own
+  ecu_logical_addr: 0x0003        # 0x0002 is the Echo ECU — give VirtualEcu its own
 
 uds:                              # session/security/timing behaviour and the
   unknown_service: nrc            # policies for unhandled requests
@@ -269,31 +269,31 @@ plugins:                          # your business logic
       params: {idle_rpm: 800}
 ```
 
-If you point the EdgeNode at TestEcu, add its own `routing_table` entry with
+If you point the EdgeNode at VirtualEcu, add its own `routing_table` entry with
 `ecu_logical_addr: 0x0003` (no `tester_logical_addr` field — routing is
 resolved by the Diagnostic Message's own target address, first match wins,
-so just give TestEcu its own entry alongside the Echo ECU's).
+so just give VirtualEcu its own entry alongside the Echo ECU's).
 
 ### 2b.3 Check the configuration
 
 ```bash
-python3 -m testecu --config config.yaml --check
+python3 -m virtecu --config config.yaml --check
 ```
 
 This loads the config and every plugin, prints the resolved hook table, and exits
 non-zero on any problem. Run it after editing a plugin — it is much faster than
 finding out over the wire.
 
-### 2b.4 Start TestEcu
+### 2b.4 Start VirtualEcu
 
 ```bash
-python3 -m testecu --config config.yaml --log-level INFO
+python3 -m virtecu --config config.yaml --log-level INFO
 ```
 
 On a developer machine without an `eth0`, use loopback:
 
 ```bash
-python3 -m testecu --config config.yaml --host ::1 --interface "" --no-udp
+python3 -m virtecu --config config.yaml --host ::1 --interface "" --no-udp
 ```
 
 ### 2b.5 Try it
@@ -309,8 +309,8 @@ python3 tools/uds_probe.py --host ::1 --uds "99"           # -> 7F 99 11
 ### 2b.6 Write a plugin
 
 ```python
-# test_ecu/plugins/my_ecu.py
-from testecu import Plugin, read_did, write_did, NRC_CONDITIONS_NOT_CORRECT
+# virtual_ecu/plugins/my_ecu.py
+from virtecu import Plugin, read_did, write_did, NRC_CONDITIONS_NOT_CORRECT
 
 class MyEcu(Plugin):
     @read_did(0xF200)
@@ -327,8 +327,8 @@ class MyEcu(Plugin):
 
 Register it under `plugins.modules` and restart. The full guide — all five decorators,
 the return contract, the precedence rules, and what the core already implements — is in
-[`test_ecu/README.md`](test_ecu/README.md) and
-[`test_ecu/plugins/README.md`](test_ecu/plugins/README.md).
+[`virtual_ecu/README.md`](virtual_ecu/README.md) and
+[`virtual_ecu/plugins/README.md`](virtual_ecu/plugins/README.md).
 
 ---
 
@@ -352,7 +352,7 @@ target:
 
 doip:
   tester_logical_addr: 0x0E00
-  ecu_logical_addr:    0x0002   # or 0x0003 for TestEcu — change anytime with the
+  ecu_logical_addr:    0x0002   # or 0x0003 for VirtualEcu — change anytime with the
                                 # REPL's 'target' command, no restart needed
 ```
 
@@ -518,11 +518,11 @@ pytest tests/test_middleware.py -v                            # no Scapy needed
 pytest tests/test_session.py -v                              # Scapy required
 ```
 
-TestEcu has its own suite. It needs nothing but pytest — no Scapy, no pytest-asyncio,
+VirtualEcu has its own suite. It needs nothing but pytest — no Scapy, no pytest-asyncio,
 no network privileges:
 
 ```bash
-cd test_ecu
+cd virtual_ecu
 pip3 install pytest --break-system-packages                  # first time only
 python3 -m pytest tests -v
 ```

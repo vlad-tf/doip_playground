@@ -1,0 +1,777 @@
+# Copyright 2026 Vladislav Vostrykh, Technica Engineering GmbH
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Typed configuration loader for VirtualEcu.
+
+Style follows ``doip_edgenode/config.py``: validating dataclasses, a single
+``ConfigError``, and base-0 integer coercion so ``0xF190`` works whether YAML
+parsed it as an int or left it a string.
+
+Missing *sections* are tolerated (like ``echo_ecu._load_config``), but a
+malformed entry inside a section is a hard error — a typo'd DID must fail at
+startup, not silently answer requestOutOfRange forever.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+from virtecu.doip import ALIVE_PROBE_TIMEOUT_S, TESTER_ADDR_RANGE
+from virtecu.uds import (
+    NRC_NAMES,
+    SESSION_DEFAULT,
+)
+
+logger = logging.getLogger("virtecu.config")
+
+
+class ConfigError(Exception):
+    """Raised for any malformed or contradictory configuration."""
+
+
+# ---------------------------------------------------------------------------
+# Coercion helpers
+# ---------------------------------------------------------------------------
+
+def _to_int(value: Any, where: str) -> int:
+    """Accept 4096, 0x1000 (YAML int) or "0x1000"/"4096" (string), base 0."""
+    if isinstance(value, bool):
+        raise ConfigError("%s: expected an integer, got a boolean" % where)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 0)
+        except ValueError:
+            raise ConfigError("%s: %r is not an integer" % (where, value))
+    raise ConfigError("%s: expected an integer, got %s" % (where, type(value).__name__))
+
+
+def _to_bool(value: Any, where: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ConfigError("%s: expected true/false, got %r" % (where, value))
+
+
+def _to_str(value: Any, where: str) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int)):
+        return str(value)
+    raise ConfigError("%s: expected a string, got %s" % (where, type(value).__name__))
+
+
+def _to_hex_bytes(value: Any, where: str) -> bytes:
+    """Parse "DE AD BE EF" / "deadbeef" into bytes."""
+    text = _to_str(value, where).replace(" ", "").replace("_", "")
+    try:
+        return bytes.fromhex(text)
+    except ValueError:
+        raise ConfigError("%s: %r is not a hex byte string" % (where, value))
+
+
+def _to_int_list(value: Any, where: str) -> List[int]:
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError("%s: expected a list, got %s" % (where, type(value).__name__))
+    return [_to_int(item, "%s[%d]" % (where, i)) for i, item in enumerate(value)]
+
+
+def _section(raw: dict, name: str) -> dict:
+    value = raw.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError("%s: expected a mapping, got %s" % (name, type(value).__name__))
+    return value
+
+
+def _one_of(value: Any, allowed: tuple, where: str) -> str:
+    text = _to_str(value, where).strip().lower()
+    if text not in allowed:
+        raise ConfigError("%s: %r is not one of %s" % (where, value, ", ".join(allowed)))
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ListenConfig:
+    host: str = "::"
+    port: int = 13400
+    interface: str = ""
+    #: TCP listener address family (IPv4-support roadmap). ``ipv6`` (default),
+    #: ``ipv4``, or ``dual`` (an IPv6 socket without V6ONLY, so it also accepts
+    #: v4-mapped connections).
+    family: str = "ipv6"
+    #: UDP discovery family used by the announcer / Vehicle Identification
+    #: (``ipv6`` | ``ipv4``). Defaults to follow ``family``: IPv4 when the
+    #: listener is IPv4-only, IPv6 otherwise. An IPv4-only in-vehicle network
+    #: sets ``family: ipv4`` and this follows automatically; set it explicitly
+    #: only to decouple the listener family from discovery (e.g. dual-stack
+    #: TCP with IPv6 announcements).
+    discovery_family: str = "ipv6"
+
+
+@dataclass
+class DoipConfig:
+    ecu_logical_addr: int = 0x0003
+    node_type: int = 0x01
+    power_mode: int = 0x01
+    #: Business-level max UDS payload for a Diagnostic Message. Since commit
+    #: 238ffa6 this also feeds session.py's framing-level read cap
+    #: (``max_len = max_payload_bytes + 4 + _FRAME_LEN_SLACK`` in
+    #: ``EcuSession._loop``) — do not relax the range check below without
+    #: re-checking that connection.
+    max_payload_bytes: int = 4096
+    vin: str = "00000000000000000"
+    eid: str = "000000000000"
+    gid: str = "000000000000"
+    #: Accepted tester (client) logical address range for Routing Activation
+    #: (ISO 13400-2 Table 13). A source address outside this range is denied
+    #: with response code 0x00 (an unrecognised source address).
+    tester_addr_range: tuple = TESTER_ADDR_RANGE
+    #: Initial inactivity timer (ISO 13400-2 Table 38, T_TCP_Initial_Inactivity):
+    #: how long a freshly connected socket may sit unregistered (no valid Routing
+    #: Activation) before the ECU closes it.  Default 2 s per spec.
+    initial_inactivity_ms: int = 2000
+    #: General inactivity timer (ISO 13400-2 Table 38, T_TCP_General_Inactivity):
+    #: how long a registered socket may be idle (no data either way) before the
+    #: ECU closes it.  Reset on any traffic.  Default 5 min per spec.
+    general_inactivity_ms: int = 300000
+    #: Advertised/enforced concurrent-session limit (architecture roadmap P3).
+    #: Single source of truth for two things that must agree: the Routing
+    #: Activation check in ``session.py`` (deny new registrations past this
+    #: count with ISO 13400-2 Table 25 code 0x01, "all sockets in use") and
+    #: the Entity Status Response's ``max_sockets`` byte in ``udp.py``. This
+    #: is deliberately a different number from the TCP ``listen`` backlog
+    #: (the kernel's pending-*accept* queue) — do not thread ``backlog`` into
+    #: either of those two places again.
+    max_concurrent_sessions: int = 8
+    #: ISO 13400-2 ``T_TCP_Alive_Check`` (architecture roadmap P6) — how long
+    #: ``session.py`` waits for an Alive Check Response during §9.3
+    #: conflict-resolution probing before treating the probed socket as
+    #: dead. ``doip.ALIVE_PROBE_TIMEOUT_S`` stays the module constant this
+    #: field defaults from (it is also the frozen parity anchor
+    #: ``test_doip_parity.py`` checks against ``echo_ecu`` — do not remove
+    #: it in favour of this field).
+    alive_check_timeout_ms: int = int(ALIVE_PROBE_TIMEOUT_S * 1000)
+
+
+@dataclass
+class UdpConfig:
+    enabled: bool = True
+    announce_count: int = 3
+    announce_interval_ms: int = 500
+    #: Upper bound (ms) of the A_DoIP_Announce_Wait delay (ISO 13400-2
+    #: Table 38: 0…500 ms), applied both before the first startup Vehicle
+    #: Announcement and before answering a Vehicle Identification Request.
+    #: ISO 13400-2 specifies a random draw in that range; VirtualEcu derives it
+    #: deterministically instead (see ``udp.py: _stagger_delay_ms``), so this
+    #: bound is honoured but the delay itself is never actually random.  Set
+    #: to 0 to disable the delay (e.g. for deterministic tests).
+    announce_wait_ms: int = 500
+
+
+@dataclass
+class SecurityConfig:
+    enabled: bool = True
+    seed: bytes = b"\x11\x22\x33\x44"
+    algorithm: str = "xor"          # none | xor | add
+    key: bytes = b"\xA5\xA5\xA5\xA5"
+    max_attempts: int = 3
+
+
+@dataclass
+class UdsConfig:
+    default_session: int = SESSION_DEFAULT
+    s3_server_ms: int = 5000
+    p2_server_ms: int = 50
+    p2_star_server_ms: int = 5000
+    auto_response_pending: bool = True
+    #: Cap on the number of ``7F <sid> 78`` (ResponsePending) frames sent
+    #: while waiting for one request's handler.  Without a cap, a handler
+    #: that never returns (a hung/buggy plugin) makes the ECU emit 0x78
+    #: forever — and since every sent frame resets the general inactivity
+    #: timer (DoIP-080), the connection can never time out on its own either.
+    #: Once the cap is hit, the ECU gives up: sends a final NRC 0x10
+    #: (generalReject) and stops retrying, leaving the handler's task running
+    #: detached rather than force-cancelling arbitrary plugin code.  0 means
+    #: unlimited (the pre-existing, unbounded behaviour).
+    max_response_pending: int = 10
+    suppress_pos_rsp_bit: bool = True
+    functional_addr: int = 0x1FFF
+    unknown_service: str = "nrc"    # nrc | echo | silent
+    unknown_did: str = "nrc"        # nrc | echo | silent
+    on_handler_error: str = "nrc"   # nrc | fallthrough | silent
+    reset_clears_writes: bool = True
+    #: ECUReset behaviour (architecture roadmap P9). ``False`` (default):
+    #: session resets in place, the TCP connection stays open -- see
+    #: ``services/reset.py``'s docstring for why. ``True``: the connection
+    #: closes abortively right after the positive response and this
+    #: tester's session state is dropped outright, the way an actually
+    #: -vanishing ECU would behave.
+    reset_drops_connection: bool = False
+    sessions: List[int] = field(default_factory=lambda: [0x01, 0x02, 0x03, 0x04])
+    security: SecurityConfig = field(default_factory=SecurityConfig)
+
+
+@dataclass
+class DidSpec:
+    """One entry of the YAML ``data_identifiers:`` table."""
+
+    did: int
+    name: str = ""
+    type: str = "hex"                             # hex | ascii | uint | dynamic
+    length: Optional[int] = None
+    value: Optional[bytes] = None                 # encoded at load time
+    read: bool = True
+    write: bool = False
+    read_sessions: Optional[List[int]] = None     # None = any session
+    write_sessions: Optional[List[int]] = None
+    read_security: int = 0
+    write_security: int = 0
+    read_nrc: Optional[int] = None                # force this NRC on read
+    write_nrc: Optional[int] = None
+
+    @property
+    def dynamic(self) -> bool:
+        return self.type == "dynamic"
+
+    def label(self) -> str:
+        return self.name or ("DID 0x%04X" % self.did)
+
+
+@dataclass
+class RoutineSpec:
+    """One entry of the YAML ``routines:`` table."""
+
+    rid: int
+    name: str = ""
+    start: bytes = b""
+    stop: bytes = b""
+    results: bytes = b""
+    sessions: Optional[List[int]] = None
+    security: int = 0
+
+    def label(self) -> str:
+        return self.name or ("routine 0x%04X" % self.rid)
+
+
+@dataclass
+class PluginSpec:
+    """One plugin to load: either a file path or an importable module name."""
+
+    label: str
+    file: Optional[str] = None
+    module: Optional[str] = None
+    enabled: bool = True
+    priority: Optional[int] = None
+    params: dict = field(default_factory=dict)
+
+
+@dataclass
+class PluginsConfig:
+    strict: bool = False
+    specs: List[PluginSpec] = field(default_factory=list)
+
+
+@dataclass
+class EcuConfig:
+    listen: ListenConfig = field(default_factory=ListenConfig)
+    doip: DoipConfig = field(default_factory=DoipConfig)
+    udp: UdpConfig = field(default_factory=UdpConfig)
+    uds: UdsConfig = field(default_factory=UdsConfig)
+    dids: Dict[int, DidSpec] = field(default_factory=dict)
+    routines: Dict[int, RoutineSpec] = field(default_factory=dict)
+    plugins: PluginsConfig = field(default_factory=PluginsConfig)
+    raw: dict = field(default_factory=dict)
+    #: Directory the config file lives in — relative plugin paths resolve here.
+    base_dir: str = "."
+
+
+# ---------------------------------------------------------------------------
+# Section loaders
+# ---------------------------------------------------------------------------
+
+def _load_listen(raw: dict) -> ListenConfig:
+    section = _section(raw, "listen")
+    family = _one_of(section.get("family", "ipv6"), ("ipv6", "ipv4", "dual"),
+                     "listen.family")
+    # Discovery family defaults to peer the listener family: a pure-IPv4
+    # listener announces on IPv4 (broadcast) unless told otherwise.
+    default_discovery = "ipv4" if family == "ipv4" else "ipv6"
+    discovery_family = _one_of(
+        section.get("discovery_family", default_discovery),
+        ("ipv6", "ipv4"), "listen.discovery_family")
+    return ListenConfig(
+        host=_to_str(section.get("host", "::"), "listen.host") or "::",
+        port=_to_int(section.get("port", 13400), "listen.port"),
+        interface=_to_str(section.get("interface", ""), "listen.interface"),
+        family=family,
+        discovery_family=discovery_family,
+    )
+
+
+def _load_doip(raw: dict) -> DoipConfig:
+    section = _section(raw, "doip")
+    cfg = DoipConfig(
+        ecu_logical_addr=_to_int(section.get("ecu_logical_addr", 0x0003),
+                                 "doip.ecu_logical_addr"),
+        node_type=_to_int(section.get("node_type", 0x01), "doip.node_type"),
+        power_mode=_to_int(section.get("power_mode", 0x01), "doip.power_mode"),
+        max_payload_bytes=_to_int(section.get("max_payload_bytes", 4096),
+                                  "doip.max_payload_bytes"),
+        vin=_to_str(section.get("vin", "00000000000000000"), "doip.vin"),
+        eid=_to_str(section.get("eid", "000000000000"), "doip.eid"),
+        gid=_to_str(section.get("gid", "000000000000"), "doip.gid"),
+        initial_inactivity_ms=_to_int(section.get("initial_inactivity_ms", 2000),
+                                      "doip.initial_inactivity_ms"),
+        general_inactivity_ms=_to_int(section.get("general_inactivity_ms", 300000),
+                                      "doip.general_inactivity_ms"),
+        max_concurrent_sessions=_to_int(section.get("max_concurrent_sessions", 8),
+                                        "doip.max_concurrent_sessions"),
+        alive_check_timeout_ms=_to_int(
+            section.get("alive_check_timeout_ms", int(ALIVE_PROBE_TIMEOUT_S * 1000)),
+            "doip.alive_check_timeout_ms"),
+    )
+    # Fail at startup rather than when the first announcement is built.
+    # ISO 13400-2's Vehicle Identification / Announcement payload (see
+    # udp.py:build_announcement_payload) has fixed 6-byte fields for EID and
+    # GID and a fixed 17-byte field for VIN; anything else misaligns every
+    # field after it rather than raising, so length is checked here, not just
+    # that the string parses as hex.
+    for name, value in (("eid", cfg.eid), ("gid", cfg.gid)):
+        decoded = _to_hex_bytes(value, "doip.%s" % name)
+        if len(decoded) != 6:
+            raise ConfigError(
+                "doip.%s: %d byte(s) after hex decoding, expected 6" % (name, len(decoded))
+            )
+    try:
+        cfg.vin.encode("ascii")
+    except UnicodeEncodeError:
+        raise ConfigError("doip.vin: %r is not pure ASCII" % cfg.vin)
+    if len(cfg.vin) != 17:
+        raise ConfigError(
+            "doip.vin: %d character(s), expected 17 (silently padding/truncating "
+            "would misalign the rest of the Vehicle Announcement payload)"
+            % len(cfg.vin)
+        )
+    if not 0 <= cfg.ecu_logical_addr <= 0xFFFF:
+        raise ConfigError("doip.ecu_logical_addr: 0x%X is not a 16-bit address"
+                          % cfg.ecu_logical_addr)
+    # 16 MiB: far above any real Diagnostic Message, while still keeping
+    # session.py's read_frame cap (see the field's docstring above) bounded.
+    # A negative value would invert that cap instead of loosening it — a
+    # legitimate 7-byte frame would then fail as "too large" while masking
+    # the real problem, so this is a hard error, not a clamp.
+    if not 0 < cfg.max_payload_bytes <= 0x1000000:
+        raise ConfigError(
+            "doip.max_payload_bytes: %d is not a usable payload limit "
+            "(1..16777216)" % cfg.max_payload_bytes
+        )
+    if cfg.max_concurrent_sessions <= 0:
+        raise ConfigError(
+            "doip.max_concurrent_sessions: %d must be a positive count "
+            "(0 would deny every Routing Activation)" % cfg.max_concurrent_sessions
+        )
+    if cfg.alive_check_timeout_ms <= 0:
+        raise ConfigError(
+            "doip.alive_check_timeout_ms: %d must be positive "
+            "(0 would never wait for a response)" % cfg.alive_check_timeout_ms
+        )
+
+    if "tester_addr_range" in section:
+        bounds = _to_int_list(section["tester_addr_range"], "doip.tester_addr_range")
+        if len(bounds) != 2:
+            raise ConfigError(
+                "doip.tester_addr_range: expected [low, high], got %d value(s)"
+                % len(bounds)
+            )
+        low, high = bounds
+        if not (0 <= low <= high <= 0xFFFF):
+            raise ConfigError(
+                "doip.tester_addr_range: [0x%04X, 0x%04X] is not a valid "
+                "ascending 16-bit range" % (low, high)
+            )
+        cfg.tester_addr_range = (low, high)
+    return cfg
+
+
+def _load_udp(raw: dict) -> UdpConfig:
+    section = _section(raw, "udp")
+    cfg = UdpConfig(
+        enabled=_to_bool(section.get("enabled", True), "udp.enabled"),
+        announce_count=_to_int(section.get("announce_count", 3), "udp.announce_count"),
+        announce_interval_ms=_to_int(section.get("announce_interval_ms", 500),
+                                     "udp.announce_interval_ms"),
+        announce_wait_ms=_to_int(section.get("announce_wait_ms", 500),
+                                 "udp.announce_wait_ms"),
+    )
+    # All three reach asyncio.sleep()/range() in run_announcer: a negative
+    # announce_count silently sends nothing, and a negative interval/wait
+    # reaches asyncio.sleep() with a value it was never meant to see. 0 stays
+    # valid throughout (announce_wait_ms's documented "act immediately";
+    # announce_count/interval's "no announcements"/"no gap between them").
+    for name, value in (("announce_count", cfg.announce_count),
+                        ("announce_interval_ms", cfg.announce_interval_ms),
+                        ("announce_wait_ms", cfg.announce_wait_ms)):
+        if value < 0:
+            raise ConfigError("udp.%s: must be >= 0" % name)
+    return cfg
+
+
+def _load_security(section: dict) -> SecurityConfig:
+    if not section:
+        return SecurityConfig()
+    algorithm = _one_of(section.get("algorithm", "xor"), ("none", "xor", "add"),
+                        "uds.security.algorithm")
+    cfg = SecurityConfig(
+        enabled=_to_bool(section.get("enabled", True), "uds.security.enabled"),
+        seed=_to_hex_bytes(section.get("seed", "11223344"), "uds.security.seed"),
+        algorithm=algorithm,
+        key=_to_hex_bytes(section.get("key", "A5A5A5A5"), "uds.security.key"),
+        max_attempts=_to_int(section.get("max_attempts", 3), "uds.security.max_attempts"),
+    )
+    if not cfg.seed:
+        raise ConfigError("uds.security.seed: must not be empty")
+    if cfg.algorithm != "none" and len(cfg.key) != len(cfg.seed):
+        raise ConfigError(
+            "uds.security.key: %d bytes but seed is %d — the %r algorithm needs "
+            "them to be the same length" % (len(cfg.key), len(cfg.seed), cfg.algorithm)
+        )
+    return cfg
+
+
+def _load_uds(raw: dict) -> UdsConfig:
+    section = _section(raw, "uds")
+    cfg = UdsConfig(
+        default_session=_to_int(section.get("default_session", SESSION_DEFAULT),
+                                "uds.default_session"),
+        s3_server_ms=_to_int(section.get("s3_server_ms", 5000), "uds.s3_server_ms"),
+        p2_server_ms=_to_int(section.get("p2_server_ms", 50), "uds.p2_server_ms"),
+        p2_star_server_ms=_to_int(section.get("p2_star_server_ms", 5000),
+                                  "uds.p2_star_server_ms"),
+        auto_response_pending=_to_bool(section.get("auto_response_pending", True),
+                                       "uds.auto_response_pending"),
+        max_response_pending=_to_int(section.get("max_response_pending", 10),
+                                     "uds.max_response_pending"),
+        suppress_pos_rsp_bit=_to_bool(section.get("suppress_pos_rsp_bit", True),
+                                      "uds.suppress_pos_rsp_bit"),
+        functional_addr=_to_int(section.get("functional_addr", 0x1FFF),
+                                "uds.functional_addr"),
+        unknown_service=_one_of(section.get("unknown_service", "nrc"),
+                                ("nrc", "echo", "silent"), "uds.unknown_service"),
+        unknown_did=_one_of(section.get("unknown_did", "nrc"),
+                            ("nrc", "echo", "silent"), "uds.unknown_did"),
+        on_handler_error=_one_of(section.get("on_handler_error", "nrc"),
+                                 ("nrc", "fallthrough", "silent"),
+                                 "uds.on_handler_error"),
+        reset_clears_writes=_to_bool(section.get("reset_clears_writes", True),
+                                     "uds.reset_clears_writes"),
+        reset_drops_connection=_to_bool(
+            section.get("reset_drops_connection", False),
+            "uds.reset_drops_connection"),
+        security=_load_security(_section(section, "security")),
+    )
+    if "sessions" in section:
+        cfg.sessions = _to_int_list(section["sessions"], "uds.sessions")
+    if cfg.default_session not in cfg.sessions:
+        raise ConfigError(
+            "uds.default_session: 0x%02X is not in uds.sessions %s"
+            % (cfg.default_session, ["0x%02X" % s for s in cfg.sessions])
+        )
+    if cfg.p2_server_ms <= 0:
+        raise ConfigError("uds.p2_server_ms: must be > 0")
+    if cfg.max_response_pending < 0:
+        raise ConfigError("uds.max_response_pending: must be >= 0 (0 = unlimited)")
+    if not 0 <= cfg.functional_addr <= 0xFFFF:
+        raise ConfigError("uds.functional_addr: 0x%X is not a 16-bit address"
+                          % cfg.functional_addr)
+    # Unlike p2_server_ms, 0 is never a valid p2_star: session.py's
+    # _dispatch_with_p2 divides it into a wait window on every ResponsePending
+    # cycle, and a zero window would spin, emitting 0x78 frames as fast as it
+    # can until uds.max_response_pending finally stops it.
+    if cfg.p2_star_server_ms <= 0:
+        raise ConfigError("uds.p2_star_server_ms: must be > 0")
+    # 0 is deliberately "disabled" for s3_server_ms (see its docstring) —
+    # only reject negative, do not tighten this to > 0.
+    if cfg.s3_server_ms < 0:
+        raise ConfigError("uds.s3_server_ms: must be >= 0 (0 = disabled)")
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# DID / routine tables
+# ---------------------------------------------------------------------------
+
+_DID_TYPES = ("hex", "ascii", "uint", "dynamic")
+
+
+def _encode_did_value(spec_type: str, value: Any, length: Optional[int],
+                      where: str) -> bytes:
+    """Encode a YAML DID value once, at load time."""
+    if spec_type == "hex":
+        encoded = _to_hex_bytes(value, where)
+    elif spec_type == "ascii":
+        text = _to_str(value, where)
+        try:
+            encoded = text.encode("ascii")
+        except UnicodeEncodeError:
+            raise ConfigError("%s: %r is not pure ASCII" % (where, value))
+        if length is not None:
+            encoded = encoded[:length].ljust(length, b"\x00")
+    elif spec_type == "uint":
+        number = _to_int(value, where)
+        width = length if length is not None else 1
+        try:
+            encoded = number.to_bytes(width, "big")
+        except OverflowError:
+            raise ConfigError("%s: %d does not fit in %d byte(s)" % (where, number, width))
+    else:  # pragma: no cover — guarded by the caller
+        raise ConfigError("%s: type %r takes no value" % (where, spec_type))
+
+    if length is not None and spec_type == "hex" and len(encoded) != length:
+        raise ConfigError(
+            "%s: value is %d byte(s) but length says %d"
+            % (where, len(encoded), length)
+        )
+    return encoded
+
+
+def _load_did(did: int, raw_entry: Any, where: str) -> DidSpec:
+    if not isinstance(raw_entry, dict):
+        raise ConfigError("%s: expected a mapping, got %s"
+                          % (where, type(raw_entry).__name__))
+
+    spec_type = _one_of(raw_entry.get("type", "hex"), _DID_TYPES, "%s.type" % where)
+    length = (_to_int(raw_entry["length"], "%s.length" % where)
+              if raw_entry.get("length") is not None else None)
+    if length is not None and length <= 0:
+        raise ConfigError("%s.length: must be > 0" % where)
+
+    value: Optional[bytes] = None
+    if spec_type == "dynamic":
+        if "value" in raw_entry:
+            raise ConfigError("%s: type 'dynamic' must not have a value — it is "
+                              "served by the core or by a plugin" % where)
+    elif "value" in raw_entry:
+        value = _encode_did_value(spec_type, raw_entry["value"], length,
+                                  "%s.value" % where)
+    else:
+        raise ConfigError("%s: missing 'value' (use type: dynamic for a "
+                          "handler-provided DID)" % where)
+
+    spec = DidSpec(
+        did=did,
+        name=_to_str(raw_entry.get("name", ""), "%s.name" % where),
+        type=spec_type,
+        length=length,
+        value=value,
+        read=_to_bool(raw_entry.get("read", True), "%s.read" % where),
+        write=_to_bool(raw_entry.get("write", False), "%s.write" % where),
+        read_security=_to_int(raw_entry.get("read_security", 0), "%s.read_security" % where),
+        write_security=_to_int(raw_entry.get("write_security", 0),
+                               "%s.write_security" % where),
+    )
+    if raw_entry.get("read_sessions") is not None:
+        spec.read_sessions = _to_int_list(raw_entry["read_sessions"],
+                                          "%s.read_sessions" % where)
+    if raw_entry.get("write_sessions") is not None:
+        spec.write_sessions = _to_int_list(raw_entry["write_sessions"],
+                                           "%s.write_sessions" % where)
+    for gate in ("read_nrc", "write_nrc"):
+        if raw_entry.get(gate) is not None:
+            code = _to_int(raw_entry[gate], "%s.%s" % (where, gate))
+            if code not in NRC_NAMES:
+                raise ConfigError("%s.%s: 0x%02X is not a known NRC" % (where, gate, code))
+            setattr(spec, gate, code)
+
+    if spec.write and spec.dynamic:
+        raise ConfigError("%s: type 'dynamic' cannot be writable — give the DID a "
+                          "@write_did handler instead" % where)
+    return spec
+
+
+def _load_dids(raw: dict) -> Dict[int, DidSpec]:
+    section = _section(raw, "data_identifiers")
+    table: Dict[int, DidSpec] = {}
+    for key, entry in section.items():
+        where = "data_identifiers[%s]" % key
+        did = _to_int(key, where)
+        if not 0 <= did <= 0xFFFF:
+            raise ConfigError("%s: 0x%X is not a 16-bit identifier" % (where, did))
+        if did in table:
+            raise ConfigError("%s: DID 0x%04X is declared twice" % (where, did))
+        table[did] = _load_did(did, entry, where)
+    return table
+
+
+def _load_routines(raw: dict) -> Dict[int, RoutineSpec]:
+    section = _section(raw, "routines")
+    table: Dict[int, RoutineSpec] = {}
+    for key, entry in section.items():
+        where = "routines[%s]" % key
+        rid = _to_int(key, where)
+        if not 0 <= rid <= 0xFFFF:
+            raise ConfigError("%s: 0x%X is not a 16-bit identifier" % (where, rid))
+        if not isinstance(entry, dict):
+            raise ConfigError("%s: expected a mapping, got %s"
+                              % (where, type(entry).__name__))
+        spec = RoutineSpec(
+            rid=rid,
+            name=_to_str(entry.get("name", ""), "%s.name" % where),
+            start=_to_hex_bytes(entry.get("start", ""), "%s.start" % where),
+            stop=_to_hex_bytes(entry.get("stop", ""), "%s.stop" % where),
+            results=_to_hex_bytes(entry.get("results", ""), "%s.results" % where),
+            security=_to_int(entry.get("security", 0), "%s.security" % where),
+        )
+        if entry.get("sessions") is not None:
+            spec.sessions = _to_int_list(entry["sessions"], "%s.sessions" % where)
+        table[rid] = spec
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Plugins
+# ---------------------------------------------------------------------------
+
+def _scan_plugin_dir(directory: str, base_dir: str, strict: bool) -> List[PluginSpec]:
+    """
+    Every non-underscore ``*.py`` in ``directory``, in sorted order.
+
+    A missing directory is a warning, not an error, unless ``plugins.strict``
+    is set: the usual cause is a container started without its plugin volume
+    mounted, and an ECU with no plugins is still a working ECU.
+    """
+    resolved = directory if os.path.isabs(directory) else os.path.join(base_dir, directory)
+    if not os.path.isdir(resolved):
+        if strict:
+            raise ConfigError("plugins.path: %r is not a directory" % directory)
+        logger.warning("plugins.path: %r is not a directory — no plugins loaded from it",
+                       directory)
+        return []
+    specs: List[PluginSpec] = []
+    for entry in sorted(os.listdir(resolved)):
+        if not entry.endswith(".py") or entry.startswith("_"):
+            continue
+        specs.append(PluginSpec(label=os.path.join(directory, entry),
+                                file=os.path.join(resolved, entry)))
+    return specs
+
+
+def _load_plugins(raw: dict, base_dir: str) -> PluginsConfig:
+    section = _section(raw, "plugins")
+    cfg = PluginsConfig(strict=_to_bool(section.get("strict", False), "plugins.strict"))
+
+    paths = section.get("path") or []
+    if not isinstance(paths, (list, tuple)):
+        raise ConfigError("plugins.path: expected a list of directories")
+    for directory in paths:
+        cfg.specs.extend(_scan_plugin_dir(
+            _to_str(directory, "plugins.path"), base_dir, cfg.strict))
+
+    modules = section.get("modules") or []
+    if not isinstance(modules, (list, tuple)):
+        raise ConfigError("plugins.modules: expected a list")
+    for index, entry in enumerate(modules):
+        where = "plugins.modules[%d]" % index
+        if not isinstance(entry, dict):
+            raise ConfigError("%s: expected a mapping with 'file:' or 'module:'" % where)
+        file_path = entry.get("file")
+        module_name = entry.get("module")
+        if bool(file_path) == bool(module_name):
+            raise ConfigError("%s: give exactly one of 'file:' or 'module:'" % where)
+        params = entry.get("params") or {}
+        if not isinstance(params, dict):
+            raise ConfigError("%s.params: expected a mapping" % where)
+        resolved = None
+        if file_path:
+            resolved = _to_str(file_path, "%s.file" % where)
+            if not os.path.isabs(resolved):
+                resolved = os.path.join(base_dir, resolved)
+        cfg.specs.append(PluginSpec(
+            label=_to_str(file_path or module_name, where),
+            file=resolved,
+            module=_to_str(module_name, "%s.module" % where) if module_name else None,
+            enabled=_to_bool(entry.get("enabled", True), "%s.enabled" % where),
+            priority=(_to_int(entry["priority"], "%s.priority" % where)
+                      if entry.get("priority") is not None else None),
+            params=params,
+        ))
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_config(raw: dict, base_dir: str = ".") -> EcuConfig:
+    """Validate an already-parsed YAML mapping.  Used directly by the tests."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("top level: expected a mapping, got %s" % type(raw).__name__)
+
+    cfg = EcuConfig(
+        listen=_load_listen(raw),
+        doip=_load_doip(raw),
+        udp=_load_udp(raw),
+        uds=_load_uds(raw),
+        dids=_load_dids(raw),
+        routines=_load_routines(raw),
+        plugins=_load_plugins(raw, base_dir),
+        raw=raw,
+        base_dir=base_dir,
+    )
+
+    # Cross-section checks
+    if cfg.uds.functional_addr == cfg.doip.ecu_logical_addr:
+        raise ConfigError(
+            "uds.functional_addr (0x%04X) must differ from doip.ecu_logical_addr"
+            % cfg.uds.functional_addr
+        )
+    for spec in cfg.dids.values():
+        for sessions, gate in ((spec.read_sessions, "read_sessions"),
+                               (spec.write_sessions, "write_sessions")):
+            for session in sessions or ():
+                if session not in cfg.uds.sessions:
+                    raise ConfigError(
+                        "data_identifiers[0x%04X].%s: session 0x%02X is not in "
+                        "uds.sessions" % (spec.did, gate, session)
+                    )
+    return cfg
+
+
+def load_config(path: str) -> EcuConfig:
+    """Read and validate a YAML config file.  Raises ConfigError on any problem."""
+    try:
+        with open(path) as handle:
+            raw = yaml.safe_load(handle)
+    except FileNotFoundError:
+        raise ConfigError("config file %r not found" % path)
+    except yaml.YAMLError as exc:
+        raise ConfigError("config file %r is not valid YAML: %s" % (path, exc))
+    except OSError as exc:
+        raise ConfigError("cannot read config file %r: %s" % (path, exc))
+
+    base_dir = os.path.dirname(os.path.abspath(path)) or "."
+    return parse_config(raw, base_dir)

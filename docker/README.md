@@ -6,7 +6,7 @@ Runs the four components in two isolated networks:
                  doip_frontend (IPv4)            doip_backend (IPv6)
  PC-Tester  ───────────────────────────►  EdgeNode  ─────┬─────────────────►  EchoNode
  172.30.100.20                            172.30.100.10  │   fd2e:646f:6970::2
-                                      fd2e:646f:6970::10  └─────────────────►  TestEcu
+                                      fd2e:646f:6970::10  └─────────────────►  VirtualEcu
                                                                      fd2e:646f:6970::3
 ```
 
@@ -14,7 +14,7 @@ Runs the four components in two isolated networks:
 |---|---|---|---|---|---|
 | EdgeNode | `doip-edgenode` | `172.30.100.10` (eth0) | `fd2e:646f:6970::10` (eth1) | `0x1234` | 13400/tcp, 3496/tcp, 13400/udp |
 | EchoNode | `doip-echonode` | — | `fd2e:646f:6970::2` | `0x0002` | 13400/tcp, 13400/udp |
-| TestEcu | `doip-testecu` | — | `fd2e:646f:6970::3` | `0x0003` | 13400/tcp, 13400/udp |
+| VirtualEcu | `doip-virtecu` | — | `fd2e:646f:6970::3` | `0x0003` | 13400/tcp, 13400/udp |
 | PC-Tester | `doip-pc-tester` | `172.30.100.20` | — | — | — |
 
 ECU logical addresses match each node's IPv6 suffix (`::2` → `0x0002`, `::3`
@@ -35,12 +35,12 @@ not by the activated tester SA. The EdgeNode resolves routes with
 | Diag target address | Reaches |
 |---|---|
 | `0x0002` | `doip-echonode` |
-| `0x0003` | `doip-testecu` |
+| `0x0003` | `doip-virtecu` |
 
 Any tester SA the EdgeNode accepts (`doip.tester_addr_range`/`tester_addr_list`
 in `edgenode.config.yaml`, default `0x0E00`-`0x0FFF`) can reach either ECU in the
 same session — no separate Routing Activation per ECU. With the bundled
-`pc_tester` (default diag target: `0x0003`, TestEcu), just use the
+`pc_tester` (default diag target: `0x0003`, VirtualEcu), just use the
 interactive REPL's `target <addr_hex>` command (e.g. `target 0x0002`) to
 switch which ECU your next `diag` goes to; no config edit or container
 restart needed.
@@ -93,33 +93,33 @@ Stop:
 docker compose down
 ```
 
-## Loading your own plugins into TestEcu
+## Loading your own plugins into VirtualEcu
 
-`doip-testecu` mounts a plugin directory read-only at `/app/plugins` and loads every
+`doip-virtecu` mounts a plugin directory read-only at `/app/plugins` and loads every
 `*.py` in it at startup (sorted, files starting with `_` skipped). No rebuild is needed
 — drop a file in and restart the container:
 
 ```bash
-cp my_ecu.py test_ecu/plugins/
-docker compose restart doip-testecu
-docker compose logs doip-testecu | head -20     # the resolved hook table is at INFO
+cp my_ecu.py virtual_ecu/plugins/
+docker compose restart doip-virtecu
+docker compose logs doip-virtecu | head -20     # the resolved hook table is at INFO
 ```
 
 To use a plugin directory outside this repo, repoint the volume in `docker-compose.yml`:
 
 ```yaml
-  doip-testecu:
+  doip-virtecu:
     volumes:
-      - ./docker/testecu.config.yaml:/app/config.yaml:ro
+      - ./docker/virtecu.config.yaml:/app/config.yaml:ro
       - /path/to/my_plugins:/app/plugins:ro
 ```
 
 A plugin that fails to import is logged with a full traceback and skipped — the ECU
 still starts and still serves everything else. Set `plugins.strict: true` in
-`docker/testecu.config.yaml` if you would rather the container refuse to start.
+`docker/virtecu.config.yaml` if you would rather the container refuse to start.
 
-`docker/testecu.config.yaml` also holds the static `data_identifiers:` table, so simple
-canned values need no Python at all. See [`../test_ecu/README.md`](../test_ecu/README.md).
+`docker/virtecu.config.yaml` also holds the static `data_identifiers:` table, so simple
+canned values need no Python at all. See [`../virtual_ecu/README.md`](../virtual_ecu/README.md).
 
 ## Running your DoIP Tests project against this stack
 
@@ -227,5 +227,5 @@ docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
   side to `eth1`, matching `ecu_interface: eth1` in `edgenode.config.yaml`.
 - Both ECUs send UDP Vehicle Announcements to `ff02::1` on the backend network, so a
   tester doing vehicle discovery there will see two entities (`0x0002` and `0x0003`).
-- `doip-echonode` and `doip-testecu` are independent: stopping one does not affect the
-  other, and TestEcu changes never touch `echo_ecu/`.
+- `doip-echonode` and `doip-virtecu` are independent: stopping one does not affect the
+  other, and VirtualEcu changes never touch `echo_ecu/`.

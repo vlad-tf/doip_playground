@@ -3,8 +3,8 @@
 ## Scope
 
 This file governs `pc_tester/` only — a single-file (`tester.py`), stdlib-only
-interactive DoIP client used to exercise EdgeNode/TestEcu/Echo ECU manually.
-See `../CLAUDE.md` for why this differs from `test_ecu/`.
+interactive DoIP client used to exercise EdgeNode/VirtualEcu/Echo ECU manually.
+See `../CLAUDE.md` for why this differs from `virtual_ecu/`.
 
 ## Conventions
 
@@ -51,6 +51,6 @@ See `../CLAUDE.md` for why this differs from `test_ecu/`.
 - Do not remove or bypass `_background_reader` / `_recv_queue` — see above;
   this is what lets the tester answer unsolicited Alive Check probes while
   the REPL is blocked on `input()`.
-- Do not couple this file to `test_ecu/` or `doip_edgenode/` internals via
+- Do not couple this file to `virtual_ecu/` or `doip_edgenode/` internals via
   imports — it only ever talks to them over the wire (DoIP/TCP), matching
   the "own Docker build context" rule in `../CLAUDE.md`.

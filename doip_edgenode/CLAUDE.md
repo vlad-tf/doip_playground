@@ -4,7 +4,7 @@
 
 This file governs `doip_edgenode/` only. It is the Scapy-based DoIP proxy that
 runs on the Raspberry Pi between the PC Tester and an ECU. Do not apply these
-conventions to `test_ecu/`, `echo_ecu/`, or `pc_tester/` — each has its own
+conventions to `virtual_ecu/`, `echo_ecu/`, or `pc_tester/` — each has its own
 style; see `../CLAUDE.md` for why.
 
 **Primary reference:** `../doip_edgenode_requirements.md`. Read it before
@@ -270,7 +270,7 @@ assuming a code bug.
 - Do not hardcode any address, port, VIN, or certificate path — everything
   comes from `config.yaml`.
 - Do not parse UDS service IDs here — the diagnostic payload is always
-  opaque bytes as far as EdgeNode is concerned (TestEcu/Echo ECU parse UDS,
+  opaque bytes as far as EdgeNode is concerned (VirtualEcu/Echo ECU parse UDS,
   not EdgeNode).
 - Do not call `MiddlewareChain.run()` on an unauthenticated/unactivated
   session.
@@ -300,7 +300,7 @@ pytest tests/test_session.py -v      # uses tests/mock_ecu.py over loopback
 
 No `pytest-asyncio` — coroutines are driven through `asyncio.run()` inside
 each test or a small helper, matching the pattern used by
-`test_ecu/tests/conftest.py:run`. Do not add `pytest-asyncio` as a dependency.
+`virtual_ecu/tests/conftest.py:run`. Do not add `pytest-asyncio` as a dependency.
 
 ## Backlog (known gaps, not yet implemented — do not silently build these)
 
@@ -312,7 +312,7 @@ tradeoffs to think through:
 
 - **Serialize concurrent testers against one ECU.** Now that routing can
   send two different tester sessions' Diagnostic Messages to the same
-  physical ECU (e.g. both land on TestEcu via two separate ECUConnections),
+  physical ECU (e.g. both land on VirtualEcu via two separate ECUConnections),
   nothing stops EdgeNode from forwarding tester A's request and tester B's
   request to that ECU back-to-back before the ECU has answered the first —
   the ECU itself may not tolerate interleaved requests on separate sockets.
@@ -375,7 +375,7 @@ relying on CI here:
   requirements.txt && pytest` fails as a result. Either add `pytest-asyncio`
   to `requirements.txt` and fix the docs (reverses the stated policy), or
   rewrite `test_session.py` to use the `run()`-helper pattern this file
-  prescribes (matching `test_ecu/tests/conftest.py:run`) and remove
+  prescribes (matching `virtual_ecu/tests/conftest.py:run`) and remove
   `pytest.ini`'s `asyncio_mode` / the `@pytest.mark.asyncio` decorators —
   pick one deliberately rather than leaving the contradiction.
 

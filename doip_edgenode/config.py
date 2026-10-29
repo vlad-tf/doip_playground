@@ -63,8 +63,8 @@ class TLSConfig:
 
 
 #: Default accepted tester (client) logical address range, used when
-#: doip.tester_addr_range is absent from config.yaml. Matches TestEcu's
-#: TESTER_ADDR_RANGE (testecu/doip.py) — ISO 13400-2 Table 13's example
+#: doip.tester_addr_range is absent from config.yaml. Matches VirtualEcu's
+#: TESTER_ADDR_RANGE (virtecu/doip.py) — ISO 13400-2 Table 13's example
 #: tester address range.
 DEFAULT_TESTER_ADDR_RANGE: tuple[int, int] = (0x0E00, 0x0FFF)
 

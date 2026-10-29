@@ -1,11 +1,11 @@
-# DoIP test stack: PC-Tester <-> EdgeNode <-> EchoNode / TestEcu
+# DoIP test stack: PC-Tester <-> EdgeNode <-> EchoNode / VirtualEcu
 #
 #   PC-Tester  --(IPv4, doip_frontend)-->  EdgeNode  --(IPv6, doip_backend)-->  EchoNode
-#                                                                           \-> TestEcu
+#                                                                           \-> VirtualEcu
 #
 # Two ECUs sit on the backend network:
 #   doip-echonode  fd2e:646f:6970::2  logical 0x0002  — fixed echo, unchanged
-#   doip-testecu   fd2e:646f:6970::3  logical 0x0003  — pluggable UDS simulator
+#   doip-virtecu   fd2e:646f:6970::3  logical 0x0003  — pluggable UDS simulator
 # EdgeNode itself (fd2e:646f:6970::10) answers self-diagnostics as 0x1234
 # (VM-specific range, deliberately distinct from the ECUs and the tester
 # range). 0x0000 is ISO/SAE reserved — ISO 13400-2 — and must never be
@@ -48,27 +48,27 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
-  doip-testecu:
+  doip-virtecu:
     build:
-      context: ./test_ecu
-      dockerfile: ../docker/testecu.Dockerfile
+      context: ./virtual_ecu
+      dockerfile: ../docker/virtecu.Dockerfile
       args:
         http_proxy: ${HTTP_PROXY:-}
         https_proxy: ${HTTPS_PROXY:-}
         no_proxy: ${NO_PROXY:-}
-    image: doip-testecu:latest
-    container_name: doip-testecu
-    hostname: doip-testecu
+    image: doip-virtecu:latest
+    container_name: doip-virtecu
+    hostname: doip-virtecu
     networks:
       doip_backend:
         mac_address: "02:6e:6c:61:62:03"
         ipv6_address: fd2e:646f:6970::3
     volumes:
-      - ./docker/testecu.config.yaml:/app/config.yaml:ro
+      - ./docker/virtecu.config.yaml:/app/config.yaml:ro
       # Your business logic.  Every *.py here is loaded at startup — drop a file
-      # in and `docker compose restart doip-testecu`, no rebuild needed.
+      # in and `docker compose restart doip-virtecu`, no rebuild needed.
       # Point this at a directory outside the repo to use your own plugins.
-      - ./test_ecu/plugins:/app/plugins:ro
+      - ./virtual_ecu/plugins:/app/plugins:ro
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -102,7 +102,7 @@ services:
       - no-new-privileges:true
     depends_on:
       - doip-echonode
-      - doip-testecu
+      - doip-virtecu
     restart: unless-stopped
 
   doip-pc-tester:

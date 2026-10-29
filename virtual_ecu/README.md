@@ -1,0 +1,453 @@
+# VirtualEcu — an extensible DoIP/UDS ECU simulator
+
+VirtualEcu speaks DoIP (ISO 13400-2) and UDS (ISO 14229-1) and lets **you** supply the
+business logic — either as a YAML table of data identifiers, or as Python plugins, or
+both.
+
+It is a sibling of [`echo_ecu/`](../echo_ecu/), not a replacement: the echo node still
+exists and still works. VirtualEcu reuses its (proven) DoIP layer and replaces its 23-line
+canned-echo UDS handler with a real service layer you can extend.
+
+**Dependencies: PyYAML. That is the whole list.** No `udsoncan`, no `py-uds`, no Scapy.
+
+**Python 3.10+ is the supported floor** — that is Ubuntu 22.04 (the test server) and
+Debian bookworm / Raspberry Pi OS (3.11, the deployment target and the Docker base).
+Tests are run on Linux. The code happens to still import on 3.9 (`from __future__ import
+annotations` throughout), which is convenient on a macOS dev box, but 3.9 is not tested
+and nothing should be held back for it.
+
+---
+
+## Quick start
+
+```bash
+cd virtual_ecu
+
+# 1. Check the config and print the resolved hook table
+python3 -m virtecu --config config.yaml --check
+
+# 2. Run it on IPv6 loopback.
+#    --no-udp is required on macOS: joining ff02::1 on lo0 fails, and there is no eth0.
+python3 -m virtecu --config config.yaml --host ::1 --interface "" --no-udp --log-level DEBUG
+
+# 3. In another terminal, talk to it
+python3 tools/uds_probe.py --host ::1 --uds "22 F1 90"
+```
+
+```
+routing activation -> 0x10 (success)
+
+-> 22 F1 90
+   ack 0x8002
+<- 62 F1 90 31 48 47 42 48 34 31 4A 58 4D 4E 31 30 39 31 38 36
+```
+
+Run the tests with `pip3 install --user pytest && python3 -m pytest tests -v`.
+
+---
+
+## Two ways to add behaviour
+
+### 1. Static data — YAML only, no code
+
+Most of what a tester needs to read is a fixed value. Declare it and you are done:
+
+```yaml
+data_identifiers:
+  0xF190:
+    name:   VIN
+    type:   ascii          # hex | ascii | uint | dynamic
+    length: 17
+    value:  "1HGBH41JXMN109186"
+    read:   true
+
+  0x0100:
+    name:   CalibrationBlock
+    type:   hex
+    length: 4
+    value:  "DEADBEEF"
+    read:   true
+    write:  true
+    write_sessions: [0x03]   # not writable in the default session -> 7F 2E 31
+    write_security: 1        # needs SecurityAccess level 1        -> 7F 2E 33
+```
+
+Writes land in an in-memory store, so `2E 01 00 11 22 33 44` followed by `22 01 00`
+returns the value you just wrote. `ECUReset` (0x11) puts the defaults back.
+
+### 2. Real logic — a Python plugin
+
+A plugin module is any `.py` file that defines one or more `Plugin` subclasses:
+
+```python
+# plugins/my_ecu.py
+from virtecu import Plugin, read_did, write_did, routine, on_service
+from virtecu import NRC_CONDITIONS_NOT_CORRECT
+
+class MyEcu(Plugin):
+    name = "MyEcu"
+    priority = 50                      # lower runs first
+
+    def __init__(self, gain: int = 1, **params):
+        super().__init__(gain=gain, **params)   # `gain` comes from YAML params:
+        self.counter = 0
+
+    @read_did(0xF200)                  # -> 62 F2 00 <your bytes>
+    def uptime(self, req, ctx):
+        self.counter += 1
+        return self.counter.to_bytes(2, "big")
+
+    @write_did(0xF201)
+    def set_mode(self, value, req, ctx):
+        if value not in (b"\x00", b"\x01"):
+            raise ctx.nrc(NRC_CONDITIONS_NOT_CORRECT, "mode must be 0 or 1")
+        ctx.store.write(0xF201, value)
+        return True                    # -> 6E F2 01
+```
+
+Point the config at it:
+
+```yaml
+plugins:
+  modules:
+    - file: "plugins/my_ecu.py"
+      params: {gain: 3}
+```
+
+---
+
+## The five decorators
+
+| Decorator | Handler signature | Return |
+|---|---|---|
+| `@on_service(sid)` | `(self, req, ctx)` | the **complete** UDS response bytes, incl. response SID |
+| `@on_service()` | `(self, req, ctx)` | same, but sees **every** service (catch-all) |
+| `@on_request()` | `(self, req, ctx)` | ignored — an observer for logging/metrics |
+| `@read_did(did)` | `(self, req, ctx)` | the DID **value only**; `62 <did>` is prepended |
+| `@write_did(did)` | `(self, value, req, ctx)` | `True` to accept; `6E <did>` is sent |
+| `@routine(rid[, control])` | `(self, control, data, req, ctx)` | routineStatusRecord; `71 <control> <rid>` is prepended |
+
+Every handler may be `def` **or** `async def`. Sync handlers run on the event loop — if
+yours blocks, wrap the slow part in `asyncio.to_thread`.
+
+### What a handler returns
+
+| Return | Effect |
+|---|---|
+| `bytes` | that is the response (see the table above for what is prepended) |
+| `None` | **not handled** — fall through to the next candidate |
+| `True` (write handlers) | accepted |
+| `NO_RESPONSE` | handled, but send nothing at all |
+| `raise ctx.nrc(NRC_X, "why")` | `7F <sid> <nrc>` |
+| `raise NegativeResponse(NRC_X)` | same, for code that has no `ctx` at hand |
+
+`None` meaning *fall through* is the single most important rule. It is what lets a
+plugin claim a DID conditionally, or take over a whole service and hand parts of it back.
+
+### The context object
+
+```python
+ctx.ecu             # EcuCore — process-wide
+ctx.session         # SessionState — this TCP connection
+ctx.request         # the UdsRequest (same object as `req`)
+ctx.store           # DidStore: read(did) / write(did, value) / reset()
+ctx.data            # free-form dict, shared across connections, yours to use
+ctx.config          # the raw parsed YAML
+ctx.log             # a logger
+
+ctx.session_type    # 0x01 default, 0x03 extended, ...
+ctx.security_level  # 0 = locked
+ctx.source_addr     # tester logical address
+ctx.target_addr     # the address that was addressed
+ctx.functional      # True if this was a functional request
+
+await ctx.send(b"...")          # emit an extra response frame right now
+await ctx.response_pending()    # emit 7F <sid> 78 by hand
+ctx.nrc(code, "reason")         # build a NegativeResponse — `raise` it
+```
+
+And on the request:
+
+```python
+req.sid              req.data              # everything after the SID
+req.sub_function     req.suppress_pos_rsp  # None/False for services without one
+req.did              req.dids()            # for 0x22 / 0x2E
+req.positive(body)   req.negative(nrc)     # response builders
+req.describe()                             # "ReadDataByIdentifier (0x22)"
+```
+
+Plugin lifecycle hooks: `async def setup(self, ecu)` runs once before the socket binds,
+`async def teardown(self, ecu)` runs on shutdown.
+
+---
+
+## Precedence — who answers first
+
+For each request, the first candidate that returns anything other than `None` wins:
+
+```
+0.  @on_request observers        always run; return ignored, exceptions swallowed
+1.  @on_service(<sid>) hooks     ordered by (priority, load order, plugin name)
+2.  @on_service() catch-alls     same ordering
+3.  the built-in core service
+      0x22  ->  @read_did   ->  YAML data_identifiers  ->  uds.unknown_did policy
+      0x2E  ->  @write_did  ->  YAML writable entry    ->  uds.unknown_did policy
+      0x31  ->  @routine    ->  YAML routines          ->  NRC 0x31
+4.  uds.unknown_service policy   nrc (7F <sid> 11) | echo | silent
+```
+
+Two consequences worth internalising:
+
+- **A per-SID hook shadows the per-DID sugar for that SID.** If you write
+  `@on_service(0x22)` you own DID routing for reads — return `None` to hand it back.
+  This is deliberate: the alternative would make a catch-all 0x22 interceptor impossible.
+- **A `@read_did` handler beats the YAML entry for the same DID**, and returning `None`
+  from it falls back to YAML. That is how you make a DID dynamic only under some
+  condition.
+
+If two plugins claim the same DID or SID, both are registered, the lower `priority` runs
+first, and a warning naming both is logged at startup. Nothing is silently dropped.
+
+---
+
+## What is built in, and what is yours
+
+Implemented by the core, all of it overridable by `@on_service`:
+
+| SID | Service | Notes |
+|---|---|---|
+| `0x10` | DiagnosticSessionControl | `50 <sub> P2 P2*`; relocks security, re-arms S3 |
+| `0x11` | ECUReset | restores DID defaults; drops the TCP connection only if `uds.reset_drops_connection` is set (see below) |
+| `0x22` | ReadDataByIdentifier | multi-DID; serves `0xF186` = active session |
+| `0x27` | SecurityAccess | fixed seed + `none`/`xor`/`add` key; attempt counter |
+| `0x2E` | WriteDataByIdentifier | length-checked against the YAML `length:` |
+| `0x31` | RoutineControl | start/stop/results, with sequence checks |
+| `0x3E` | TesterPresent | honours the suppress bit, refreshes S3 |
+
+Deliberately **not** built in, because they are OEM-shaped and are exactly what the
+plugin system is for: `0x14`, `0x19` (ReadDTCInformation), `0x23`/`0x3D` (memory),
+`0x28`, `0x2C`, `0x2F`, `0x34`–`0x37` (transfer), `0x85`.
+[`plugins/example_faults.py`](plugins/example_faults.py) implements `0x19` as a worked
+example in about fifteen lines.
+
+### Deliberate deviations from a real ECU
+
+- **ECUReset keeps the socket open by default, switchably.** A real ECU would vanish off
+  the bus. Dropping the connection on every reset would force every test client to
+  reconnect and re-activate routing each time, which makes the simulator much less useful
+  for most testing — so `uds.reset_drops_connection` defaults to `false` and resets happen
+  in place. Set it `true` to get the real-ECU behaviour instead (the connection closes
+  abortively right after the positive response, and this tester's session state is
+  forgotten outright) when what you are exercising is an EdgeNode's own "ECU vanished,
+  came back" reconnect handling, which the default behaviour cannot exercise at all.
+- **Session/security state belongs to the tester, not the socket.** A tester that enters
+  a non-default session, unlocks security, then drops TCP (network blip, deliberate
+  reconnect test, whatever) and reconnects within `s3_server_ms` finds the *same* state —
+  matching a real ECU, whose diagnostic session belongs to the tester and only elapses via
+  S3, not via the transport. `SessionRegistry` (which socket currently owns a given tester
+  address) is a separate structure from this and is unaffected: at most one live socket per
+  tester either way, this is only about what UDS state a reconnecting tester finds.
+- **Nothing is random.** The security seed comes from the config, and the `echo`
+  fallback echoes the request with no random trailer (the echo node appends four random
+  bytes). A simulator you cannot write an assertion against is not worth much.
+  `tests/test_dispatcher.py` enforces this at the source level.
+- **`suppress_pos_rsp` is only honoured for services that actually have a sub-function**
+  (`virtecu/uds.py: SUB_FUNCTION_SERVICES`). For ReadDataByIdentifier, byte 1 is the DID
+  high byte — without this, `22 F1 90` would look like a suppressed request and the VIN
+  would never be sent.
+- **`0x36 exceededNumberOfAttempts` is reported, not enforced.** `uds.security.max_attempts`
+  is counted and a wrong key past that count gets `0x36`, but a *correct* key always
+  unlocks on the very next try — there is no lockout. ISO 14229-1 §9.4 expects a delay
+  timer to start once the limit is hit, rejecting further SecurityAccess requests with
+  `0x37 requiredTimeDelayNotExpired` until it elapses (`0x37` is not even in
+  `virtecu/uds.py: NRC_NAMES`). Deliberately not implemented: a delay timer is
+  time-dependent, which conflicts with the "nothing is random" determinism invariant
+  above — the two are in tension, and resolving that is a maintainer decision, not one to
+  make silently in a bugfix.
+
+---
+
+## Configuration reference
+
+Sections `listen`, `doip` and `udp` are identical to
+[`echo_ecu/config.yaml`](../echo_ecu/config.yaml) — except VirtualEcu's `listen`
+adds the `family` and `discovery_family` keys (see "IPv4 / IPv6 listener"
+below). The rest:
+
+### `uds:`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `default_session` | `0x01` | session at connect and after ECUReset |
+| `sessions` | `[1,2,3,4]` | sub-functions 0x10 accepts |
+| `s3_server_ms` | `5000` | non-default session falls back after this idle time |
+| `p2_server_ms` | `50` | emit `7F xx 78` if a handler takes longer |
+| `p2_star_server_ms` | `5000` | and again every 90% of this |
+| `auto_response_pending` | `true` | set false to never emit 0x78 automatically |
+| `max_response_pending` | `10` | cap on 0x78 frames per request before giving up with NRC 0x10; `0` = unlimited |
+| `suppress_pos_rsp_bit` | `true` | honour sub-function bit 7 |
+| `functional_addr` | `0x1FFF` | target address that means "functional request" |
+| `unknown_service` | `nrc` | `nrc` → `7F <sid> 11`, `echo`, `silent` |
+| `unknown_did` | `nrc` | `nrc` → `7F <sid> 31`, `echo` (returns the DID), `silent` |
+| `on_handler_error` | `nrc` | `nrc` → `7F <sid> 22`, `fallthrough`, `silent` |
+| `reset_clears_writes` | `true` | ECUReset restores YAML DID defaults |
+| `reset_drops_connection` | `false` | `true` = ECUReset closes the TCP connection abortively and forgets this tester's session state, instead of resetting it in place |
+| `security.*` | | `enabled`, `seed`, `algorithm`, `key`, `max_attempts` |
+
+`unknown_service: echo` reproduces the echo node's behaviour if you want a drop-in
+replacement rather than a strict ECU.
+
+### `data_identifiers:`
+
+`name`, `type` (`hex`/`ascii`/`uint`/`dynamic`), `length`, `value`, `read`, `write`,
+`read_sessions`, `write_sessions`, `read_security`, `write_security`, `read_nrc`,
+`write_nrc`.
+
+`type: dynamic` declares a DID with no static value — the core serves `0xF186`, and any
+other dynamic DID needs a `@read_did` handler. `read_nrc`/`write_nrc` force a specific
+negative response, which is handy for exercising a tester's error handling.
+
+Values are encoded once, at load time, so a typo fails at startup rather than on the
+hundredth request.
+
+### `plugins:`
+
+```yaml
+plugins:
+  strict: false           # true = a plugin that fails to load aborts startup (use in CI)
+  path:  ["plugins"]      # auto-discovery: every *.py, sorted, _* skipped, no params
+  modules:                # explicit, ordered, can carry params
+    - file:   "plugins/my_ecu.py"
+      enabled: true
+      priority: 50
+      params:  {gain: 3}
+    - module: "mycompany.brake_ecu"    # any importable module name
+```
+
+Do not list the same file under both `path` and `modules` — it would load twice.
+`priority:` here overrides the class attribute for **every** `Plugin` subclass defined in
+that file.
+
+**Error isolation.** A plugin that fails to import is logged with a full traceback and
+skipped; the ECU still starts. A handler that raises is logged and converted per
+`on_handler_error`; the connection survives and the next request is served normally. Set
+`strict: true` when you would rather a broken plugin fail the build.
+
+---
+
+## CLI
+
+```
+--config PATH        default config.yaml
+--log-level LEVEL    DEBUG | INFO | WARNING | ERROR
+--host / --port / --interface    override the listen section
+--no-udp             skip the UDP announcer
+--plugin PATH        load an extra plugin file; repeatable, runs first
+--check              load config + plugins, print the hook table, exit 0/1
+```
+
+`--check` is the smoke test to run in CI and after editing a plugin:
+
+```
+Static DIDs         : 7
+Plugins             : 3
+Hooks               : 8
+  observer                 EngineEcu.trace              priority=50
+  service 0x19             SimpleDtcs.read_dtc          priority=10
+  service <any>            RawFaults.intercept          priority=10
+  read_did 0xF40C          EngineEcu.read_engine_speed  priority=50
+  ...
+```
+
+---
+
+## Docker
+
+```bash
+cd ..                                  # repo root
+docker compose build doip-virtecu
+docker compose up -d
+docker compose logs -f doip-virtecu    # the hook table is printed at INFO
+```
+
+VirtualEcu runs alongside the echo node: echo node keeps `fd2e:646f:6970::2` /
+logical address `0x0002`, VirtualEcu takes `fd2e:646f:6970::3` / `0x0003`. Routing
+is resolved by the diag target address, not by tester SA, so no separate
+Routing Activation is needed to switch — just address a `diag` request to
+`0x0003` (e.g. `target 0x0003` in `pc_tester`'s REPL), or set
+`ecu_logical_addr: 0x0003` in
+[`docker/pctester.config.yaml`](../docker/pctester.config.yaml) to make it
+the default.
+
+Your own plugins go in without a rebuild — `./virtual_ecu/plugins` is mounted at
+`/app/plugins`, so drop a `.py` in and `docker compose restart doip-virtecu`. Point the
+volume somewhere else to use a directory outside this repo:
+
+```yaml
+volumes:
+  - /path/to/my_plugins:/app/plugins:ro
+```
+
+### IPv4 / IPv6 listener
+
+VirtualEcu defaults to an IPv6-only listener (`listen.family: ipv6`), matching the
+topology in [`docker-compose.yml`](../docker-compose.yml): VirtualEcu sits on the
+`doip_backend` ULA (`fd2e:646f:6970::/64`), the same IPv6 network as the frozen
+`echo_ecu` node, and nothing needs to reach it over IPv4 today.
+
+That changed into a real config option so the same binary also serves an
+IPv4-only in-vehicle network:
+
+| `listen.family` | Listener socket | Notes |
+|---|---|---|
+| `ipv6` (default) | `AF_INET6`, `IPV6_V6ONLY` on | only IPv6 |
+| `dual` | `AF_INET6`, `V6ONLY` off | accepts IPv4 and IPv6 (v4-mapped) |
+| `ipv4` | `AF_INET` | only IPv4; the default `host` `::` becomes `0.0.0.0` |
+
+`listen.discovery_family` (`ipv6` | `ipv4`) controls where startup Vehicle
+Announcements and Vehicle Identification handling listen/send. It defaults to
+follow `family` — `ipv4` when the listener is `ipv4`, `ipv6` otherwise — and
+only needs to be set explicitly to decouple the two (e.g. dual-stack TCP but
+IPv6 announcements). IPv4 discovery uses the limited-broadcast address
+(ISO 13400-2 DoIP-125), which requires `SO_BROADCAST`; there is no multicast
+group to join and no scope id. Replies to identification requests are always
+unicast to the requester regardless of family.
+
+---
+
+## Layout
+
+```
+virtual_ecu/
+├── main.py                  # `python3 main.py` shim; canonical is `python3 -m virtecu`
+├── config.yaml              # the annotated default config
+├── virtecu/
+│   ├── doip.py              # DoIP constants + frame helpers (ported from echo_ecu)
+│   ├── udp.py               # vehicle announcements
+│   ├── uds.py               # SIDs, NRCs, UdsRequest, NegativeResponse, NO_RESPONSE
+│   ├── plugin.py            # >>> the plugin API: decorators, Plugin, Context <<<
+│   ├── config.py            # typed YAML loader
+│   ├── store.py             # DID values (YAML defaults + runtime writes)
+│   ├── loader.py            # importlib discovery + error isolation
+│   ├── dispatcher.py        # the precedence ladder
+│   ├── services/            # the built-in UDS core
+│   ├── core.py              # EcuCore + SessionState
+│   ├── session.py           # the DoIP connection state machine
+│   └── server.py            # the TCP listener
+├── plugins/                 # your business logic lives here
+├── tools/uds_probe.py       # one-shot DoIP client
+└── tests/                   # pytest; no plugins needed beyond pytest itself
+```
+
+### Known duplication
+
+`virtecu/doip.py`, `session.py` and `server.py` are a port of `echo_ecu/echo_ecu.py`
+rather than a shared library. That is on purpose: each ECU is built as its own Docker
+image from its own single-directory build context, and sharing code would mean changing
+the echo node — which is meant to stay frozen and working.
+`tests/test_doip_parity.py` imports the real `echo_ecu.py` and asserts the framing is
+byte-identical, so the two cannot drift silently.
+
+Separately, `doip_edgenode/session.py:506` still carries its own copy of the old
+`_build_uds_response` for self-addressed diagnostics. Wiring that up to this dispatcher
+is a sensible follow-up, but it is out of scope here.

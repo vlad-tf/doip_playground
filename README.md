@@ -3,11 +3,11 @@
 A DoIP (ISO 13400-2) proxy that sits between a tester and an ECU so you can log,
 delay, drop, or corrupt diagnostic traffic in flight — without touching the tester
 or the ECU. This repo has four pieces: the **EdgeNode** (the proxy itself), two ECU
-simulators (**Echo ECU** — fixed canned answers, and **TestEcu** — real UDS with
+simulators (**Echo ECU** — fixed canned answers, and **VirtualEcu** — real UDS with
 pluggable business logic), and a **PC Tester** REPL for driving diagnostic sessions.
 
 ```
-PC Tester  ───►  EdgeNode  ───►  ECU (Echo ECU or TestEcu)
+PC Tester  ───►  EdgeNode  ───►  ECU (Echo ECU or VirtualEcu)
 ```
 
 There are two ways to run it. Docker is the fast path and is what most people
@@ -34,8 +34,8 @@ doip> diag 10 01
 Detach without killing the tester with `Ctrl-P Ctrl-Q`. Stop everything with
 `docker compose down`.
 
-That's the whole quick start. For the network topology, running TestEcu instead of
-(or alongside) the Echo ECU, loading your own TestEcu plugins, and attaching your
+That's the whole quick start. For the network topology, running VirtualEcu instead of
+(or alongside) the Echo ECU, loading your own VirtualEcu plugins, and attaching your
 own test project to the Docker networks, see **[`docker/README.md`](docker/README.md)**.
 
 ---
@@ -71,12 +71,12 @@ injection, troubleshooting) are in
 |---|---|---|---|
 | EdgeNode | `doip_edgenode/` | Implemented (PoC), Scapy-based | [`doip_edgenode/CLAUDE.md`](doip_edgenode/CLAUDE.md) |
 | Echo ECU | `echo_ecu/` | Frozen — fixed canned answers | [`echo_ecu/CLAUDE.md`](echo_ecu/CLAUDE.md) |
-| TestEcu | `test_ecu/` | Active — pluggable UDS logic | [`test_ecu/README.md`](test_ecu/README.md) |
+| VirtualEcu | `virtual_ecu/` | Active — pluggable UDS logic | [`virtual_ecu/README.md`](virtual_ecu/README.md) |
 | PC Tester | `pc_tester/` | Implemented (PoC) | [`pc_tester/CLAUDE.md`](pc_tester/CLAUDE.md) |
 
-**Echo ECU or TestEcu?** Echo ECU answers every UDS request with a canned echo and
+**Echo ECU or VirtualEcu?** Echo ECU answers every UDS request with a canned echo and
 one hardcoded VIN — use it when you just need something on the far end of the wire.
-TestEcu speaks real UDS (sessions, security access, negative response codes) and
+VirtualEcu speaks real UDS (sessions, security access, negative response codes) and
 lets you supply the business logic as YAML data identifiers, Python plugins, or
 both — use it when the tester under test actually cares what the ECU says.
 

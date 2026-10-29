@@ -11,7 +11,7 @@ picking a component.
 |---|---|---|---|
 | EdgeNode | `doip_edgenode/` | [`doip_edgenode/CLAUDE.md`](doip_edgenode/CLAUDE.md) | Implemented (PoC), Scapy-based |
 | Echo ECU | `echo_ecu/` | [`echo_ecu/CLAUDE.md`](echo_ecu/CLAUDE.md) | Frozen — do not modify casually |
-| TestEcu | `test_ecu/` | [`test_ecu/CLAUDE.md`](test_ecu/CLAUDE.md) | Active, actively extended |
+| VirtualEcu | `virtual_ecu/` | [`virtual_ecu/CLAUDE.md`](virtual_ecu/CLAUDE.md) | Active, actively extended |
 | PC Tester | `pc_tester/` | [`pc_tester/CLAUDE.md`](pc_tester/CLAUDE.md) | Implemented (PoC) |
 
 The full protocol/behaviour spec for the whole system is
@@ -23,39 +23,39 @@ The full protocol/behaviour spec for the whole system is
 
 ## Why per-component instructions, not one shared style
 
-EdgeNode and TestEcu were built at different times with different goals and
+EdgeNode and VirtualEcu were built at different times with different goals and
 **do not share a coding style on purpose**:
 
 - **EdgeNode** (`doip_edgenode/`) was generated from a single big implementation
   prompt (phase-by-phase, "build this from scratch"). It depends on Scapy for
   packet framing and TLS, and has its own docstring style.
-- **TestEcu** (`test_ecu/`) was built later as a hand-designed plugin
+- **VirtualEcu** (`virtual_ecu/`) was built later as a hand-designed plugin
   architecture (hook precedence ladder, typed config, zero dependencies
   beyond PyYAML, no Scapy). It is the style to imitate for **new**
   components in this repo.
-- **Echo ECU** (`echo_ecu/`) predates both and is deliberately frozen: TestEcu's
+- **Echo ECU** (`echo_ecu/`) predates both and is deliberately frozen: VirtualEcu's
   DoIP framing is a verified byte-for-byte port of it
-  (`test_ecu/tests/test_doip_parity.py`), so changing `echo_ecu/echo_ecu.py`
+  (`virtual_ecu/tests/test_doip_parity.py`), so changing `echo_ecu/echo_ecu.py`
   risks breaking that guarantee silently.
 
 **Rule of thumb:** when adding a new component or a substantial new module,
-follow the TestEcu conventions (typed config + `ConfigError`,
+follow the VirtualEcu conventions (typed config + `ConfigError`,
 dependency-light, precedence-ladder-style dispatch, README with a "Quick
 start"). When fixing a bug inside an existing component, match *that
-component's* existing style, not TestEcu's — do not silently reformat
-`doip_edgenode/` files to TestEcu conventions as a side effect of a bug fix.
+component's* existing style, not VirtualEcu's — do not silently reformat
+`doip_edgenode/` files to VirtualEcu conventions as a side effect of a bug fix.
 
 ---
 
 ## Cross-component invariants (do not break these silently)
 
 - **DoIP framing must round-trip identically across `echo_ecu/`,
-  `test_ecu/testecu/doip.py`, and `doip_edgenode/`**: version `0x02`/inverse
-  `0xFD`, 8-byte header, big-endian payload length. `test_ecu`'s parity test
-  is the only thing enforcing this for TestEcu vs Echo ECU — there is no
+  `virtual_ecu/virtecu/doip.py`, and `doip_edgenode/`**: version `0x02`/inverse
+  `0xFD`, 8-byte header, big-endian payload length. `virtual_ecu`'s parity test
+  is the only thing enforcing this for VirtualEcu vs Echo ECU — there is no
   equivalent check against `doip_edgenode/session.py`.
 - **Logical addresses / Docker network layout** are documented in
-  [`docker/README.md`](docker/README.md) — EchoNode is `0x0002`, TestEcu is
+  [`docker/README.md`](docker/README.md) — EchoNode is `0x0002`, VirtualEcu is
   `0x0003`, EdgeNode itself answers self-diagnostics as `0x1234` (`0x0000` is
   ISO/SAE reserved and must never be assigned to a node). If you add a new
   simulated ECU, give it its own logical address and update that table,
@@ -72,14 +72,14 @@ component's* existing style, not TestEcu's — do not silently reformat
 None of the four components use `pytest-asyncio`. Async tests are driven
 through a small `run(coro)` helper (new event loop, run to completion, drain
 stray tasks) defined once per test suite
-(`test_ecu/tests/conftest.py:run`, mirrored by `doip_edgenode/tests/test_middleware.py`).
+(`virtual_ecu/tests/conftest.py:run`, mirrored by `doip_edgenode/tests/test_middleware.py`).
 Keep using this pattern rather than adding `pytest-asyncio` as a dependency —
 it is a deliberate choice to keep `pip install pytest` sufficient.
 
 ## License headers — applies to all four components
 
 Every `.py` file in this repo (all of `doip_edgenode/`, `echo_ecu/`,
-`pc_tester/`, `test_ecu/`) carries the same Apache-2.0 header:
+`pc_tester/`, `virtual_ecu/`) carries the same Apache-2.0 header:
 
 ```python
 # Copyright 2026 Vladislav Vostrykh, Technica Engineering GmbH
@@ -98,7 +98,7 @@ Every `.py` file in this repo (all of `doip_edgenode/`, `echo_ecu/`,
 ```
 
 It goes at the very top of the file — before the module docstring in files
-that have one (e.g. `test_ecu/main.py` puts `#!/usr/bin/env python3` above
+that have one (e.g. `virtual_ecu/main.py` puts `#!/usr/bin/env python3` above
 even that). Add this header, verbatim, to every new `.py` file you create in
 any of the four components. This is a repo-wide rule, not a per-component
 one — none of the per-component `CLAUDE.md` files repeat it.

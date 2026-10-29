@@ -81,7 +81,7 @@ routing_table:
     ecu_sni:             ""
 
   - ecu_logical_addr:    0x0003
-    ecu_ipv6:            "fd2e:646f:6970::3"   # TestEcu static IPv6 on doip_backend
+    ecu_ipv6:            "fd2e:646f:6970::3"   # VirtualEcu static IPv6 on doip_backend
     ecu_interface:       "eth1"
     ecu_port_plain:      13400
     ecu_port_tls:        3496
