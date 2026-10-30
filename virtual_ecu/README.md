@@ -27,12 +27,19 @@ cd virtual_ecu
 python3 -m virtecu --config config.yaml --check
 
 # 2. Run it on IPv6 loopback.
-#    --no-udp is required on macOS: joining ff02::1 on lo0 fails, and there is no eth0.
+#    --no-udp keeps this loopback-only run from binding port 13400 and announcing
+#    on the real interfaces; on macOS joining ff02::1 on lo0 fails as well.
 python3 -m virtecu --config config.yaml --host ::1 --interface "" --no-udp --log-level DEBUG
 
 # 3. In another terminal, talk to it
 python3 tools/uds_probe.py --host ::1 --uds "22 F1 90"
 ```
+
+On Windows, pass the interface by index (from `Get-NetIPInterface`) instead of a
+name, e.g. `--interface 12`, to get UDP discovery — interface names there do not
+look like Linux's `eth0`. `--no-udp` is not needed for that; it is only used by
+the loopback recipe above. A failed UDP setup is non-fatal: it is logged and the
+TCP listener still comes up.
 
 ```
 routing activation -> 0x10 (success)
