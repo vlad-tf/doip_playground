@@ -29,6 +29,7 @@ import socket
 from typing import Optional
 
 from virtecu.core import EcuCore
+from virtecu.netutil import resolve_if_index
 from virtecu.session import EcuSession, SessionRegistry
 from virtecu.udp import run_announcer
 
@@ -70,13 +71,7 @@ class VirtualEcuServer:
             except (AttributeError, OSError):
                 pass  # not available everywhere
 
-        scope_id = 0
-        if listen.interface:
-            try:
-                scope_id = socket.if_nametoindex(listen.interface)
-            except OSError as exc:
-                logger.warning("Cannot get scope_id for interface %r: %s  (using 0)",
-                               listen.interface, exc)
+        scope_id = resolve_if_index(listen.interface, "TCP")
 
         # The sockaddr_in6 scope/zone field is meaningful for link-local and
         # multicast addresses. Global/ULA unicast addresses must use scope 0;

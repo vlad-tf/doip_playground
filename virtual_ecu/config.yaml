@@ -11,7 +11,10 @@ listen:
   host:      "::"       # bind to all IPv6 interfaces; set to "fe80::..." for link-local only
   port:      13400      # plain DoIP port (match the EdgeNode routing table)
   interface: "eth0"     # used for the multicast join, outgoing announcements,
-                        # and the IPv6 scope_id when binding a link-local address
+                        # and the IPv6 scope_id when binding a link-local address.
+                        # A bare number is taken as the interface index (ifIndex),
+                        # e.g. "12" -- on Windows use the value from
+                        # Get-NetIPInterface instead of a name.
   family:    "ipv6"     # TCP listener family: ipv6 | dual | ipv4 (see README)
                         #   dual = AF_INET6 without V6ONLY (also accepts IPv4)
                         #   ipv4 = AF_INET only; host default becomes 0.0.0.0

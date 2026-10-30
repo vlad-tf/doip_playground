@@ -30,6 +30,7 @@ import struct
 from typing import Any, Optional
 
 from virtecu.config import EcuConfig
+from virtecu.netutil import harden_udp_socket, resolve_if_index
 from virtecu.plugin import DoipContext, IdentificationRequest
 from virtecu.doip import (
     DOIP_MCAST_ADDR,
@@ -115,13 +116,18 @@ def _local_ips() -> set:
     /etc/hosts commonly maps a Linux box's hostname to ``127.0.1.1``, hiding
     the real LAN address — so the live interface addresses are enumerated via
     SIOCGIFADDR, with ``getaddrinfo`` kept as a best-effort fallback.
+
+    Windows has no ``fcntl``/``/proc``, so there only the ``getaddrinfo``
+    fallback applies and the set may miss some LAN addresses. That is
+    accepted: our own announcements are never NACKed (``_UDP_NEVER_NACK_TYPES``)
+    and the request types we would NACK are never self-sent.
     """
-    import fcntl
     import struct as _struct
 
     ips = {"127.0.0.1", "::1"}
     probe = None
     try:
+        import fcntl  # POSIX only; on Windows fall through to the fallbacks below
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for _index, name in socket.if_nameindex():
             try:
@@ -130,7 +136,7 @@ def _local_ips() -> set:
                 ips.add(socket.inet_ntoa(packed[20:24]))
             except OSError:
                 pass
-    except OSError:
+    except (OSError, ImportError):
         pass
     finally:
         if probe is not None:
@@ -431,15 +437,7 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
     port = config.listen.port
     discovery_family = config.listen.discovery_family
 
-    if_index = 0
-    if interface:
-        try:
-            if_index = socket.if_nametoindex(interface)
-        except OSError as exc:
-            logger.warning(
-                "UDP: cannot get if_index for %r: %s — multicast may not work",
-                interface, exc,
-            )
+    if_index = resolve_if_index(interface, "UDP")
 
     if discovery_family == "ipv4":
         # IPv4 discovery (ISO 13400-2 DoIP-125) uses the *limited broadcast*
@@ -456,6 +454,7 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         except OSError as exc:
             logger.warning("UDP: cannot enable SO_BROADCAST: %s", exc)
+        harden_udp_socket(sock)
         try:
             sock.bind(("0.0.0.0", port))
         except OSError as exc:
@@ -474,6 +473,18 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
         except (AttributeError, OSError):
             pass
 
+        harden_udp_socket(sock)
+
+        # Bind first, join second: Windows rejects IPV6_JOIN_GROUP on an
+        # unbound socket (WSAEINVAL), which silently disabled multicast
+        # discovery there. Linux accepts either order.
+        try:
+            sock.bind(("::", port, 0, 0))
+        except OSError as exc:
+            sock.close()
+            logger.warning("UDP: cannot bind [::]:%d: %s — announcements disabled", port, exc)
+            return
+
         try:
             mreq = socket.inet_pton(socket.AF_INET6, DOIP_MCAST_ADDR) + struct.pack("I", if_index)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
@@ -486,13 +497,6 @@ async def run_announcer(config: EcuConfig, registry: Optional[Any] = None,
                                 struct.pack("I", if_index))
             except OSError:
                 pass
-
-        try:
-            sock.bind(("::", port, 0, 0))
-        except OSError as exc:
-            sock.close()
-            logger.warning("UDP: cannot bind [::]:%d: %s — announcements disabled", port, exc)
-            return
         bind_text = "[::]"
 
     loop = asyncio.get_running_loop()

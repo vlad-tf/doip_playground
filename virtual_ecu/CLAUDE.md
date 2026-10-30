@@ -32,6 +32,7 @@ virtual_ecu/
 ├── virtecu/
 │   ├── doip.py               # DoIP constants + frame helpers (ported from echo_ecu — see below)
 │   ├── udp.py                 # vehicle announcements
+│   ├── netutil.py             # cross-platform socket helpers (ifIndex, Windows UDP reset)
 │   ├── uds.py                 # SIDs, NRCs, UdsRequest, NegativeResponse, NO_RESPONSE
 │   ├── plugin.py               # >>> the plugin API: decorators, Plugin, Context <<<
 │   ├── config.py               # typed YAML loader

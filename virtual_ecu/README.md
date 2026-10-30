@@ -404,6 +404,9 @@ IPv4-only in-vehicle network:
 | `dual` | `AF_INET6`, `V6ONLY` off | accepts IPv4 and IPv6 (v4-mapped) |
 | `ipv4` | `AF_INET` | only IPv4; the default `host` `::` becomes `0.0.0.0` |
 
+`listen.interface` is an interface name (`eth0`) or a bare interface index
+(`12`). On Windows prefer the index from `Get-NetIPInterface`; `0` means "any".
+
 `listen.discovery_family` (`ipv6` | `ipv4`) controls where startup Vehicle
 Announcements and Vehicle Identification handling listen/send. It defaults to
 follow `family` — `ipv4` when the listener is `ipv4`, `ipv6` otherwise — and
