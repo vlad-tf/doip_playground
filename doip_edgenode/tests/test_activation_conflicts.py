@@ -142,11 +142,11 @@ def test_overlapping_probes_keep_their_own_event(cancel_first):
                 with pytest.raises(asyncio.CancelledError):
                     await tasks[0]
             else:
-                await owner._handle_alive_check_response()
+                await owner._dispatch(owner._dissect(owner._build_frame(0x0008, b"\x0e\x00")))
                 assert await asyncio.wait_for(tasks[0], 1)
             await asyncio.wait_for(sent.get(), 1)
             assert owner._alive_probe_event is not event
-            await owner._handle_alive_check_response()
+            await owner._dispatch(owner._dissect(owner._build_frame(0x0008, b"\x0e\x00")))
             assert await asyncio.wait_for(tasks[1], 1)
             assert not owner._alive_probe_pending
             assert owner._alive_probe_event is None
@@ -319,7 +319,7 @@ def test_probe_send_failure_clears_state_for_retry():
             owner._send_raw = send
             tasks.append(asyncio.create_task(owner.probe_alive(1)))
             await asyncio.wait_for(sent.wait(), 1)
-            await owner._handle_alive_check_response()
+            await owner._dispatch(owner._dissect(owner._build_frame(0x0008, b"\x0e\x00")))
             assert await asyncio.wait_for(tasks[0], 1) is True
         finally:
             await finish(tasks, sessions)

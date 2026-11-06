@@ -30,7 +30,7 @@ Interactive commands:
                                  (ecu_logical_addr) used by 'diag', e.g.
                                  'target 0x0002'. No arg shows the current
                                  target. Takes effect immediately, no restart.
-    alive                        Send Alive Check Request
+    alive                        Send one-way Alive Check Response keepalive
     status                       Send Entity Status Request
     power                        Send Power Mode Info Request
     help                         Show this list
@@ -301,7 +301,9 @@ class DoIPTester:
                 pt = _ptype(raw)
 
                 if pt == PT_ALIVE_CHECK_REQUEST:
-                    # ISO 13400-2: reply with our tester logical address
+                    if _plen(raw) != 0:
+                        raise ValueError("Alive Check Request payload must be empty")
+                    # Reply with the tester SA registered on this connection.
                     logger.debug(
                         "background: received Alive Check Request — replying"
                     )
@@ -437,6 +439,7 @@ class DoIPTester:
         pt = _ptype(resp)
         p = _payload(resp)
         if pt == PT_ROUTING_ACT_RESPONSE and len(p) >= 5 and p[4] == 0x10:
+            self.tester_addr = addr
             self.activated = True
             return True
         return False
@@ -479,13 +482,13 @@ class DoIPTester:
         print(f"  Diagnostic target changed: 0x{old_addr:04X} → 0x{new_addr:04X}")
 
     async def cmd_alive(self) -> None:
-        # Alive Check Request has no payload (0x0007); the EdgeNode replies
-        # with Alive Check Response (0x0008) + its own logical address (2 bytes).
-        raw = _build(PT_ALIVE_CHECK_REQUEST, b"")
-        print("  → Alive Check Request")
-        await self._send(raw)
-        resp = await self._recv()
-        self._print_response(resp)
+        """Keep the registered connection alive without requesting a reply."""
+        if not self.activated:
+            print("  ! Not activated. Run 'activate' first.")
+            return
+        payload = struct.pack("!H", self.tester_addr)
+        await self._send(_build(PT_ALIVE_CHECK_RESPONSE, payload))
+        print(f"  → Alive Check Response  src=0x{self.tester_addr:04X}  (keepalive)")
 
     async def cmd_status(self) -> None:
         raw = _build(PT_ENTITY_STATUS_REQUEST, b"")
@@ -512,7 +515,7 @@ Commands:
   diag <hex bytes>       Diagnostic Message  e.g. 'diag 10 01' or 'diag 1001'
   target [addr_hex]      Show, or change, the diag target address used by
                           'diag' (e.g. 'target 0x0002'). No arg shows current.
-  alive                  Alive Check Request
+  alive                  Send Alive Check Response keepalive (no reply expected)
   status                 Entity Status Request
   power                  Power Mode Info Request
   help                   Show this help

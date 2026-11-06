@@ -273,9 +273,9 @@ class ECUConnection:
             ptype = struct.unpack("!H", raw[2:4])[0]
 
             if ptype == _PT_ALIVE_CHECK_REQ:
-                # ECU is checking we're alive before responding — answer it
-                logger.debug("ECUConnection: received Alive Check Request from ECU, responding")
-                await self.send(_build_doip_frame(_PT_ALIVE_CHECK_RESP, b""))
+                # Compatibility: some ECUs probe before returning the RA result.
+                logger.debug("ECUConnection: received early Alive Check Request")
+                await self._send_alive_check_response(tester_logical_addr)
                 continue
 
             if ptype != _PT_RA_RESPONSE:
@@ -308,6 +308,10 @@ class ECUConnection:
 
         raise RuntimeError("ECUConnection: no Routing Activation Response received from ECU")
 
+    async def _send_alive_check_response(self, tester_addr: int) -> None:
+        """Use the client identity for both early and registered ECU probes."""
+        await self.send(_build_doip_frame(_PT_ALIVE_CHECK_RESP, struct.pack("!H", tester_addr)))
+
     async def _background_reader(self) -> None:
         """
         Continuously read frames from the ECU after routing activation.
@@ -329,8 +333,7 @@ class ECUConnection:
                     logger.debug(
                         "ECUConnection: received Alive Check Request from ECU — replying"
                     )
-                    payload = struct.pack("!H", self._tester_logical_addr)
-                    await self.send(_build_doip_frame(_PT_ALIVE_CHECK_RESP, payload))
+                    await self._send_alive_check_response(self._tester_logical_addr)
                 else:
                     await self._recv_queue.put(raw)
 

@@ -54,8 +54,8 @@ Tester (PC) ──[IPv4 · eth0]──► RPi EdgeNode ──[IPv6 · eth1]─�
 | DoIP Header NACK | `0x0000` | EdgeNode → Tester | Send on malformed/unknown header |
 | Routing Activation Request | `0x0005` | Tester → EdgeNode | Parse, validate, respond |
 | Routing Activation Response | `0x0006` | EdgeNode → Tester | Generate (see response codes below) |
-| Alive Check Request | `0x0007` | Either direction | Respond immediately |
-| Alive Check Response | `0x0008` | Either direction | Generate |
+| Alive Check Request | `0x0007` | EdgeNode → Tester | Probe registered tester connections; empty payload |
+| Alive Check Response | `0x0008` | Tester → EdgeNode | Accept two-byte registered tester SA; matching pending probe completes, unsolicited valid response is a keepalive |
 | Diagnostic Message | `0x8001` | Bidirectional | Intercept, route, forward |
 | Diagnostic Message Positive ACK | `0x8002` | ECU → Tester | Relay |
 | Diagnostic Message Negative ACK | `0x8003` | ECU → Tester | Relay |
@@ -222,7 +222,7 @@ main()
    c. Pass through `MiddlewareChain`
    d. If not dropped: rewrite addresses per routing table, forward to ECU
    e. Relay ECU response back through middleware, back to tester
-7. Alive Check Request (0x0007) received at any time: respond immediately with `0x0008`; reset `T_TCP_General_Inactivity` timer
+7. Alive checks on the tester-facing leg: send empty `0x0007` requests only to registered connections. Accept `0x0008` responses containing exactly the registered tester SA (two bytes); a matching response completes an outstanding probe. A valid unsolicited response is a one-way client keepalive and resets `T_TCP_General_Inactivity` without generating a reply or creating probe state. Ignore alive traffic before activation and do not reply to tester-originated requests. On the ECU-facing leg, EdgeNode acts as client and answers ECU probes with that connection's tester/client SA.
 8. On `T_TCP_General_Inactivity` expiry, tester disconnect, or ECU disconnect: tear down session, log reason, accept new connections
 
 ### Inactivity timers

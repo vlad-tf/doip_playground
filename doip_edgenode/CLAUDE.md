@@ -196,14 +196,19 @@ sufficient; a previous bug silently returned the *previous* request's queued
 response instead of the current one because only one `recv()` was performed
 per diagnostic request.
 
-### Alive Check Response payload
+### Alive Check roles and payload
 
-Both `_handle_alive_check()` (self.config.doip.node_logical_addr for the
-tester-facing leg) and the ECU-facing Alive Check auto-reply in
-`ecu_client.py`'s background reader must send the **2-byte logical address of
-the responder** as the payload (ISO 13400-2 Table 22) — never an empty
-payload. An empty Alive Check Response payload was a real bug found via
-Wireshark (`Length: 0` where `Length: 2` was expected).
+On the tester-facing leg, EdgeNode sends empty Alive Check Requests to
+registered clients. The tester's Alive Check Response contains its **2-byte
+registered tester SA**, not EdgeNode's node address. Only a matching response
+to an outstanding probe completes that probe. A valid unsolicited response
+is a client keepalive and does not create probe state. Alive traffic before
+routing activation is ignored; tester-originated requests receive no reply.
+
+On the ECU-facing leg, EdgeNode is the client. Both the early routing-activation
+compatibility reply and the background reader's reply in `ecu_client.py` use
+the two-byte tester/client SA requested for that ECU connection. Never send
+an empty response or substitute the ECU or EdgeNode node address.
 
 ### Scapy-specific pitfalls
 
@@ -255,8 +260,9 @@ failures · `CRITICAL` unhandled exceptions.
 
 `node_logical_addr` (EdgeNode's own logical address) is optional and
 defaults to `0x1234` if absent — it is used both in UDP Vehicle Announcements
-and as the source address in Routing Activation Responses / Alive Check
-Responses / self-diagnostic replies. `0x0000` is ISO/SAE reserved (ISO
+and as the source address in Routing Activation Responses and self-diagnostic
+replies. Alive Check Responses instead identify the registered tester/client
+SA. `0x0000` is ISO/SAE reserved (ISO
 13400-2) and rejected by `load_config()`, so if a Wireshark capture shows
 `0x0000` as the EdgeNode's source address, check this config value before
 assuming a code bug.

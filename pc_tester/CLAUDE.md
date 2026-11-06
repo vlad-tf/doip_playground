@@ -39,10 +39,11 @@ See `../CLAUDE.md` for why this differs from `virtual_ecu/`.
   `doip_edgenode/CLAUDE.md`'s SA-conflict section), and if nothing is reading
   the socket while the REPL waits on `input()`, the probe times out and the
   EdgeNode wrongly evicts this (still-alive) session.
-- Alive Check Response payload (both the auto-reply above and `cmd_alive`'s
-  expected response) carries a 2-byte logical address, per ISO 13400-2 Table
-  22 — `_print_response` decodes and displays it; don't treat it as an empty
-  payload.
+- `alive` sends a one-way Alive Check Response keepalive only after successful
+  routing activation; it does not send an Alive Check Request or wait for a
+  reply. Its payload and automatic probe replies both contain the two-byte
+  tester SA registered on this connection. A successful `activate <addr>`
+  updates that SA; a rejected activation must not change it.
 
 ## What you must not do
 

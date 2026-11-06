@@ -439,13 +439,14 @@ doip> status
        node_type=0x01  max_sockets=1  open=1  max_data=4096
 ```
 
-**Alive check**
+**Keep the registered connection alive**
 ```
 doip> alive
-  → Alive Check Request
-  ← Alive Check Response
-       (alive)
+  → Alive Check Response  src=0x0E00  (keepalive)
 ```
+
+This sends a one-way client keepalive; no reply is expected. Vehicle-originated
+Alive Check Requests are answered automatically by the tester's background reader.
 
 **Quit**
 ```
