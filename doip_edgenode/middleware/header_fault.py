@@ -43,7 +43,7 @@ import copy
 import logging
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _bounded_int
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -77,9 +77,11 @@ class HeaderFaultMiddleware(Middleware):
                 f"HeaderFaultMiddleware: unknown fault mode {fault!r}. "
                 f"Valid modes: {sorted(FAULT_MODES)}"
             )
+        if direction not in ("tester_to_ecu", "ecu_to_tester", "both"):
+            raise ValueError(f"HeaderFaultMiddleware.direction is invalid: {direction!r}")
         self.fault = fault
-        self.direction = direction  # "tester_to_ecu" | "ecu_to_tester" | "both"
-        self.inject_on_nth = int(inject_on_nth)
+        self.direction = direction
+        self.inject_on_nth = _bounded_int(inject_on_nth, "inject_on_nth", 1)
         self._counter = 0
 
     def _should_inject(self, direction: str) -> bool:

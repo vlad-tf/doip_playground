@@ -30,7 +30,7 @@ import logging
 import random
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _bounded_int
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 
 class DelayMiddleware(Middleware):
     def __init__(self, delay_ms: int = 0, jitter_ms: int = 0, **_) -> None:
-        self.delay_ms = int(delay_ms)
-        self.jitter_ms = int(jitter_ms)
+        self.delay_ms = _bounded_int(delay_ms, "delay_ms", 0)
+        self.jitter_ms = _bounded_int(jitter_ms, "jitter_ms", 0)
 
     async def process(
         self,

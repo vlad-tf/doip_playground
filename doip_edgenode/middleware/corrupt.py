@@ -31,7 +31,7 @@ import logging
 import random
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _bounded_int
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -48,8 +48,10 @@ class CorruptMiddleware(Middleware):
         flip_mask: int = 0x01,
         **_,
     ) -> None:
-        self.byte_offset = byte_offset
-        self.flip_mask = int(flip_mask)
+        self.byte_offset = (
+            _bounded_int(byte_offset, "byte_offset", 0) if byte_offset is not None else None
+        )
+        self.flip_mask = _bounded_int(flip_mask, "flip_mask", 0, 0xFF)
 
     async def process(
         self,

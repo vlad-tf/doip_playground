@@ -46,6 +46,25 @@ class DoIPFaultInjectionError(Exception):
         super().__init__(message)
 
 
+def _bounded_int(value, name: str, minimum: int, maximum: int | None = None) -> int:
+    """Validate integer middleware settings without truncating floats/booleans."""
+    if type(value) is int:
+        result = value
+    elif isinstance(value, str):
+        try:
+            text = value.strip()
+            base = 16 if text.lstrip("+-").lower().startswith("0x") else 10
+            result = int(text, base)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer; got {value!r}") from exc
+    else:
+        raise ValueError(f"{name} must be an integer; got {value!r}")
+    if result < minimum or (maximum is not None and result > maximum):
+        bounds = f"[{minimum}, {maximum}]" if maximum is not None else f">= {minimum}"
+        raise ValueError(f"{name} must be {bounds}; got {value!r}")
+    return result
+
+
 class Middleware:
     """Base middleware.  Override process() in subclasses."""
 

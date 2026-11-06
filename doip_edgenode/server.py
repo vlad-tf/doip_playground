@@ -33,7 +33,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from config import AppConfig, MiddlewareConfig
+from config import AppConfig, ConfigError, MiddlewareConfig
 from routing import RoutingTable
 from middleware import Middleware, MiddlewareChain
 from session import DoIPSession
@@ -97,8 +97,7 @@ def _build_middleware(mw_configs: list[MiddlewareConfig]) -> list[Middleware]:
     for mw in mw_configs:
         cls = _CLASS_MAP.get(mw.type)
         if cls is None:
-            logger.warning("server: unknown middleware type %r — skipping", mw.type)
-            continue
+            raise ConfigError(f"middleware: unknown type {mw.type!r}")
         obj = cls(**mw.params)
         obj.enabled = mw.enabled
         instances.append(obj)

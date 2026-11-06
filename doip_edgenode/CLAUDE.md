@@ -84,6 +84,15 @@ doip_edgenode/
   across sessions. Replay buffers and header-fault counters reset on reconnect;
   both directions of a connection use its same chain. Logger output can share
   the path-scoped process logger, which sessions must not close.
+- Middleware parameter bounds: corrupt offsets are nonnegative or `None`, XOR
+  masks are `0..255`, address overrides are `0..65535` or `None`, and delay/jitter
+  are nonnegative integer milliseconds. Numeric strings (decimal or `0x`) are
+  accepted; booleans/floats are not integers. Reserved addresses remain available
+  for deliberate fault injection. Unknown middleware types are configuration
+  errors even when disabled; do not silently skip them.
+- When adding middleware, update both `config.py`'s `_VALID_MIDDLEWARE_TYPES`
+  and `server.py`'s `_CLASS_MAP`; loader validation and factory support must
+  agree without instantiating middleware during configuration loading.
 - Middleware constructors run once for startup validation and again for each
   accepted connection. Limit them to parameter validation and local state
   initialization: no background tasks, sockets, or per-instance file handles.

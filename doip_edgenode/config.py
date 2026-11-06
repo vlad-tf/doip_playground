@@ -379,6 +379,10 @@ def _load_routing_table(raw_list: list, network: NetworkConfig) -> list[RoutingE
     return entries
 
 
+_VALID_MIDDLEWARE_TYPES = {
+    "LoggerMiddleware", "DropMiddleware", "DelayMiddleware", "CorruptMiddleware",
+    "ReplayMiddleware", "AddressMiddleware", "HeaderFaultMiddleware", "TLSFaultMiddleware",
+}
 _VALID_HEADER_FAULTS = {"wrong_version", "bad_inverse", "bad_length", "unknown_type"}
 
 
@@ -386,8 +390,27 @@ def _load_middleware(raw_list: list) -> list[MiddlewareConfig]:
     result = []
     for i, raw in enumerate(raw_list):
         mw_type = str(_require(raw, "type", f"middleware[{i}]"))
+        if mw_type not in _VALID_MIDDLEWARE_TYPES:
+            raise ConfigError(f"middleware[{i}].type: unknown middleware type {mw_type!r}")
         enabled = bool(raw.get("enabled", True))
         params = {k: v for k, v in raw.items() if k not in ("type", "enabled")}
+
+        # Use the same bounds as direct middleware construction, without
+        # instantiating middleware or opening the logger's sink during loading.
+        from middleware import _bounded_int
+        integer_fields = {
+            "CorruptMiddleware": (("byte_offset", 0, None, True), ("flip_mask", 0, 0xFF, False)),
+            "AddressMiddleware": (("src_override", 0, 0xFFFF, True), ("tgt_override", 0, 0xFFFF, True)),
+            "DelayMiddleware": (("delay_ms", 0, None, False), ("jitter_ms", 0, None, False)),
+            "HeaderFaultMiddleware": (("inject_on_nth", 1, None, False),),
+        }
+        for name, minimum, maximum, optional in integer_fields.get(mw_type, ()):
+            if name not in params or (optional and params[name] is None):
+                continue
+            try:
+                params[name] = _bounded_int(params[name], name, minimum, maximum)
+            except ValueError as exc:
+                raise ConfigError(f"middleware[{i}] {mw_type}: {exc}") from exc
 
         # Validate per-type params
         if mw_type == "DropMiddleware":
@@ -398,16 +421,16 @@ def _load_middleware(raw_list: list) -> list[MiddlewareConfig]:
                     f"got {rate!r}"
                 )
         if mw_type == "HeaderFaultMiddleware":
-            fault = params.get("fault", "")
+            fault = params.get("fault", "wrong_version")
             if fault not in _VALID_HEADER_FAULTS:
                 raise ConfigError(
                     f"middleware[{i}] HeaderFaultMiddleware.fault must be one of "
                     f"{sorted(_VALID_HEADER_FAULTS)}; got {fault!r}"
                 )
-            nth = params.get("inject_on_nth", 1)
-            if int(nth) < 1:
+            direction = params.get("direction", "tester_to_ecu")
+            if direction not in ("tester_to_ecu", "ecu_to_tester", "both"):
                 raise ConfigError(
-                    f"middleware[{i}] HeaderFaultMiddleware.inject_on_nth must be >= 1"
+                    f"middleware[{i}] HeaderFaultMiddleware.direction is invalid: {direction!r}"
                 )
 
         result.append(MiddlewareConfig(type=mw_type, enabled=enabled, params=params))

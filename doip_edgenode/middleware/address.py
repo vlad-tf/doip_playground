@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _bounded_int
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -60,8 +60,14 @@ class AddressMiddleware(Middleware):
         tgt_override: int | None = None,
         **_,
     ) -> None:
-        self.src_override = int(src_override) if src_override is not None else None
-        self.tgt_override = int(tgt_override) if tgt_override is not None else None
+        self.src_override = (
+            _bounded_int(src_override, "src_override", 0, 0xFFFF)
+            if src_override is not None else None
+        )
+        self.tgt_override = (
+            _bounded_int(tgt_override, "tgt_override", 0, 0xFFFF)
+            if tgt_override is not None else None
+        )
 
     async def process(
         self,
