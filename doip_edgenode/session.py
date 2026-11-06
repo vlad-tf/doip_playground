@@ -1025,19 +1025,19 @@ class DoIPSession:
         await self._send_raw(self._build_frame(PT_ROUTING_ACTIVATION_RESPONSE, payload))
 
     async def _send_diag_nack(self, nack_code: int, request: bytes) -> None:
-        """Send a local NACK from EdgeNode to the diagnostic request's SA.
+        """Send a local NACK with the original request's addresses swapped.
 
         Keep the original request context, including before activation or SA
         rejection. Optional previous-message data is omitted (five-byte payload).
-        ECU-generated NACKs are relayed separately and keep their ECU address.
+        ECU-generated NACKs are relayed separately without address rewriting.
         """
-        if len(request) < 10:
-            # There is no complete tester address to acknowledge. Complete
+        if len(request) < 12:
+            # Both request addresses are needed to build the response. Complete
             # payload-shape validation belongs to the framing layer (F15).
             await self._send_header_nack(0x04)  # invalid payload length
-            raise DoIPProtocolError("diagnostic request lacks a source address")
+            raise DoIPProtocolError("diagnostic request lacks complete addresses")
         payload = (
-            self.config.doip.node_logical_addr.to_bytes(2, "big")
+            request[10:12]
             + request[8:10]
             + bytes([nack_code])
         )

@@ -183,7 +183,7 @@ def test_disconnect_during_exchange_is_prompt_and_next_request_reconnects(prefix
             if prefix:
                 assert writer.frames == prefix
             else:
-                assert writer.frames[-1][8:] == b"\x12\x34\x0e\x00\x06"
+                assert writer.frames[-1][8:] == b"\x00\x01\x0e\x00\x06"
             assert 1 not in session._ecu_conns
             assert not session._ecu_read_tasks
             assert not old._connected
@@ -304,7 +304,7 @@ def test_reconnect_failure_does_not_retain_dead_cache():
                 await exchange(session)
                 connect.assert_awaited_once()
             assert 1 not in session._ecu_conns
-            assert writer.frames[-1][8:] == b"\x12\x34\x0e\x00\x06"
+            assert writer.frames[-1][8:] == b"\x00\x01\x0e\x00\x06"
             assert not writer.closed
             assert old._writer.closed
         finally:

@@ -100,7 +100,7 @@ def test_missing_first_ack_is_bounded_and_reports_unreachable():
         session, writer = await setup(ecu)
         try:
             await exchange(session)
-            assert writer.frames[-1][8:] == b"\x12\x34\x0e\x00\x06"
+            assert writer.frames[-1][8:] == b"\x00\x01\x0e\x00\x06"
             assert_retired(session, ecu)
             assert not writer.closed
         finally:
@@ -133,7 +133,7 @@ def test_transport_errors_retire_stream_and_report_unreachable(phase):
         try:
             await exchange(session)
             if phase != "followup":
-                assert writer.frames[-1][8:] == b"\x12\x34\x0e\x00\x06"
+                assert writer.frames[-1][8:] == b"\x00\x01\x0e\x00\x06"
             else:
                 assert writer.frames == [ACK]
             assert_retired(session, ecu)
@@ -346,7 +346,7 @@ def test_blocked_send_is_bounded_by_exchange_budget():
         ecu.send = AsyncMock(side_effect=blocked_send)
         try:
             await exchange(session)
-            assert writer.frames[-1][8:] == b"\x12\x34\x0e\x00\x06"
+            assert writer.frames[-1][8:] == b"\x00\x01\x0e\x00\x06"
             assert_retired(session, ecu)
         finally:
             await session._cleanup()
