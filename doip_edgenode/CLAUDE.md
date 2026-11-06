@@ -80,6 +80,16 @@ doip_edgenode/
   None`; returning `None` stops the chain (packet dropped).
   `DoIPFaultInjectionError` lets a middleware inject a synthetic NACK instead
   of forwarding.
+- Middleware instances are owned by one accepted TCP connection, not shared
+  across sessions. Replay buffers and header-fault counters reset on reconnect;
+  both directions of a connection use its same chain. Logger output can share
+  the path-scoped process logger, which sessions must not close.
+- Middleware constructors run once for startup validation and again for each
+  accepted connection. Limit them to parameter validation and local state
+  initialization: no background tasks, sockets, or per-instance file handles.
+  The intentionally reused path-scoped logger is the exception. Middleware
+  needing owned external resources requires an explicit lifecycle design
+  before being added to this construction path.
 
 ### asyncio patterns
 

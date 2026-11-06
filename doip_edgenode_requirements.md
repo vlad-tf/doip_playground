@@ -259,6 +259,13 @@ routing_table:
 
 The middleware chain is the **primary hook point for DoIP fault injection and testing**. It operates on **decrypted DoIP frames** — after TLS termination, before re-encryption toward the ECU.
 
+Each accepted TCP connection owns fresh middleware instances. Replay recordings,
+one-shot replay state, and header-fault cadence are local to that connection
+and reset on reconnect; traffic from one tester must never be replayed through
+another tester's session. Both directions of one connection use its same chain.
+Logger output may share the configured process-wide log sink; session-local
+middleware must not close that shared sink.
+
 ### Interface
 
 ```python

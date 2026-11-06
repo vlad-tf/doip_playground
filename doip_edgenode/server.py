@@ -115,9 +115,9 @@ class DoIPServer:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._routing_table = RoutingTable(config.routing_table)
-        self._middleware_chain = MiddlewareChain(
-            _build_middleware(config.middleware)
-        )
+        # Keep constructor/configuration errors at startup, but never share
+        # these mutable instances with sessions. Log sinks remain path-scoped.
+        _build_middleware(config.middleware)
         self._executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="doip-tls"
         )
@@ -179,12 +179,25 @@ class DoIPServer:
             if not tls_ok:
                 return
 
+        try:
+            middleware_chain = MiddlewareChain(
+                _build_middleware(self._config.middleware)
+            )
+        except Exception:
+            logger.exception("DoIPServer: middleware setup failed for %s", peer)
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except Exception:
+                logger.debug("DoIPServer: writer cleanup failed for %s", peer, exc_info=True)
+            return
+
         session = DoIPSession(
             reader=reader,
             writer=writer,
             config=self._config,
             routing_table=self._routing_table,
-            middleware_chain=self._middleware_chain,
+            middleware_chain=middleware_chain,
             loop=self._loop,
             executor=self._executor,
             registry=self._registry,
