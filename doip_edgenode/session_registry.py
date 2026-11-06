@@ -27,12 +27,15 @@ to accept or deny the new one.
                                 registered on a different socket)
   - Old connection times out  → evict old, accept new with response code 0x10
 
-All access is from the asyncio event loop; no locking is needed.
+All access is from the asyncio event loop. Per-address asyncio locks serialize
+activation decisions across alive-probe awaits; no thread locks are needed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -52,6 +55,23 @@ class SessionRegistry:
 
     def __init__(self) -> None:
         self._sessions: dict[int, "DoIPSession"] = {}
+        self._activation_locks: dict[int, tuple[asyncio.Lock, int]] = {}
+
+    @asynccontextmanager
+    async def activation_lock(self, logical_addr: int):
+        """Serialize contenders for one SA without blocking unrelated addresses."""
+        lock, users = self._activation_locks.get(logical_addr, (asyncio.Lock(), 0))
+        self._activation_locks[logical_addr] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            # Count holders and waiters so cancellation cannot split a live lock.
+            _, users = self._activation_locks[logical_addr]
+            if users == 1:
+                del self._activation_locks[logical_addr]
+            else:
+                self._activation_locks[logical_addr] = (lock, users - 1)
 
     def register(self, logical_addr: int, session: "DoIPSession") -> None:
         self._sessions[logical_addr] = session

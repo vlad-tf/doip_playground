@@ -163,6 +163,8 @@ class DoIPSession:
         # Alive Check probe support (used when a competing session checks us)
         self._alive_probe_pending: bool = False
         self._alive_probe_event: asyncio.Event | None = None
+        self._alive_probe_lock = asyncio.Lock()
+        self._closing = False
 
     @property
     def peer(self):
@@ -381,48 +383,44 @@ class DoIPSession:
             await self._send_routing_activation_response(0x06, src_addr)
             raise DoIPProtocolError("unsupported routing activation type")
 
-        # --- SA conflict check (ISO 13400-2 §9.3) ----------------------------
-        if self._registry is not None:
-            existing = self._registry.lookup(src_addr)
-            if existing is not None and existing is not self:
-                logger.info(
-                    "DoIPSession: SA 0x%04X already registered on %s — "
-                    "probing that session with Alive Check",
-                    src_addr, existing.peer,
-                )
-                alive = await existing.probe_alive(_ALIVE_PROBE_TIMEOUT_S)
-                if alive:
-                    logger.info(
-                        "DoIPSession: existing session %s responded — "
-                        "denying new connection %s (code 0x03)",
-                        existing.peer, self._peer,
-                    )
-                    await self._send_routing_activation_response(0x03, src_addr)
-                    raise DoIPProtocolError(
-                        "SA already registered on another active socket"
-                    )
-                else:
-                    logger.info(
-                        "DoIPSession: existing session %s did not respond — "
-                        "evicting it and accepting new connection %s",
-                        existing.peer, self._peer,
-                    )
-                    existing.evict()  # synchronous — no CancelledError propagation
+        if self._registry is None:
+            await self._activate_with_conflict_check(src_addr, activation_type)
+        else:
+            async with self._registry.activation_lock(src_addr):
+                await self._activate_with_conflict_check(src_addr, activation_type)
 
-        # ---------------------------------------------------------------------
+    async def _activate_with_conflict_check(self, src_addr: int, activation_type: int) -> None:
+        """Resolve and commit activation while holding the registry's SA lock."""
+        while self._registry is not None:
+            if self._closing:
+                raise DoIPProtocolError("session closed during routing activation")
+            existing = self._registry.lookup(src_addr)
+            if existing is None or existing is self:
+                break
+            alive = await existing.probe_alive(_ALIVE_PROBE_TIMEOUT_S)
+            if self._closing:
+                raise DoIPProtocolError("session closed during routing activation")
+            # Cleanup/eviction does not take the activation lock. Never use a
+            # probe result for an owner that changed while we were awaiting it.
+            if self._registry.lookup(src_addr) is not existing:
+                continue
+            if alive:
+                await self._send_routing_activation_response(0x03, src_addr)
+                raise DoIPProtocolError("SA already registered on another active socket")
+            existing.evict()  # synchronous — no CancelledError propagation
+
+        if self._closing:
+            raise DoIPProtocolError("session closed during routing activation")
         self.tester_logical_addr = src_addr
         self.activated = True
-
         if self._registry is not None:
             self._registry.register(src_addr, self)
-
         await self._send_routing_activation_response(0x10, src_addr)
-
+        if self._closing:
+            raise DoIPProtocolError("session closed during routing activation")
         logger.info(
             "DoIPSession: activated tester 0x%04X type=0x%02X from %s",
-            src_addr,
-            activation_type,
-            self._peer,
+            src_addr, activation_type, self._peer,
         )
         # Same-SA reactivation is valid, but must replace the existing timer.
         self._reset_inactivity_timer()
@@ -465,6 +463,13 @@ class DoIPSession:
         Returns True  — tester responded; this session is active.
         Returns False — tester did not respond within timeout; consider dead.
         """
+        # Serialize direct callers too: one probe owns the event and its cleanup.
+        async with self._alive_probe_lock:
+            return await self._probe_alive_once(timeout)
+
+    async def _probe_alive_once(self, timeout: float) -> bool:
+        if self._closing:
+            return False
         self._alive_probe_event = asyncio.Event()
         self._alive_probe_pending = True
         try:
@@ -476,7 +481,7 @@ class DoIPSession:
                 await asyncio.wait_for(
                     self._alive_probe_event.wait(), timeout=timeout
                 )
-                return True
+                return not self._closing
             except asyncio.TimeoutError:
                 logger.debug(
                     "DoIPSession: Alive Check probe timed out for %s", self._peer
@@ -511,6 +516,9 @@ class DoIPSession:
           on its next read).  The old session's run() finally block then
           calls _cleanup() in its own context — no cross-session awaiting.
         """
+        self._closing = True
+        if self._alive_probe_event is not None:
+            self._alive_probe_event.set()
         if self._initial_timer_task and not self._initial_timer_task.done():
             self._initial_timer_task.cancel()
         if self._inactivity_task and not self._inactivity_task.done():
@@ -1019,6 +1027,9 @@ class DoIPSession:
 
     async def _cleanup(self) -> None:
         """Tear down the session: cancel timers, close all ECU conns, close tester socket."""
+        self._closing = True
+        if self._alive_probe_event is not None:
+            self._alive_probe_event.set()
         if self._initial_timer_task and not self._initial_timer_task.done():
             self._initial_timer_task.cancel()
         if self._inactivity_task and not self._inactivity_task.done():
