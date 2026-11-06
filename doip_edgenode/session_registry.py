@@ -61,9 +61,12 @@ class SessionRegistry:
             session.peer,
         )
 
-    def unregister(self, logical_addr: int) -> None:
-        removed = self._sessions.pop(logical_addr, None)
-        if removed is not None:
+    def unregister(self, logical_addr: int, session: "DoIPSession") -> None:
+        """Remove an address only while it is still owned by this session."""
+        # An evicted session can finish cleanup after a replacement registers.
+        # Identity checking and removal are synchronous on the event loop.
+        if self._sessions.get(logical_addr) is session:
+            del self._sessions[logical_addr]
             logger.debug("SessionRegistry: unregistered SA=0x%04X", logical_addr)
 
     def lookup(self, logical_addr: int) -> "DoIPSession | None":

@@ -522,7 +522,7 @@ class DoIPSession:
         # Unregister immediately so the registry is clean before the new
         # session registers itself.
         if self._registry is not None and self.tester_logical_addr is not None:
-            self._registry.unregister(self.tester_logical_addr)
+            self._registry.unregister(self.tester_logical_addr, self)
         logger.info(
             "DoIPSession: evicted session for %s (SA=0x%04X)",
             self._peer, self.tester_logical_addr or 0,
@@ -1041,7 +1041,7 @@ class DoIPSession:
 
         # Unregister from the session registry
         if self._registry is not None and self.tester_logical_addr is not None:
-            self._registry.unregister(self.tester_logical_addr)
+            self._registry.unregister(self.tester_logical_addr, self)
 
         logger.info(
             "DoIPSession: closed session for %s (activated=%s)", self._peer, self.activated
