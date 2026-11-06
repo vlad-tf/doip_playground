@@ -309,7 +309,7 @@ class DoIPSession:
             logger.warning(
                 "DoIPSession: Diagnostic Message before activation from %s", self._peer
             )
-            await self._send_diag_nack(0x02)  # invalid source address
+            await self._send_diag_nack(0x02, bytes(pkt))  # invalid source address
             raise DoIPProtocolError("diagnostic message before activation")
 
         if ptype == PT_DIAGNOSTIC_MESSAGE and self.activated:
@@ -660,7 +660,7 @@ class DoIPSession:
                 "missing" if source is None else f"0x{source:04X}",
                 self.tester_logical_addr or 0, self._peer,
             )
-            await self._send_diag_nack(0x02)  # invalid source address
+            await self._send_diag_nack(0x02, bytes(pkt))  # invalid source address
             raise DoIPProtocolError("diagnostic source address differs from registered SA")
         if len(raw_bytes) >= 12:
             tgt = int.from_bytes(raw_bytes[10:12], "big")
@@ -672,7 +672,7 @@ class DoIPSession:
         try:
             processed = await self.middleware_chain.run(pkt, "tester_to_ecu", self)
         except DoIPFaultInjectionError as exc:
-            await self._send_diag_nack(exc.nack_code)
+            await self._send_diag_nack(exc.nack_code, raw_bytes)
             return
 
         if processed is None:
@@ -694,14 +694,14 @@ class DoIPSession:
             logger.warning(
                 "DoIPSession: Diagnostic Message too short to read target address"
             )
-            await self._send_diag_nack(0x03)  # unknown target address
+            await self._send_diag_nack(0x03, raw_bytes)  # unknown target address
             return
 
         # Ensure an ECU connection exists for this target (opens and caches
         # one lazily, keyed by target address — see _connect_to_ecu).
         ecu_conn = self._ecu_conns.get(route_tgt)
         if ecu_conn is None:
-            ecu_conn = await self._connect_to_ecu(route_tgt)
+            ecu_conn = await self._connect_to_ecu(route_tgt, raw_bytes)
         if ecu_conn is None:
             # _connect_to_ecu already sent the appropriate Diag Negative ACK
             # (0x03 unknown target / 0x06 target unreachable).
@@ -712,7 +712,7 @@ class DoIPSession:
             await ecu_conn.send(processed_bytes)
         except Exception as exc:
             logger.error("DoIPSession: ECU send error: %s", exc)
-            await self._send_diag_nack(0x06)  # target unreachable
+            await self._send_diag_nack(0x06, raw_bytes)  # target unreachable
             return
 
         # Receive ECU response(s).
@@ -856,7 +856,7 @@ class DoIPSession:
     # ECU connection management
     # ------------------------------------------------------------------
 
-    async def _connect_to_ecu(self, target_ecu_addr: int):
+    async def _connect_to_ecu(self, target_ecu_addr: int, raw_bytes: bytes):
         """
         Open (and cache) an ECUConnection for target_ecu_addr, returning it.
 
@@ -882,7 +882,7 @@ class DoIPSession:
                 "DoIPSession: no routing entry for target ECU 0x%04X (tester 0x%04X)",
                 target_ecu_addr, self.tester_logical_addr,
             )
-            await self._send_diag_nack(0x03)  # unknown target address
+            await self._send_diag_nack(0x03, raw_bytes)  # unknown target address
             return None
 
         conn = ECUConnection(
@@ -900,7 +900,7 @@ class DoIPSession:
                 "DoIPSession: failed to connect to ECU 0x%04X for tester 0x%04X: %s",
                 target_ecu_addr, self.tester_logical_addr, exc,
             )
-            await self._send_diag_nack(0x06)  # target unreachable
+            await self._send_diag_nack(0x06, raw_bytes)  # target unreachable
             return None
 
         self._ecu_conns[target_ecu_addr] = conn
@@ -927,7 +927,7 @@ class DoIPSession:
         tgt = int.from_bytes(raw[10:12], "big")
         ecu_conn = self._ecu_conns.get(tgt)
         if ecu_conn is None:
-            ecu_conn = await self._connect_to_ecu(tgt)
+            ecu_conn = await self._connect_to_ecu(tgt, raw)
         if ecu_conn is None:
             logger.warning(
                 "DoIPSession.send_to_ecu: no ECU connection for target 0x%04X", tgt
@@ -986,11 +986,23 @@ class DoIPSession:
         )
         await self._send_raw(self._build_frame(PT_ROUTING_ACTIVATION_RESPONSE, payload))
 
-    async def _send_diag_nack(self, nack_code: int) -> None:
-        """Send a Diagnostic Message Negative ACK (0x8003)."""
-        # Payload: source addr (2) + target addr (2) + nack code (1)
-        src = (self.tester_logical_addr or 0x0000).to_bytes(2, "big")
-        payload = src + b"\x00\x00" + bytes([nack_code])
+    async def _send_diag_nack(self, nack_code: int, request: bytes) -> None:
+        """Send a local NACK from EdgeNode to the diagnostic request's SA.
+
+        Keep the original request context, including before activation or SA
+        rejection. Optional previous-message data is omitted (five-byte payload).
+        ECU-generated NACKs are relayed separately and keep their ECU address.
+        """
+        if len(request) < 10:
+            # There is no complete tester address to acknowledge. Complete
+            # payload-shape validation belongs to the framing layer (F15).
+            await self._send_header_nack(0x04)  # invalid payload length
+            raise DoIPProtocolError("diagnostic request lacks a source address")
+        payload = (
+            self.config.doip.node_logical_addr.to_bytes(2, "big")
+            + request[8:10]
+            + bytes([nack_code])
+        )
         await self._send_raw(self._build_frame(PT_DIAGNOSTIC_NEGATIVE_ACK, payload))
         logger.warning(
             "DoIPSession: sent Diag NACK code=0x%02X to %s", nack_code, self._peer

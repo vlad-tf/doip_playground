@@ -112,7 +112,7 @@ def test_valid_wire_source_can_be_rewritten_by_address_fault_injection(override)
             ecu.recv.return_value = session._build_frame(0x8003, b"\x00\x01\x0e\x00\x03")
             raw = _diagnostic_message(0x0E00, 0x0001)
             await asyncio.wait_for(session._dispatch(session._dissect(raw)), 1)
-            session._connect_to_ecu.assert_awaited_once_with(route_target)
+            session._connect_to_ecu.assert_awaited_once_with(route_target, raw)
             sent = ecu.send.await_args.args[0]
             assert int.from_bytes(sent[8:10], "big") == (0x0E55 if override else 0x0E00)
             assert int.from_bytes(sent[10:12], "big") == route_target
