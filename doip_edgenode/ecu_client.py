@@ -48,6 +48,8 @@ _PT_RA_RESPONSE      = 0x0006
 _PT_ALIVE_CHECK_REQ  = 0x0007
 _PT_ALIVE_CHECK_RESP = 0x0008
 
+_RECV_TERMINAL = object()
+
 _RA_RESPONSE_CODES = {
     0x00: "Denied — unknown source address",
     0x01: "Denied — all sockets registered and active",
@@ -101,10 +103,35 @@ class ECUConnection:
 
         # Background reader: handles unsolicited Alive Check Requests from ECU;
         # all other frames go onto _recv_queue for recv() to consume.
-        self._recv_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._recv_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
+        self._terminal_error: BaseException | None = None
         self._reader_task: asyncio.Task | None = None
         # Logical address used in Alive Check Responses sent to the ECU
         self._tester_logical_addr: int = 0x0E00
+
+    @property
+    def connected(self) -> bool:
+        """Whether this leg can still send; terminal instances are not reusable."""
+        return self._connected
+
+    def _mark_terminal(self, cause: BaseException, *, discard: bool = False) -> None:
+        """Publish EOF after queued frames, or discard them on explicit close.
+
+        State change and queue publication are synchronous on the event loop.
+        A single persistent marker wakes all current and future receivers.
+        """
+        self._connected = False
+        first = self._terminal_error is None
+        if first:
+            self._terminal_error = cause
+        if discard:
+            while not self._recv_queue.empty():
+                self._recv_queue.get_nowait()
+        if first or discard:
+            self._recv_queue.put_nowait(_RECV_TERMINAL)
+
+    def _raise_terminal(self) -> None:
+        raise ConnectionError("ECU connection terminated") from self._terminal_error
 
     async def connect(self, tester_logical_addr: int = 0x0E00) -> None:
         """
@@ -118,6 +145,8 @@ class ECUConnection:
         IPv6 link-local scope_id is mandatory; without it the connect() call
         will fail on most kernels.
         """
+        if self._terminal_error is not None:
+            self._raise_terminal()  # recovery requires a fresh connection object
         entry = self._entry
         port = entry.ecu_port_tls if self._use_tls else entry.ecu_port_plain
 
@@ -250,6 +279,7 @@ class ECUConnection:
 
         - All other frames → enqueued for recv() to consume.
         """
+        cause: BaseException = ConnectionError("ECU reader stopped")
         try:
             while True:
                 raw = await self._read_frame()
@@ -264,14 +294,23 @@ class ECUConnection:
                 else:
                     await self._recv_queue.put(raw)
 
-        except asyncio.IncompleteReadError:
+        except asyncio.IncompleteReadError as exc:
+            cause = exc
             logger.info("ECUConnection: ECU closed the connection")
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError as exc:
+            cause = exc
         except Exception as exc:
+            cause = exc
             logger.debug("ECUConnection: background reader error: %s", exc)
+        finally:
+            self._mark_terminal(cause)
+            # Do not call close() here: it waits for this very reader task.
+            if self._writer is not None:
+                self._writer.close()
 
     async def send(self, data: bytes) -> None:
+        if self._terminal_error is not None:
+            self._raise_terminal()
         if not self._connected:
             raise RuntimeError("ECUConnection.send() called before connect()")
         if self._tls_bridge:
@@ -282,19 +321,26 @@ class ECUConnection:
             await self._writer.drain()
 
     async def recv(self) -> bytes:
-        if not self._connected:
+        if not self._connected and self._terminal_error is None:
             raise RuntimeError("ECUConnection.recv() called before connect()")
         if self._tls_bridge:
+            if self._terminal_error is not None:
+                self._raise_terminal()
             return await self._tls_bridge.recv()
         else:
-            # Consume from the queue fed by _background_reader.
-            # The background reader handles Alive Check Requests transparently;
-            # everything else (diagnostic responses, etc.) arrives here.
-            return await self._recv_queue.get()
+            raw = await self._recv_queue.get()
+            if raw is _RECV_TERMINAL:
+                # No await between removal and reinsertion: cancellation cannot
+                # consume the sole marker and strand another waiter.
+                self._recv_queue.put_nowait(_RECV_TERMINAL)
+                self._raise_terminal()
+            assert isinstance(raw, bytes)
+            return raw
 
     async def close(self) -> None:
-        self._connected = False
-        if self._reader_task and not self._reader_task.done():
+        self._mark_terminal(ConnectionError("ECU connection closed"), discard=True)
+        if (self._reader_task and not self._reader_task.done()
+                and self._reader_task is not asyncio.current_task()):
             self._reader_task.cancel()
             try:
                 await self._reader_task

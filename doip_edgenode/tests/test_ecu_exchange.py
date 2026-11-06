@@ -44,6 +44,10 @@ class QueueECU:
         self.send_error = send_error
         self.receiving = asyncio.Event()
 
+    @property
+    def connected(self):
+        return not self.closed
+
     async def send(self, raw):
         self.sent.append(raw)
         if self.send_error:

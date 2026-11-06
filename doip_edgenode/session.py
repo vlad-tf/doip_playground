@@ -700,6 +700,9 @@ class DoIPSession:
         # Ensure an ECU connection exists for this target (opens and caches
         # one lazily, keyed by target address — see _connect_to_ecu).
         ecu_conn = self._ecu_conns.get(route_tgt)
+        if ecu_conn is not None and not ecu_conn.connected:
+            await self._retire_ecu_connection(route_tgt, ecu_conn)
+            ecu_conn = None
         if ecu_conn is None:
             ecu_conn = await self._connect_to_ecu(route_tgt, raw_bytes)
         if ecu_conn is None:
@@ -958,6 +961,9 @@ class DoIPSession:
             return
         tgt = int.from_bytes(raw[10:12], "big")
         ecu_conn = self._ecu_conns.get(tgt)
+        if ecu_conn is not None and not ecu_conn.connected:
+            await self._retire_ecu_connection(tgt, ecu_conn)
+            ecu_conn = None
         if ecu_conn is None:
             ecu_conn = await self._connect_to_ecu(tgt, raw)
         if ecu_conn is None:
