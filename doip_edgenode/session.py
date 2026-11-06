@@ -346,6 +346,18 @@ class DoIPSession:
             await self._send_routing_activation_response(0x00, 0x0000)
             raise DoIPProtocolError("malformed Routing Activation Request")
 
+        # An activated socket keeps its original tester identity. Check this
+        # before the allow-list and conflict lookup so a changed SA cannot
+        # acquire another registry entry or probe/evict a different session.
+        if self.activated and src_addr != self.tester_logical_addr:
+            logger.warning(
+                "DoIPSession: changed Routing Activation SA 0x%04X on socket "
+                "registered as 0x%04X from %s",
+                src_addr, self.tester_logical_addr, self._peer,
+            )
+            await self._send_routing_activation_response(0x02, src_addr)
+            raise DoIPProtocolError("source address differs from registered SA")
+
         # Validate: source address must be an accepted tester SA (ISO 13400-2
         # Table 13) — config.doip.tester_addr_range / tester_addr_list, not
         # the routing table. Diagnostic routing (which ECU a tester reaches)
@@ -412,7 +424,8 @@ class DoIPSession:
             activation_type,
             self._peer,
         )
-        self._start_inactivity_timer()
+        # Same-SA reactivation is valid, but must replace the existing timer.
+        self._reset_inactivity_timer()
 
     async def _handle_alive_check(self) -> None:
         """Respond to an Alive Check Request immediately.
@@ -982,11 +995,6 @@ class DoIPSession:
             await self._cleanup()
         except asyncio.CancelledError:
             pass  # normal: RA arrived before timeout
-
-    def _start_inactivity_timer(self) -> None:
-        self._inactivity_task = asyncio.create_task(
-            self._general_inactivity_timeout()
-        )
 
     def _reset_inactivity_timer(self) -> None:
         if self._inactivity_task and not self._inactivity_task.done():
