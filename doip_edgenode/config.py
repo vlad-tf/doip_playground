@@ -105,12 +105,11 @@ class TimerConfig:
     t_tcp_initial_inactivity_s: float
     t_tcp_general_inactivity_s: float
     alive_check_interval_ms: int
-    #: How long to wait for one ECU frame after the Diagnostic Positive ACK.
+    #: Per-frame wait, including the first ECU ACK. After matching pending,
+    #: retry within the total budget. Also bounds retired-leg close waits.
     ecu_response_timeout_s: float = 2.0
-    #: Total budget for one request when the ECU keeps answering
-    #: requestCorrectlyReceived-ResponsePending (0x78).  A flash routine can
-    #: legitimately pend for far longer than a single P2, so this is the cap
-    #: on the whole exchange, not on each frame.
+    #: Whole exchange budget from send (excluding connect/RA), including ACK
+    #: and any matching ResponsePending chain; never reset by pending frames.
     ecu_pending_max_wait_s: float = 30.0
     #: Drop an ECU response whose service id does not answer the request that
     #: is in flight.  Without this a desynchronised stream silently delivers a

@@ -151,10 +151,10 @@ class DoIPSession:
         # own socket, so a response read here can never be mixed up with
         # another tester's response (see session.py top-of-class note).
         self._ecu_conns: dict[int, "ECUConnection"] = {}
-        # Outstanding ECU reads, carried across ResponsePending waits so that
-        # a timeout never cancels a read in flight. Keyed the same way as
-        # _ecu_conns. See _recv_ecu_frame().
+        # One queue-consumer task per ECU leg, retained only within an exchange
+        # across pending wait intervals. Retirement drains it before reuse.
         self._ecu_read_tasks: dict[int, asyncio.Task] = {}
+        self._ecu_read_owners: dict[int, "ECUConnection"] = {}
         self._initial_timer_task: asyncio.Task | None = None
         self._inactivity_task: asyncio.Task | None = None
         self._session_start = time.monotonic()
@@ -707,88 +707,116 @@ class DoIPSession:
             # (0x03 unknown target / 0x06 target unreachable).
             return
 
-        # Forward to ECU
-        try:
-            await ecu_conn.send(processed_bytes)
-        except Exception as exc:
-            logger.error("DoIPSession: ECU send error: %s", exc)
-            await self._send_diag_nack(0x06, raw_bytes)  # target unreachable
-            return
+        await self._exchange_with_ecu(route_tgt, ecu_conn, processed_bytes, raw_bytes)
 
-        # Receive ECU response(s).
-        # An ECU sends AT LEAST two frames per diagnostic request:
-        #   1. Diagnostic Positive ACK (0x8002)
-        #   2. Diagnostic Message (0x8001) — the UDS response
-        # but it may send any number of intermediate
-        #   7F <sid> 78  requestCorrectlyReceived-ResponsePending
-        # frames first, one per P2* window, while a slow routine or a flash
-        # operation runs (ISO 14229-1 §7.4).
-        #
-        # Reading a fixed number of frames here is what used to break: the
-        # third frame stayed in the socket buffer until the *next* request
-        # pumped recv(), which stranded the real answer and then delivered it
-        # as the response to an unrelated request for the rest of the session.
-        try:
-            ecu_raw = await ecu_conn.recv()
-        except Exception as exc:
-            logger.error("DoIPSession: ECU recv error: %s", exc)
-            return
+    async def _exchange_with_ecu(self, target: int, ecu_conn,
+                                 sent_bytes: bytes, request: bytes) -> None:
+        """Own all reads until completion; retire uncertain streams before reuse.
 
-        await self._relay_ecu_frame(ecu_raw)
-
-        if not (len(ecu_raw) >= 4
-                and int.from_bytes(ecu_raw[2:4], "big") == PT_DIAGNOSTIC_POSITIVE_ACK):
-            return
-
-        # Keep reading until a frame that is not ResponsePending arrives, or
-        # until the whole-exchange budget runs out.  Match against the bytes we
-        # actually sent (post-middleware), not the tester's original, so that
-        # address/corrupt fault injection does not trip the SID guard.
-        sent_bytes = bytes(processed)
-        request_sid = sent_bytes[12] if len(sent_bytes) >= 13 else None
+        The session loop admits one normal diagnostic exchange at a time.
+        This is not cross-tester ECU arbitration or replay-response isolation.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.config.timers.ecu_pending_max_wait_s
-        pending_seen = 0
-
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                logger.warning(
-                    "DoIPSession: ECU still pending after %.1fs (%d x 0x78) — giving up",
-                    self.config.timers.ecu_pending_max_wait_s, pending_seen,
-                )
-                return
-            try:
-                ecu_raw2 = await self._recv_ecu_frame(
-                    route_tgt, ecu_conn,
+        request_sid = sent_bytes[12] if len(sent_bytes) >= 13 else None
+        # Receiving diagnostic data also suppresses synthetic errors, even
+        # without an ACK: preserve the existing direct-response compatibility.
+        accepted = False
+        completed = False
+        pending_seen = False
+        try:
+            await asyncio.wait_for(ecu_conn.send(sent_bytes), timeout=max(0, deadline - loop.time()))
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning("DoIPSession: ECU exchange budget exhausted")
+                    if not accepted:
+                        await self._send_diag_nack(0x06, request)
+                    return
+                raw = await self._recv_ecu_frame(
+                    target, ecu_conn,
                     min(self.config.timers.ecu_response_timeout_s, remaining),
                 )
-            except Exception as exc:
-                logger.error("DoIPSession: ECU recv error (follow-up): %s", exc)
-                return
+                if raw is None:
+                    if pending_seen:
+                        continue
+                    logger.warning("DoIPSession: ECU response wait elapsed")
+                    if not accepted:
+                        await self._send_diag_nack(0x06, request)
+                    # Silence after ACK may be an intentionally suppressed UDS
+                    # response. Do not manufacture another ACK/NACK or UDS NRC.
+                    return
 
-            if ecu_raw2 is None:                       # this wait elapsed
-                if pending_seen:
-                    # The ECU said 0x78, so it has promised an answer.  Keep
-                    # waiting until the whole-exchange budget runs out.
+                ptype = int.from_bytes(raw[2:4], "big")
+                if ptype == PT_DIAGNOSTIC_POSITIVE_ACK:
+                    if accepted:
+                        logger.warning("DoIPSession: unexpected repeated ECU ACK")
+                        return
+                    accepted = True
+                    await self._relay_ecu_frame(raw)
                     continue
-                logger.warning(
-                    "DoIPSession: timeout waiting for diagnostic response after ACK"
-                )
-                return
 
-            if _is_response_pending(ecu_raw2):
-                pending_seen += 1
-                logger.debug(
-                    "DoIPSession: ECU ResponsePending #%d — still waiting", pending_seen
-                )
-                await self._relay_ecu_frame(ecu_raw2)
-                continue
+                if ptype == PT_DIAGNOSTIC_MESSAGE:
+                    # Validate before relay and before treating 0x78 as pending.
+                    # Strict matching remains configurable for fault injection.
+                    if not self._response_matches(raw, request_sid):
+                        return
+                    pending = _is_response_pending(raw)
+                    pending_matches = pending and request_sid is not None and raw[13] == request_sid
+                    accepted = True
+                    await self._relay_ecu_frame(raw)
+                    if pending_matches:
+                        pending_seen = True
+                        continue
+                    # A permissively relayed mismatched pending frame ends the
+                    # exchange and retires the stream; non-pending responses
+                    # complete normally and keep the connection.
+                    completed = not pending
+                    return
 
-            if not self._response_matches(ecu_raw2, request_sid):
+                await self._relay_ecu_frame(raw)
+                completed = ptype == PT_DIAGNOSTIC_NEGATIVE_ACK
                 return
-            await self._relay_ecu_frame(ecu_raw2)
-            return
+        except Exception as exc:
+            logger.error("DoIPSession: ECU exchange error: %s", exc)
+            if not accepted:
+                await self._send_diag_nack(0x06, request)
+        finally:
+            # Also runs on cancellation. Cancel the queue consumer AND close
+            # its transport: even a late response with the same SID is unsafe.
+            if not completed:
+                await self._retire_ecu_connection(target, ecu_conn)
+
+    async def _retire_ecu_connection(self, target: int, ecu_conn) -> None:
+        """Finish retirement even if the exchange is cancelled during cleanup."""
+        cleanup = asyncio.create_task(self._retire_ecu_leg(target, ecu_conn))
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True  # repeated cancellation cannot abort retirement
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _retire_ecu_leg(self, target: int, ecu_conn) -> None:
+        """Detach this failed leg, drain its read, and close with a bounded wait."""
+        if self._ecu_conns.get(target) is ecu_conn:
+            del self._ecu_conns[target]
+        if self._ecu_read_owners.get(target) is ecu_conn:
+            self._ecu_read_owners.pop(target)
+            task = self._ecu_read_tasks.pop(target, None)
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        # Still close the old transport if ownership changed, but never touch
+        # a replacement's cache/read state.
+        try:
+            await asyncio.wait_for(ecu_conn.close(), self.config.timers.ecu_response_timeout_s)
+        except Exception as exc:
+            logger.warning("DoIPSession: failed to close retired ECU leg: %s", exc)
 
     async def _recv_ecu_frame(self, target_ecu_addr: int, ecu_conn, timeout: float):
         """
@@ -805,16 +833,20 @@ class DoIPSession:
         call instead.
         """
         task = self._ecu_read_tasks.get(target_ecu_addr)
+        if task is not None and self._ecu_read_owners.get(target_ecu_addr) is not ecu_conn:
+            raise RuntimeError("ECU receive task belongs to a different connection")
         if task is None:
             task = asyncio.ensure_future(ecu_conn.recv())
             self._ecu_read_tasks[target_ecu_addr] = task
+            self._ecu_read_owners[target_ecu_addr] = ecu_conn
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except asyncio.TimeoutError:
             return None
         finally:
-            if task.done():
-                self._ecu_read_tasks.pop(target_ecu_addr, None)
+            if task.done() and self._ecu_read_tasks.get(target_ecu_addr) is task:
+                self._ecu_read_tasks.pop(target_ecu_addr)
+                self._ecu_read_owners.pop(target_ecu_addr, None)
 
     def _response_matches(self, ecu_raw: bytes, request_sid: int | None) -> bool:
         """
@@ -1062,6 +1094,7 @@ class DoIPSession:
             if not task.done():
                 task.cancel()
         self._ecu_read_tasks.clear()
+        self._ecu_read_owners.clear()
         for conn in self._ecu_conns.values():
             try:
                 await conn.close()
