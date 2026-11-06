@@ -95,8 +95,17 @@ class FakeSession:
 
 
 def run(coro):
-    """Run a coroutine synchronously (helper for pytest without async plugin)."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Run a coroutine synchronously on a fresh loop (pytest without async plugin)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
