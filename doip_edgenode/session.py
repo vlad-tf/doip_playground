@@ -650,6 +650,18 @@ class DoIPSession:
         # for target_address can return None even on valid Diagnostic Messages,
         # causing the self-check to silently fail and the message to be routed.
         raw_bytes = bytes(pkt)
+        # Validate the original tester identity before local handling or any
+        # middleware. Address fault injection may deliberately rewrite it later.
+        source = int.from_bytes(raw_bytes[8:10], "big") if len(raw_bytes) >= 10 else None
+        if source is None or source != self.tester_logical_addr:
+            logger.warning(
+                "DoIPSession: Diagnostic Message SA %s differs from registered "
+                "SA 0x%04X from %s",
+                "missing" if source is None else f"0x{source:04X}",
+                self.tester_logical_addr or 0, self._peer,
+            )
+            await self._send_diag_nack(0x02)  # invalid source address
+            raise DoIPProtocolError("diagnostic source address differs from registered SA")
         if len(raw_bytes) >= 12:
             tgt = int.from_bytes(raw_bytes[10:12], "big")
             if tgt == self.config.doip.node_logical_addr:
