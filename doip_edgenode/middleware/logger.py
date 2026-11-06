@@ -28,7 +28,7 @@ import os
 from datetime import datetime, timezone
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _strict_bool
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -117,8 +117,10 @@ class LoggerMiddleware(Middleware):
     """
 
     def __init__(self, log_path: str = "logs/doip.log", hex_dump: bool = True, **_):
+        if not isinstance(log_path, str) or not log_path.strip():
+            raise ValueError("log_path must be a non-empty string")
         self.log_path = log_path
-        self.hex_dump = hex_dump
+        self.hex_dump = _strict_bool(hex_dump, "hex_dump")
         self._logger = _make_logger(log_path)
 
     async def process(

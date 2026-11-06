@@ -263,8 +263,25 @@ failures · `CRITICAL` unhandled exceptions.
 ### Config validation checklist (`load_config` must reject all of these)
 
 - `tls_version` not `"TLSv1.3"`
-- VIN length ≠ 17; EID/GID not exactly 12 hex chars
-- `drop_rate` outside `[0.0, 1.0]`
+- VIN must be an actual string of exactly 17 ASCII bytes; EID/GID must be
+  actual strings of exactly 12 hexadecimal characters
+- Probabilities must be finite numbers in `[0.0, 1.0]`; replay count must be
+  an integer `>=1`. Drop filters accept `None` or a mapping with supported
+  direction and optional `0..65535` payload type.
+- Boolean settings require YAML booleans (`true`/`false`), not quoted strings,
+  integers or null. This includes TLS, response matching and middleware flags.
+- Sections/entries must be mappings with string keys; routing and middleware
+  sections must be lists. Invalid input raises `ConfigError` with its field path.
+- Ports and normal node/route addresses must be integers in `1..65535`;
+  node type is `0..1`, power mode `0..2`, payload cap `1..4294967295`.
+  Tester allow-list/range policy and fault-injection address bounds are unchanged.
+- Timer seconds must be finite and positive; intervals/counts are integers `>=1`.
+  Decimal/hex integer strings and numeric timer strings remain supported.
+- Interfaces, certificate paths, log paths and cipher-list elements must be
+  nonempty strings. Empty cipher lists retain defaults; empty SNI omits SNI.
+  Tester IPv4 and routing IPv6 must be syntactically valid addresses.
+- Validation does not check file existence, interface availability or cipher
+  support, impose timer ordering, or validate manually constructed dataclasses.
 - `header_fault.fault` not one of `wrong_version`/`bad_inverse`/`bad_length`/`unknown_type`
 - `inject_on_nth` < 1 · `announce_count` < 1
 - routing entry referencing an interface not present in `network.*_interface`

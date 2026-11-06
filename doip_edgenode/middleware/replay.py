@@ -37,7 +37,7 @@ import copy
 import logging
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _bounded_int, _strict_bool
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 
 class ReplayMiddleware(Middleware):
     def __init__(self, record: bool = False, replay_count: int = 1, **_) -> None:
-        self.record = bool(record)
-        self.replay_count = int(replay_count)
+        self.record = _strict_bool(record, "record")
+        self.replay_count = _bounded_int(replay_count, "replay_count", 1)
         self._recorded: list = []
         self._replayed = False
 

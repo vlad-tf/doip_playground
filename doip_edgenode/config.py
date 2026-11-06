@@ -21,7 +21,8 @@ hardcoded here; every default is documented by its yaml counterpart.
 
 from __future__ import annotations
 
-import re
+import ipaddress
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -156,17 +157,39 @@ class AppConfig:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+def _mapping(value, path: str) -> dict:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{path} must be a mapping; got {type(value).__name__}")
+    if any(not isinstance(key, str) for key in value):
+        raise ConfigError(f"{path} must contain only string keys")
+    return value
+
+
+def _strict_bool(value, path: str) -> bool:
+    if type(value) is not bool:
+        raise ConfigError(f"{path} must be a boolean; got {value!r}")
+    return value
+
+
+def _string(value, path: str, *, nonempty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{path} must be a string; got {type(value).__name__}")
+    if nonempty and not value.strip():
+        raise ConfigError(f"{path} must be a non-empty string")
+    return value
 
 
 def _to_int(value, field_name: str) -> int:
-    """Convert a value that may be a hex string or plain int to int."""
-    if isinstance(value, int):
+    """Convert a strict integer, accepting decimal and 0x strings."""
+    if type(value) is int:
         return value
     if isinstance(value, str):
         try:
-            return int(value, 0)  # handles 0x prefix and plain decimal
-        except ValueError:
+            text = value.strip()
+            base = 16 if text.lstrip("+-").lower().startswith("0x") else 10
+            return int(text, base)
+        except (OverflowError, ValueError):
             raise ConfigError(
                 f"Field '{field_name}' must be an integer or hex string, got: {value!r}"
             )
@@ -183,11 +206,62 @@ def _require(mapping: dict, key: str, section: str):
 
 def _to_int_list(value, field_name: str) -> list[int]:
     """Convert a YAML list of ints/hex-strings to a list[int]."""
-    if not isinstance(value, (list, tuple)):
+    if not isinstance(value, list):
         raise ConfigError(
             f"Field '{field_name}' must be a list, got: {type(value).__name__}"
         )
     return [_to_int(item, f"{field_name}[{i}]") for i, item in enumerate(value)]
+
+
+def _bounded(value, path: str, minimum: int, maximum: int | None = None) -> int:
+    result = _to_int(value, path)
+    if result < minimum or (maximum is not None and result > maximum):
+        bounds = f"[{minimum}, {maximum}]" if maximum is not None else f">= {minimum}"
+        raise ConfigError(f"{path} must be {bounds}; got {value!r}")
+    return result
+
+
+def _positive_number(value, path: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{path} must be a finite positive number")
+    try:
+        result = float(value) if isinstance(value, (int, float, str)) else None
+    except (OverflowError, TypeError, ValueError):
+        result = None
+    if result is None or not math.isfinite(result) or result <= 0:
+        raise ConfigError(f"{path} must be a finite positive number; got {value!r}")
+    return result
+
+
+def _nonnegative_number(value, path: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{path} must be a finite nonnegative number")
+    try:
+        result = float(value) if isinstance(value, (int, float, str)) else None
+    except (OverflowError, TypeError, ValueError):
+        result = None
+    if result is None or not math.isfinite(result) or result < 0:
+        raise ConfigError(f"{path} must be a finite nonnegative number; got {value!r}")
+    return result
+
+
+def _ipv4(value, path: str) -> str:
+    text = _string(value, path, nonempty=True)
+    try:
+        if ipaddress.ip_address(text).version != 4:
+            raise ValueError
+    except ValueError as exc:
+        raise ConfigError(f"{path} must be an IPv4 address; got {value!r}") from exc
+    return text
+
+
+def _ipv6(value, path: str) -> str:
+    text = _string(value, path, nonempty=True)
+    try:
+        ipaddress.IPv6Address(text)
+    except ValueError as exc:
+        raise ConfigError(f"{path} must be an IPv6 address; got {value!r}") from exc
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -198,182 +272,197 @@ def _to_int_list(value, field_name: str) -> list[int]:
 def _load_network(raw: dict) -> NetworkConfig:
     sec = "network"
     return NetworkConfig(
-        tester_interface=str(_require(raw, "tester_interface", sec)),
-        tester_ipv4=str(_require(raw, "tester_ipv4", sec)),
-        ecu_interface=str(_require(raw, "ecu_interface", sec)),
+        tester_interface=_string(
+            _require(raw, "tester_interface", sec),
+            "network.tester_interface",
+            nonempty=True,
+        ),
+        tester_ipv4=_ipv4(_require(raw, "tester_ipv4", sec), "network.tester_ipv4"),
+        ecu_interface=_string(
+            _require(raw, "ecu_interface", sec),
+            "network.ecu_interface",
+            nonempty=True,
+        ),
     )
 
 
 def _load_ports(raw: dict) -> PortsConfig:
-    sec = "ports"
     return PortsConfig(
-        doip_plain=int(_require(raw, "doip_plain", sec)),
-        doip_tls=int(_require(raw, "doip_tls", sec)),
+        doip_plain=_bounded(
+            _require(raw, "doip_plain", "ports"), "ports.doip_plain", 1, 65535
+        ),
+        doip_tls=_bounded(
+            _require(raw, "doip_tls", "ports"), "ports.doip_tls", 1, 65535
+        ),
     )
 
 
 def _load_tls(raw: dict) -> TLSConfig:
     sec = "tls"
-    tls_version = str(_require(raw, "tls_version", sec))
-    if tls_version != "TLSv1.3":
-        raise ConfigError(
-            f"tls.tls_version must be 'TLSv1.3'; got {tls_version!r}. "
-            "TLS 1.2 and below are not supported."
-        )
+    version = _string(_require(raw, "tls_version", sec), "tls.tls_version")
+    if version != "TLSv1.3":
+        raise ConfigError("tls.tls_version must be 'TLSv1.3'")
+
+    suites = raw.get("cipher_suites", [])
+    if not isinstance(suites, list):
+        raise ConfigError("tls.cipher_suites must be a list")
+    cipher_suites = [
+        _string(value, f"tls.cipher_suites[{index}]", nonempty=True)
+        for index, value in enumerate(suites)
+    ]
     return TLSConfig(
-        server_cert=str(_require(raw, "server_cert", sec)),
-        server_key=str(_require(raw, "server_key", sec)),
-        client_cert=str(_require(raw, "client_cert", sec)),
-        client_key=str(_require(raw, "client_key", sec)),
-        ca_cert=str(_require(raw, "ca_cert", sec)),
-        mutual_tls=bool(raw.get("mutual_tls", True)),
-        tls_version=tls_version,
-        cipher_suites=list(raw.get("cipher_suites", [])),
+        server_cert=_string(_require(raw, "server_cert", sec), "tls.server_cert", nonempty=True),
+        server_key=_string(_require(raw, "server_key", sec), "tls.server_key", nonempty=True),
+        client_cert=_string(_require(raw, "client_cert", sec), "tls.client_cert", nonempty=True),
+        client_key=_string(_require(raw, "client_key", sec), "tls.client_key", nonempty=True),
+        ca_cert=_string(_require(raw, "ca_cert", sec), "tls.ca_cert", nonempty=True),
+        mutual_tls=_strict_bool(raw.get("mutual_tls", True), "tls.mutual_tls"),
+        tls_version=version,
+        cipher_suites=cipher_suites,
     )
 
 
 def _load_doip(raw: dict) -> DoIPConfig:
     sec = "doip"
-    vin = str(_require(raw, "vin", sec))
-    if len(vin) != 17:
-        raise ConfigError(
-            f"doip.vin must be exactly 17 characters; got {len(vin)}: {vin!r}"
-        )
-    eid = str(_require(raw, "eid", sec))
-    if len(eid) != 12 or not _HEX_RE.match(eid):
-        raise ConfigError(
-            f"doip.eid must be exactly 12 hex characters; got: {eid!r}"
-        )
-    gid = str(_require(raw, "gid", sec))
-    if len(gid) != 12 or not _HEX_RE.match(gid):
-        raise ConfigError(
-            f"doip.gid must be exactly 12 hex characters; got: {gid!r}"
-        )
-    tester_addr_range = DEFAULT_TESTER_ADDR_RANGE
-    if "tester_addr_range" in raw:
-        bounds = _to_int_list(raw["tester_addr_range"], "doip.tester_addr_range")
-        if len(bounds) != 2:
-            raise ConfigError(
-                f"doip.tester_addr_range: expected [low, high], got "
-                f"{len(bounds)} value(s)"
-            )
-        low, high = bounds
-        if not (0 <= low <= high <= 0xFFFF):
-            raise ConfigError(
-                f"doip.tester_addr_range: [0x{low:04X}, 0x{high:04X}] is not "
-                "a valid ascending 16-bit range"
-            )
-        tester_addr_range = (low, high)
+    vin = _string(_require(raw, "vin", sec), "doip.vin")
+    if len(vin) != 17 or not vin.isascii():
+        raise ConfigError("doip.vin must be exactly 17 ASCII characters")
 
-    tester_addr_list: tuple[int, ...] = ()
-    if "tester_addr_list" in raw:
-        values = _to_int_list(raw["tester_addr_list"], "doip.tester_addr_list")
-        for v in values:
-            if not (0 <= v <= 0xFFFF):
-                raise ConfigError(
-                    f"doip.tester_addr_list: 0x{v:X} is not a valid 16-bit "
-                    "address"
-                )
-        tester_addr_list = tuple(values)
+    values = {}
+    for name in ("eid", "gid"):
+        value = _string(_require(raw, name, sec), f"doip.{name}")
+        if len(value) != 12 or any(char not in "0123456789abcdefABCDEF" for char in value):
+            raise ConfigError(f"doip.{name} must be exactly 12 hex characters")
+        values[name] = value
 
-    node_logical_addr = _to_int(
-        raw.get("node_logical_addr", DEFAULT_NODE_LOGICAL_ADDR),
-        "doip.node_logical_addr",
+    bounds = _to_int_list(
+        raw.get("tester_addr_range", list(DEFAULT_TESTER_ADDR_RANGE)),
+        "doip.tester_addr_range",
     )
-    if node_logical_addr == 0x0000:
+    if len(bounds) != 2 or not 0 <= bounds[0] <= bounds[1] <= 0xFFFF:
         raise ConfigError(
-            "doip.node_logical_addr must not be 0x0000 — ISO/SAE reserved "
-            "(ISO 13400-2), never a valid node address"
+            "doip.tester_addr_range must be an ascending pair in [0, 65535]"
         )
+    addresses = _to_int_list(raw.get("tester_addr_list", []), "doip.tester_addr_list")
+    if any(not 0 <= value <= 0xFFFF for value in addresses):
+        raise ConfigError("doip.tester_addr_list values must be in [0, 65535]")
 
     return DoIPConfig(
         vin=vin,
-        eid=eid,
-        gid=gid,
-        node_type=_to_int(_require(raw, "node_type", sec), "doip.node_type"),
-        node_logical_addr=node_logical_addr,
-        power_mode=_to_int(_require(raw, "power_mode", sec), "doip.power_mode"),
-        max_payload_bytes=int(_require(raw, "max_payload_bytes", sec)),
-        tester_addr_range=tester_addr_range,
-        tester_addr_list=tester_addr_list,
+        eid=values["eid"],
+        gid=values["gid"],
+        node_type=_bounded(_require(raw, "node_type", sec), "doip.node_type", 0, 1),
+        node_logical_addr=_bounded(
+            raw.get("node_logical_addr", DEFAULT_NODE_LOGICAL_ADDR),
+            "doip.node_logical_addr",
+            1,
+            65535,
+        ),
+        power_mode=_bounded(_require(raw, "power_mode", sec), "doip.power_mode", 0, 2),
+        max_payload_bytes=_bounded(
+            _require(raw, "max_payload_bytes", sec),
+            "doip.max_payload_bytes",
+            1,
+            0xFFFFFFFF,
+        ),
+        tester_addr_range=tuple(bounds),
+        tester_addr_list=tuple(addresses),
     )
 
 
 def _load_timers(raw: dict) -> TimerConfig:
-    sec = "timers"
     return TimerConfig(
-        t_tcp_initial_inactivity_s=float(
-            _require(raw, "t_tcp_initial_inactivity_s", sec)
+        t_tcp_initial_inactivity_s=_positive_number(
+            _require(raw, "t_tcp_initial_inactivity_s", "timers"),
+            "timers.t_tcp_initial_inactivity_s",
         ),
-        t_tcp_general_inactivity_s=float(
-            _require(raw, "t_tcp_general_inactivity_s", sec)
+        t_tcp_general_inactivity_s=_positive_number(
+            _require(raw, "t_tcp_general_inactivity_s", "timers"),
+            "timers.t_tcp_general_inactivity_s",
         ),
-        alive_check_interval_ms=int(
-            raw.get("alive_check_interval_ms", 500)
+        alive_check_interval_ms=_bounded(
+            raw.get("alive_check_interval_ms", 500),
+            "timers.alive_check_interval_ms",
+            1,
         ),
-        ecu_response_timeout_s=float(
-            raw.get("ecu_response_timeout_s", 2.0)
+        ecu_response_timeout_s=_positive_number(
+            raw.get("ecu_response_timeout_s", 2.0),
+            "timers.ecu_response_timeout_s",
         ),
-        ecu_pending_max_wait_s=float(
-            raw.get("ecu_pending_max_wait_s", 30.0)
+        ecu_pending_max_wait_s=_positive_number(
+            raw.get("ecu_pending_max_wait_s", 30.0),
+            "timers.ecu_pending_max_wait_s",
         ),
-        strict_response_matching=bool(
-            raw.get("strict_response_matching", True)
+        strict_response_matching=_strict_bool(
+            raw.get("strict_response_matching", True),
+            "timers.strict_response_matching",
         ),
     )
 
 
 def _load_udp(raw: dict) -> UDPConfig:
-    sec = "udp"
-    count = int(_require(raw, "announce_count", sec))
-    if count < 1:
-        raise ConfigError("udp.announce_count must be >= 1")
     return UDPConfig(
-        announce_count=count,
-        announce_interval_ms=int(_require(raw, "announce_interval_ms", sec)),
+        announce_count=_bounded(
+            _require(raw, "announce_count", "udp"), "udp.announce_count", 1
+        ),
+        announce_interval_ms=_bounded(
+            _require(raw, "announce_interval_ms", "udp"),
+            "udp.announce_interval_ms",
+            1,
+        ),
     )
 
 
 def _load_routing_table(raw_list: list, network: NetworkConfig) -> list[RoutingEntry]:
+    if not isinstance(raw_list, list):
+        raise ConfigError("routing_table must be a list")
+
     valid_interfaces = {network.tester_interface, network.ecu_interface}
     entries = []
     seen_ecu_addrs: set[int] = set()
-    for i, raw in enumerate(raw_list):
-        iface = str(raw.get("ecu_interface", ""))
+    for index, value in enumerate(raw_list):
+        path = f"routing_table[{index}]"
+        raw = _mapping(value, path)
+        ecu_addr = _bounded(
+            _require(raw, "ecu_logical_addr", path),
+            f"{path}.ecu_logical_addr",
+            1,
+            65535,
+        )
+        iface = _string(
+            _require(raw, "ecu_interface", path),
+            f"{path}.ecu_interface",
+            nonempty=True,
+        )
         if iface not in valid_interfaces:
             raise ConfigError(
-                f"routing_table[{i}].ecu_interface={iface!r} is not one of the "
-                f"declared interfaces {valid_interfaces}"
+                f"{path}.ecu_interface={iface!r} is not one of the declared interfaces"
             )
-        ecu_addr = _to_int(
-            _require(raw, "ecu_logical_addr", f"routing_table[{i}]"),
-            f"routing_table[{i}].ecu_logical_addr",
-        )
-        # Diagnostic routing picks the first entry whose ecu_logical_addr
-        # matches a Diagnostic Message's target address (see
-        # RoutingTable.lookup_by_ecu_addr / session.py's _connect_to_ecu) —
-        # a second entry for the same address would silently be dead
-        # config, so this is a hard error rather than a silent first-match.
+        # Diagnostic routing picks the first entry matching the ECU address;
+        # a duplicate would silently make the later entry dead configuration.
         if ecu_addr in seen_ecu_addrs:
             raise ConfigError(
-                f"routing_table[{i}].ecu_logical_addr=0x{ecu_addr:04X} "
-                "duplicates an earlier entry; each ECU needs exactly one "
-                "routing_table entry"
+                f"{path}.ecu_logical_addr=0x{ecu_addr:04X} duplicates an earlier entry"
             )
         seen_ecu_addrs.add(ecu_addr)
-
         entries.append(
             RoutingEntry(
                 ecu_logical_addr=ecu_addr,
-                ecu_ipv6=str(_require(raw, "ecu_ipv6", f"routing_table[{i}]")),
+                ecu_ipv6=_ipv6(_require(raw, "ecu_ipv6", path), f"{path}.ecu_ipv6"),
                 ecu_interface=iface,
-                ecu_port_plain=int(
-                    _require(raw, "ecu_port_plain", f"routing_table[{i}]")
+                ecu_port_plain=_bounded(
+                    _require(raw, "ecu_port_plain", path),
+                    f"{path}.ecu_port_plain",
+                    1,
+                    65535,
                 ),
-                ecu_port_tls=int(
-                    _require(raw, "ecu_port_tls", f"routing_table[{i}]")
+                ecu_port_tls=_bounded(
+                    _require(raw, "ecu_port_tls", path),
+                    f"{path}.ecu_port_tls",
+                    1,
+                    65535,
                 ),
-                ecu_sni=str(raw.get("ecu_sni", "")),
+                ecu_sni=_string(raw.get("ecu_sni", ""), f"{path}.ecu_sni"),
             )
         )
     return entries
@@ -387,54 +476,112 @@ _VALID_HEADER_FAULTS = {"wrong_version", "bad_inverse", "bad_length", "unknown_t
 
 
 def _load_middleware(raw_list: list) -> list[MiddlewareConfig]:
-    result = []
-    for i, raw in enumerate(raw_list):
-        mw_type = str(_require(raw, "type", f"middleware[{i}]"))
-        if mw_type not in _VALID_MIDDLEWARE_TYPES:
-            raise ConfigError(f"middleware[{i}].type: unknown middleware type {mw_type!r}")
-        enabled = bool(raw.get("enabled", True))
-        params = {k: v for k, v in raw.items() if k not in ("type", "enabled")}
+    if not isinstance(raw_list, list):
+        raise ConfigError("middleware must be a list")
 
-        # Use the same bounds as direct middleware construction, without
-        # instantiating middleware or opening the logger's sink during loading.
-        from middleware import _bounded_int
-        integer_fields = {
-            "CorruptMiddleware": (("byte_offset", 0, None, True), ("flip_mask", 0, 0xFF, False)),
-            "AddressMiddleware": (("src_override", 0, 0xFFFF, True), ("tgt_override", 0, 0xFFFF, True)),
-            "DelayMiddleware": (("delay_ms", 0, None, False), ("jitter_ms", 0, None, False)),
-            "HeaderFaultMiddleware": (("inject_on_nth", 1, None, False),),
-        }
+    from middleware import _bounded_int
+
+    integer_fields = {
+        "CorruptMiddleware": (
+            ("byte_offset", 0, None, True),
+            ("flip_mask", 0, 0xFF, False),
+        ),
+        "AddressMiddleware": (
+            ("src_override", 0, 0xFFFF, True),
+            ("tgt_override", 0, 0xFFFF, True),
+        ),
+        "DelayMiddleware": (
+            ("delay_ms", 0, None, False),
+            ("jitter_ms", 0, None, False),
+        ),
+        "HeaderFaultMiddleware": (("inject_on_nth", 1, None, False),),
+    }
+    result = []
+    for index, value in enumerate(raw_list):
+        path = f"middleware[{index}]"
+        raw = _mapping(value, path)
+        mw_type = _string(_require(raw, "type", path), f"{path}.type")
+        if mw_type not in _VALID_MIDDLEWARE_TYPES:
+            raise ConfigError(f"{path}.type: unknown middleware type {mw_type!r}")
+
+        enabled = _strict_bool(raw.get("enabled", True), f"{path}.enabled")
+        params = {key: value for key, value in raw.items() if key not in ("type", "enabled")}
         for name, minimum, maximum, optional in integer_fields.get(mw_type, ()):
-            if name not in params or (optional and params[name] is None):
+            if name not in params:
+                continue
+            if optional and params[name] is None:
                 continue
             try:
-                params[name] = _bounded_int(params[name], name, minimum, maximum)
-            except ValueError as exc:
-                raise ConfigError(f"middleware[{i}] {mw_type}: {exc}") from exc
+                params[name] = _bounded_int(
+                    params[name], f"{path}.{name}", minimum, maximum
+                )
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{path}.{name}: {exc}") from exc
 
-        # Validate per-type params
         if mw_type == "DropMiddleware":
-            rate = params.get("drop_rate", 0.0)
-            if not (0.0 <= float(rate) <= 1.0):
-                raise ConfigError(
-                    f"middleware[{i}] DropMiddleware.drop_rate must be in [0.0, 1.0]; "
-                    f"got {rate!r}"
+            if "drop_rate" in params:
+                rate = _nonnegative_number(params["drop_rate"], f"{path}.drop_rate")
+                if rate > 1:
+                    raise ConfigError(f"{path}.drop_rate must be in [0, 1]")
+                params["drop_rate"] = rate
+            if "match" in params:
+                _validate_match(params["match"], path, _bounded_int)
+
+        if mw_type == "LoggerMiddleware":
+            if "log_path" in params:
+                params["log_path"] = _string(
+                    params["log_path"], f"{path}.log_path", nonempty=True
                 )
-        if mw_type == "HeaderFaultMiddleware":
-            fault = params.get("fault", "wrong_version")
-            if fault not in _VALID_HEADER_FAULTS:
-                raise ConfigError(
-                    f"middleware[{i}] HeaderFaultMiddleware.fault must be one of "
-                    f"{sorted(_VALID_HEADER_FAULTS)}; got {fault!r}"
-                )
-            direction = params.get("direction", "tester_to_ecu")
-            if direction not in ("tester_to_ecu", "ecu_to_tester", "both"):
-                raise ConfigError(
-                    f"middleware[{i}] HeaderFaultMiddleware.direction is invalid: {direction!r}"
+            if "hex_dump" in params:
+                params["hex_dump"] = _strict_bool(
+                    params["hex_dump"], f"{path}.hex_dump"
                 )
 
-        result.append(MiddlewareConfig(type=mw_type, enabled=enabled, params=params))
+        if mw_type == "ReplayMiddleware":
+            if "record" in params:
+                params["record"] = _strict_bool(params["record"], f"{path}.record")
+            if "replay_count" in params:
+                try:
+                    params["replay_count"] = _bounded_int(
+                        params["replay_count"], f"{path}.replay_count", 1
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ConfigError(f"{path}.replay_count: {exc}") from exc
+
+        if mw_type == "HeaderFaultMiddleware":
+            if "fault" in params:
+                fault = _string(params["fault"], f"{path}.fault", nonempty=True)
+                if fault not in _VALID_HEADER_FAULTS:
+                    raise ConfigError(f"{path}.fault is invalid: {fault!r}")
+            if "direction" in params:
+                direction = params["direction"]
+                if direction not in ("tester_to_ecu", "ecu_to_tester", "both"):
+                    raise ConfigError(f"{path}.direction is invalid: {direction!r}")
+
+        if mw_type == "TLSFaultMiddleware" and "fault" in params:
+            params["fault"] = _string(params["fault"], f"{path}.fault", nonempty=True)
+
+        result.append(
+            MiddlewareConfig(type=mw_type, enabled=enabled, params=params)
+        )
     return result
+
+
+def _validate_match(match, path: str, bounded_int) -> None:
+    if match is None:
+        return
+    match = _mapping(match, f"{path}.match")
+    if "direction" in match:
+        direction = match["direction"]
+        if direction not in (None, "tester_to_ecu", "ecu_to_tester"):
+            raise ConfigError(f"{path}.match.direction is invalid: {direction!r}")
+    if "payload_type" in match and match["payload_type"] is not None:
+        try:
+            match["payload_type"] = bounded_int(
+                match["payload_type"], f"{path}.match.payload_type", 0, 0xFFFF
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{path}.match.payload_type: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -445,22 +592,21 @@ def _load_middleware(raw_list: list) -> list[MiddlewareConfig]:
 def load_config(path: str) -> AppConfig:
     """Load and validate config.yaml. Raises ConfigError on any issue."""
     try:
-        with open(path, "r") as fh:
+        with open(path, "r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh)
-    except FileNotFoundError:
-        raise ConfigError(f"Config file not found: {path!r}")
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError(f"Unable to read config file {path!r}: {exc}") from exc
     except yaml.YAMLError as exc:
-        raise ConfigError(f"YAML parse error in {path!r}: {exc}")
+        raise ConfigError(f"YAML parse error in {path!r}: {exc}") from exc
 
-    if not isinstance(raw, dict):
-        raise ConfigError("Config file must be a YAML mapping at the top level")
+    raw = _mapping(raw, "root")
 
-    network = _load_network(_require(raw, "network", "root"))
-    ports = _load_ports(_require(raw, "ports", "root"))
-    tls = _load_tls(_require(raw, "tls", "root"))
-    doip = _load_doip(_require(raw, "doip", "root"))
-    timers = _load_timers(_require(raw, "timers", "root"))
-    udp = _load_udp(_require(raw, "udp", "root"))
+    network = _load_network(_mapping(_require(raw, "network", "root"), "network"))
+    ports = _load_ports(_mapping(_require(raw, "ports", "root"), "ports"))
+    tls = _load_tls(_mapping(_require(raw, "tls", "root"), "tls"))
+    doip = _load_doip(_mapping(_require(raw, "doip", "root"), "doip"))
+    timers = _load_timers(_mapping(_require(raw, "timers", "root"), "timers"))
+    udp = _load_udp(_mapping(_require(raw, "udp", "root"), "udp"))
     routing_table = _load_routing_table(
         _require(raw, "routing_table", "root"), network
     )

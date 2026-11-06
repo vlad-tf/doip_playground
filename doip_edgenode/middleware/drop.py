@@ -31,7 +31,7 @@ import logging
 import random
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _bounded_int, _finite_float
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -49,13 +49,19 @@ class DropMiddleware(Middleware):
         match: dict | None = None,
         **_,
     ) -> None:
-        self.drop_rate = float(drop_rate)
+        self.drop_rate = _finite_float(drop_rate, "drop_rate", 0.0, 1.0)
         self._match_direction: str | None = None
         self._match_payload_type: int | None = None
-        if match:
+        if match is not None:
+            if not isinstance(match, dict) or any(not isinstance(k, str) for k in match):
+                raise ValueError("match must be a mapping with string keys")
             self._match_direction = match.get("direction")
+            if self._match_direction not in (None, "tester_to_ecu", "ecu_to_tester"):
+                raise ValueError("match.direction must be tester_to_ecu or ecu_to_tester")
             pt = match.get("payload_type")
-            self._match_payload_type = int(pt) if pt is not None else None
+            self._match_payload_type = (
+                _bounded_int(pt, "match.payload_type", 0, 0xFFFF) if pt is not None else None
+            )
 
     def _matches(self, pkt, direction: str) -> bool:
         """Return True if this packet/direction satisfies the match filter."""

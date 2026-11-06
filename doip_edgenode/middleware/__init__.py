@@ -27,6 +27,7 @@ send a synthetic error response instead of forwarding the packet.
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -62,6 +63,30 @@ def _bounded_int(value, name: str, minimum: int, maximum: int | None = None) -> 
     if result < minimum or (maximum is not None and result > maximum):
         bounds = f"[{minimum}, {maximum}]" if maximum is not None else f">= {minimum}"
         raise ValueError(f"{name} must be {bounds}; got {value!r}")
+    return result
+
+
+def _strict_bool(value, name: str) -> bool:
+    """Do not turn quoted false or numeric values into enabled features."""
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean; got {value!r}")
+    return value
+
+
+def _finite_float(value, name: str, minimum: float, maximum: float | None = None) -> float:
+    """Parse finite numeric settings without accepting booleans."""
+    if type(value) not in (int, float, str):
+        raise ValueError(f"{name} must be numeric; got {value!r}")
+    try:
+        result = float(value)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be numeric; got {value!r}") from exc
+    if (
+        not math.isfinite(result)
+        or result < minimum
+        or (maximum is not None and result > maximum)
+    ):
+        raise ValueError(f"{name} must be finite and in range; got {value!r}")
     return result
 
 

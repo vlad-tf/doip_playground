@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from typing import Literal, TYPE_CHECKING
 
-from middleware import Middleware
+from middleware import Middleware, _strict_bool
 
 if TYPE_CHECKING:
     from session import DoIPSession
@@ -40,8 +40,10 @@ class TLSFaultMiddleware(Middleware):
     """No-op placeholder.  Logs a warning and passes every packet through."""
 
     def __init__(self, fault: str = "wrong_cipher", **kwargs) -> None:
+        if not isinstance(fault, str) or not fault.strip():
+            raise ValueError("fault must be a non-empty string")
         self.fault = fault
-        self.enabled = kwargs.get("enabled", False)
+        self.enabled = _strict_bool(kwargs.get("enabled", False), "enabled")
 
     async def process(
         self,

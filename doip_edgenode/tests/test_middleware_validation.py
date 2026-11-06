@@ -25,6 +25,10 @@ from middleware.address import AddressMiddleware
 from middleware.corrupt import CorruptMiddleware
 from middleware.delay import DelayMiddleware
 from middleware.header_fault import HeaderFaultMiddleware
+from middleware.drop import DropMiddleware
+from middleware.logger import LoggerMiddleware
+from middleware.replay import ReplayMiddleware
+from middleware.tls_fault import TLSFaultMiddleware
 from server import DoIPServer, _build_middleware
 from tests.test_session import _make_app_config
 
@@ -249,3 +253,84 @@ def test_zero_padded_decimal_and_hex_strings(value, expected):
     assert HeaderFaultMiddleware(inject_on_nth=value).inject_on_nth == expected
     loaded = _load_middleware([{"type": "DelayMiddleware", "delay_ms": value}])
     assert loaded[0].params["delay_ms"] == expected
+
+
+# F12: direct construction must agree with the YAML loader.
+
+
+@pytest.mark.parametrize("cls,name", [
+    (ReplayMiddleware, "record"), (LoggerMiddleware, "hex_dump"),
+    (TLSFaultMiddleware, "enabled"),
+])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_constructor_requires_actual_boolean(cls, name, value):
+    with patch("middleware.logger._make_logger") as make_logger:
+        with pytest.raises(ValueError, match=name):
+            cls(**{name: value})
+        make_logger.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [True, False, None, [], {}, "bad", -0.1, 1.1,
+                                        float("nan"), float("inf"), "-inf", 10**400])
+def test_drop_constructor_rejects_invalid_probability(value):
+    with pytest.raises(ValueError, match="drop_rate"):
+        DropMiddleware(drop_rate=value)
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5, None, [], "bad", float("inf")])
+def test_replay_constructor_rejects_invalid_count(value):
+    with pytest.raises(ValueError, match="replay_count"):
+        ReplayMiddleware(replay_count=value)
+
+
+@pytest.mark.parametrize("match", [[], "", "bad", False, 0, {1: "value"},
+    {"direction": "both"}, {"direction": []}, {"payload_type": True},
+    {"payload_type": 1.5}, {"payload_type": -1}, {"payload_type": 65536}])
+def test_drop_constructor_rejects_invalid_filter(match):
+    with pytest.raises(ValueError, match="match"):
+        DropMiddleware(match=match)
+
+
+@pytest.mark.parametrize("value", [None, 1, [], "", "   "])
+def test_logger_path_validation_precedes_sink_creation(value):
+    with patch("middleware.logger._make_logger") as make_logger:
+        with pytest.raises(ValueError, match="log_path"):
+            LoggerMiddleware(log_path=value)
+        make_logger.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [None, 1, [], "", "   "])
+def test_tls_placeholder_fault_requires_nonempty_string(value):
+    with pytest.raises(ValueError, match="fault"):
+        TLSFaultMiddleware(fault=value)
+
+
+@pytest.mark.parametrize("rate", [0, 1, "0.25"])
+def test_drop_constructor_accepts_probability_and_filter_bounds(rate):
+    mw = DropMiddleware(drop_rate=rate, match={"payload_type": "0xffff"})
+    assert mw.drop_rate == float(rate)
+    assert mw._matches(diagnostic_packet(), "tester_to_ecu") is False
+    assert DropMiddleware(match=None)._matches(diagnostic_packet(), "tester_to_ecu")
+    assert DropMiddleware(match={"payload_type": 0})._match_payload_type == 0
+
+
+def test_replay_logger_and_tls_constructor_preserve_valid_settings():
+    mw = ReplayMiddleware(record=False, replay_count="0008")
+    assert mw.record is False
+    assert mw.replay_count == 8
+    with patch("middleware.logger._make_logger") as make_logger:
+        logger = LoggerMiddleware(log_path="custom.log", hex_dump=False)
+    assert logger.hex_dump is False
+    make_logger.assert_called_once_with("custom.log")
+    assert TLSFaultMiddleware(enabled=False).enabled is False
+
+
+@pytest.mark.parametrize("direction", ["tester_to_ecu", "ecu_to_tester"])
+def test_drop_combined_filter_requires_both_conditions(direction):
+    mw = DropMiddleware(match={"direction": direction, "payload_type": "0x8001"})
+    pkt = diagnostic_packet()
+    other = "ecu_to_tester" if direction == "tester_to_ecu" else "tester_to_ecu"
+    assert mw._matches(pkt, direction)
+    assert not mw._matches(pkt, other)
+    mw = DropMiddleware(match={"direction": direction, "payload_type": 0})
+    assert not mw._matches(pkt, direction)

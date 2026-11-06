@@ -338,6 +338,19 @@ Additional config params:
 
 Single `config.yaml` file. All paths relative to working directory.
 
+The loader rejects malformed section/list shapes and reports invalid fields as
+`ConfigError`. Boolean flags require unquoted YAML `true`/`false`; quoted
+`"false"`, numeric booleans and null are rejected. Integer fields accept integers
+or decimal/hex strings, but not floats or booleans. Ports and normal node/route
+addresses are `1..65535`; timer seconds are finite and positive, and intervals
+and counts are integers `>=1`. VIN is exactly 17 ASCII bytes; EID/GID are exactly
+12 hex characters. Interfaces, file paths and cipher-list elements are nonempty
+strings; IPv4/IPv6 fields are checked syntactically. Empty cipher lists keep the
+default behavior and empty SNI omits SNI. Drop probability is finite in `[0,1]`,
+replay count is `>=1`, and middleware boolean flags follow the same strict rule.
+Validation does not verify local files/interfaces, cipher support or timer
+ordering, and manually constructed configuration dataclasses bypass the loader.
+
 ```yaml
 network:
   tester_interface: "eth0"
