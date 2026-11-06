@@ -927,6 +927,7 @@ class DoIPSession:
             executor=self.executor,
             use_tls=False,  # use plain port for PoC; TLS path uses port 3496
             fault_policy=TLSFaultPolicy(),
+            max_payload_bytes=self.config.doip.max_payload_bytes,
         )
         try:
             await conn.connect(tester_logical_addr=self.tester_logical_addr or 0x0E00)

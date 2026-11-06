@@ -88,6 +88,7 @@ class ECUConnection:
         executor: ThreadPoolExecutor,
         use_tls: bool = False,
         fault_policy: TLSFaultPolicy | None = None,
+        max_payload_bytes: int = 4096,
     ) -> None:
         self._entry = entry
         self._tls_config = tls_config
@@ -95,6 +96,8 @@ class ECUConnection:
         self._executor = executor
         self._use_tls = use_tls
         self._fault_policy = fault_policy or TLSFaultPolicy()
+        self._max_payload_bytes = max_payload_bytes
+        self._connecting = False
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -147,71 +150,106 @@ class ECUConnection:
         """
         if self._terminal_error is not None:
             self._raise_terminal()  # recovery requires a fresh connection object
-        entry = self._entry
-        port = entry.ecu_port_tls if self._use_tls else entry.ecu_port_plain
-
-        # IPv6 link-local scope_id
+        if self._connected or self._connecting:
+            raise RuntimeError("ECUConnection.connect() called during an existing connection")
+        self._connecting = True
+        sock = None
         try:
-            scope_id = socket.if_nametoindex(entry.ecu_interface)
-        except OSError as exc:
-            raise OSError(
-                f"Cannot get interface index for {entry.ecu_interface!r}: {exc}"
-            ) from exc
+            entry = self._entry
+            port = entry.ecu_port_tls if self._use_tls else entry.ecu_port_plain
+            try:
+                scope_id = socket.if_nametoindex(entry.ecu_interface)
+            except OSError as exc:
+                raise OSError(
+                    f"Cannot get interface index for {entry.ecu_interface!r}: {exc}"
+                ) from exc
 
-        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        sock.setblocking(False)
-
-        logger.info(
-            "ECUConnection: connecting to [%s%%%s]:%d (use_tls=%s)",
-            entry.ecu_ipv6,
-            entry.ecu_interface,
-            port,
-            self._use_tls,
-        )
-
-        await self._loop.sock_connect(sock, (entry.ecu_ipv6, port, 0, scope_id))
-
-        if self._use_tls:
-            from scapy.layers.tls.automaton_cli import TLSClientAutomaton  # type: ignore[import]
-
-            sni = entry.ecu_sni if entry.ecu_sni else None
-            self._tls_bridge = TLSBridge(
-                sock=sock,
-                automaton_cls=TLSClientAutomaton,
-                tls_config=self._tls_config,
-                fault_policy=self._fault_policy,
-                loop=self._loop,
-                executor=self._executor,
-                is_server=False,
-                server_name=sni,
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            logger.info(
+                "ECUConnection: connecting to [%s%%%s]:%d (use_tls=%s)",
+                entry.ecu_ipv6, entry.ecu_interface, port, self._use_tls,
             )
-            await self._tls_bridge.handshake()
-            logger.info("ECUConnection: TLS handshake complete")
-        else:
-            self._reader, self._writer = await asyncio.open_connection(sock=sock)
+            await self._loop.sock_connect(sock, (entry.ecu_ipv6, port, 0, scope_id))
+            if self._use_tls:
+                from scapy.layers.tls.automaton_cli import TLSClientAutomaton  # type: ignore[import]
 
-        # Must set _connected before calling send/recv helpers below
-        self._connected = True
-        self._tester_logical_addr = tester_logical_addr
+                self._tls_bridge = TLSBridge(
+                    sock=sock,
+                    automaton_cls=TLSClientAutomaton,
+                    tls_config=self._tls_config,
+                    fault_policy=self._fault_policy,
+                    loop=self._loop,
+                    executor=self._executor,
+                    is_server=False,
+                    server_name=entry.ecu_sni or None,
+                )
+                sock = None  # bridge owns the socket, even if handshake fails
+                await self._tls_bridge.handshake()
+            else:
+                self._reader, self._writer = await asyncio.open_connection(sock=sock)
+                sock = None  # ownership transferred to the stream transport
 
-        # Perform Routing Activation toward the ECU
-        await self._do_routing_activation(tester_logical_addr)
+            if self._terminal_error is not None:
+                self._raise_terminal()
+            # Internal send() is needed during RA; failed setup revokes this state.
+            self._connected = True
+            self._tester_logical_addr = tester_logical_addr
+            await self._do_routing_activation(tester_logical_addr)
+            if self._terminal_error is not None:
+                self._raise_terminal()
+            self._reader_task = asyncio.get_running_loop().create_task(
+                self._background_reader(), name="ecu-reader"
+            )
+        except BaseException as exc:
+            self._mark_terminal(exc, discard=True)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError as close_error:
+                    logger.debug("ECUConnection: raw socket close error: %s", close_error)
+            # Cancellation (including repeated cancellation) must not abandon
+            # the stream close or replace the original setup failure.
+            cleanup = asyncio.create_task(self._close_failed_setup())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+            cleanup.result()
+            raise
+        finally:
+            self._connecting = False
 
-        # Start background reader AFTER routing activation is complete.
-        # From this point the ECU may send unsolicited Alive Check Requests
-        # (e.g. when a competing EdgeNode connection tries to register the
-        # same SA); the background reader must reply immediately.
-        self._reader_task = asyncio.get_running_loop().create_task(
-            self._background_reader(), name="ecu-reader"
-        )
+    async def _close_failed_setup(self) -> None:
+        """Close owned transports promptly, bounding asynchronous close waits."""
+        try:
+            await asyncio.wait_for(self.close(), timeout=2.0)
+        except Exception as exc:
+            logger.debug("ECUConnection: setup cleanup error: %s", exc)
 
     async def _read_frame(self) -> bytes:
-        """Read one complete DoIP frame directly from the stream (no _connected guard)."""
+        """Read a bounded, structurally valid ECU frame without sending errors."""
         assert self._reader is not None
         header = await self._reader.readexactly(8)
-        payload_len = int.from_bytes(header[4:8], "big")
-        if payload_len == 0:
-            return header
+        version, inverse, ptype, payload_len = struct.unpack("!BBHI", header)
+        if version not in (0x02, 0x03) or inverse != (version ^ 0xFF):
+            raise RuntimeError("ECUConnection: invalid DoIP version pattern")
+        if payload_len > self._max_payload_bytes:
+            raise RuntimeError("ECUConnection: DoIP payload exceeds configured limit")
+        fixed_lengths = {
+            0x0000: (1,), _PT_RA_RESPONSE: (9, 13),
+            _PT_ALIVE_CHECK_REQ: (0,), _PT_ALIVE_CHECK_RESP: (2,),
+            0x4002: (3, 7), 0x4004: (1,),
+        }
+        if ptype in fixed_lengths:
+            valid_length = payload_len in fixed_lengths[ptype]
+        elif ptype in (0x8001, 0x8002, 0x8003):
+            valid_length = payload_len >= 5
+        else:
+            raise RuntimeError(f"ECUConnection: unsupported ECU payload type 0x{ptype:04X}")
+        if not valid_length:
+            raise RuntimeError(f"ECUConnection: invalid payload length for 0x{ptype:04X}")
         payload = await self._reader.readexactly(payload_len)
         return header + payload
 
@@ -246,12 +284,14 @@ class ECUConnection:
                     f"(0x{_PT_RA_RESPONSE:04X}), got 0x{ptype:04X}"
                 )
 
-            # Parse RA Response payload (min 5 bytes: 2+2+1)
             payload = raw[8:]
-            if len(payload) < 5:
-                raise RuntimeError(
-                    f"ECUConnection: RA Response payload too short ({len(payload)} bytes)"
-                )
+            if len(payload) not in (9, 13):
+                raise RuntimeError("ECUConnection: invalid RA Response payload length")
+            echoed_tester, entity_addr = struct.unpack("!HH", payload[:4])
+            if echoed_tester != tester_logical_addr:
+                raise RuntimeError("ECUConnection: RA Response tester address mismatch")
+            if entity_addr != self._entry.ecu_logical_addr:
+                raise RuntimeError("ECUConnection: RA Response ECU address mismatch")
             code = payload[4]
             desc = _RA_RESPONSE_CODES.get(code, f"unknown (0x{code:02X})")
 
