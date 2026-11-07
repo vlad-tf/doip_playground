@@ -112,9 +112,23 @@ doip_edgenode/
 - Valid received NACKs and announcements are ignored. Short headers are silently
   discarded; invalid complete messages receive Header NACK without closing the
   shared listener. UDP has no per-peer stream to drain or connection to close.
+- UDP uses a portable wildcard IPv4 bind (`0.0.0.0:13400`) on Windows/Linux/macOS,
+  without device binding or primary-address queries. `tester_interface` and
+  `tester_ipv4` do not restrict UDP; TCP's configured address bind is unchanged.
+  Announcements use limited broadcast; egress and reply source selection follow
+  OS routing, not guaranteed per-adapter fan-out. Firewall/network policy controls
+  access. Interface isolation remains deferred by user choice for portability.
+- Multicast, unspecified and limited-broadcast source addresses are silently
+  filtered before validation or replies. Directed-broadcast filtering is deferred
+  because local interface netmasks are not collected. Off-subnet unicast is allowed;
+  this is not a tester ACL or authentication mechanism.
+- Initial announcements and each matching identification response have independent
+  random waits of 0–500 ms. Configured announcement count/interval remain supported.
+  At most 256 discovery replies are pending; excess requests are silently dropped
+  without new timers/logs. Stop/transport loss cancels pending replies. Power/NACK
+  replies are immediate. Per-rejection WARNING flooding remains F18.
 - Optional UDP status awaits truthful socket/capacity accounting; do not copy the
-  existing TCP handler's hardcoded counts into a new UDP response. Random response
-  delay and source/interface filtering are still pending separate fixes.
+  existing TCP handler's hardcoded counts into a new UDP response.
 
 ### asyncio patterns
 
@@ -361,6 +375,17 @@ each test or a small helper, matching the pattern used by
 `virtual_ecu/tests/conftest.py:run`. Do not add `pytest-asyncio` as a dependency.
 
 ## Backlog (known gaps, not yet implemented — do not silently build these)
+
+Raised 2026-11-07 by the user:
+
+- **Tester-facing IPv6 availability — deferred; IPv4 is the current priority.**
+  EdgeNode should eventually accept tester connections over IPv6 as well as IPv4
+  and support IPv6 UDP discovery/announcements using multicast, with correct
+  interface membership, egress and link-local scope handling. Existing ECU-facing
+  IPv6 TCP support does not provide tester-facing IPv6 availability. Preserve
+  Windows compatibility and current IPv4 behavior; design configuration/socket
+  policy and verify native Windows/Linux IPv6 behavior when this item is taken up.
+  No IPv6 implementation is authorized by this backlog entry.
 
 Raised 2026-10-02 while reworking diagnostic routing (see "Diagnostic
 routing is resolved by target address, not tester SA" above). Each of these

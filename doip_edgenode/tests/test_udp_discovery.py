@@ -51,11 +51,18 @@ def frame(pt: int, payload: bytes = b"", version: int = 2,
     return bytes((version, inverse)) + struct.pack("!HI", pt, size) + payload
 
 
+def _make_immediate(proto: _UDPProtocol) -> _UDPProtocol:
+    """Keep legacy raw-frame assertions synchronous; policy tests cover timers."""
+    proto._schedule_discovery = lambda addr: proto._send(
+        VEHICLE_ID, proto._payload, addr)
+    return proto
+
+
 def protocol(power_mode: int = 1) -> tuple[_UDPProtocol, MagicMock]:
     config = _make_app_config()
     config.doip.power_mode = power_mode
     transport = MagicMock()
-    proto = _UDPProtocol(config)
+    proto = _make_immediate(_UDPProtocol(config))
     proto.connection_made(transport)
     return proto, transport
 
@@ -100,7 +107,7 @@ def test_discovery_mismatches_are_silent() -> None:
 def test_discovery_response_is_exact_33_bytes_with_configured_fields() -> None:
     config = _make_app_config()
     config.doip.gid = "112233445566"
-    proto = _UDPProtocol(config)
+    proto = _make_immediate(_UDPProtocol(config))
     transport = MagicMock()
     proto.connection_made(transport)
     proto.datagram_received(frame(DISCOVERY), ADDR)
@@ -207,7 +214,7 @@ def test_datagram_boundaries_and_short_datagrams() -> None:
 def test_configured_payload_cap_precedes_body_and_fixed_shape_validation() -> None:
     config = _make_app_config()
     config.doip.max_payload_bytes = 6
-    proto = _UDPProtocol(config)
+    proto = _make_immediate(_UDPProtocol(config))
     transport = MagicMock()
     proto.connection_made(transport)
     proto.datagram_received(frame(DISCOVERY_EID, bytes.fromhex(config.doip.eid)), ADDR)
@@ -233,7 +240,7 @@ def test_bad_then_good_request_keeps_shared_transport_open() -> None:
 
 
 def test_transport_lifecycle_and_send_errors_are_contained(caplog: pytest.LogCaptureFixture) -> None:
-    proto = _UDPProtocol(_make_app_config())
+    proto = _make_immediate(_UDPProtocol(_make_app_config()))
     transport = MagicMock()
     proto.connection_made(transport)
     transport.sendto.side_effect = OSError("closed")
@@ -269,13 +276,13 @@ def test_real_asyncio_loopback_handles_bad_then_healthy_request() -> None:
                 raise
             server_addr = server_transport.get_extra_info("sockname")
             client_transport.sendto(frame(POWER_MODE_REQ, b"x"), server_addr)
-            bad, _ = await asyncio.wait_for(queue.get(), timeout=0.5)
+            bad, _ = await asyncio.wait_for(queue.get(), timeout=1.0)
             assert bad == frame(HEADER_NACK, bytes((NACK_INVALID_PAYLOAD,)))
             client_transport.sendto(frame(POWER_MODE_REQ), server_addr)
-            good, _ = await asyncio.wait_for(queue.get(), timeout=0.5)
+            good, _ = await asyncio.wait_for(queue.get(), timeout=1.0)
             assert good == frame(POWER_MODE_RES, b"\x01")
             client_transport.sendto(frame(DISCOVERY), server_addr)
-            discovery, _ = await asyncio.wait_for(queue.get(), timeout=0.5)
+            discovery, _ = await asyncio.wait_for(queue.get(), timeout=1.0)
             assert int.from_bytes(discovery[2:4], "big") == VEHICLE_ID
             assert discovery[8:] == _UDPProtocol(config)._payload
             with pytest.raises(asyncio.TimeoutError):

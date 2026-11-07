@@ -189,8 +189,16 @@ All four containers run their Python process as a dedicated, unprivileged
 Dockerfile. None of the services need raw sockets or a privileged port
 (everything is 13400/udp, 13400/tcp or 3496/tcp, all well above 1024), so this
 was a drop-in change — no `cap_add`, `privileged`, or kernel capabilities are
-required anywhere in `docker-compose.yml`, and none of the containers need to
+required by the TCP/ordinary UDP transports, and none of the containers need to
 start as root at any point.
+
+EdgeNode UDP discovery uses a portable wildcard IPv4 bind, without
+`SO_BINDTODEVICE`, interface-address queries or added capabilities. UDP can be
+received on either attached IPv4 network, subject to firewall/network policy.
+Announcements and replies follow OS routing; limited broadcast is not guaranteed
+on every adapter. The startup shim still resolves interface names for other
+configured networking; UDP does not enforce `tester_interface` or `tester_ipv4`.
+Native Windows networking and broadcast behavior have not been verified.
 
 ```bash
 docker compose exec doip-edgenode id      # uid=10001(doip) gid=10001(doip)

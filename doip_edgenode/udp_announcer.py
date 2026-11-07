@@ -15,8 +15,10 @@
 """
 DoIP EdgeNode — UDP Vehicle Announcement and Discovery.
 
-On startup: sends announce_count Vehicle Announcement messages
-(payload type 0x0004) at announce_interval_ms intervals.
+On startup: waits a random 0–500 ms, then sends announce_count Vehicle
+Announcement messages (payload type 0x0004) at announce_interval_ms intervals.
+Matching identification responses use independent random 0–500 ms waits.
+Wildcard IPv4 reception is portable; announcement/reply egress follows OS routing.
 
 Ongoing: validates UDP discovery datagrams, answers unqualified or matching
 EID/VIN-qualified identification requests, and reports configured power mode.
@@ -36,7 +38,9 @@ Vehicle Identification Response / Announcement payload structure (33 bytes):
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
+import random
 import socket
 from typing import Tuple
 
@@ -102,6 +106,24 @@ def _announcement_payload(config: AppConfig) -> bytes:
     return vin_bytes + logical_addr + eid_bytes + gid_bytes + b"\x00\x00"
 
 
+# Bound discovery scheduling independently of peer count and request rate.
+_MAX_PENDING_RESPONSES = 256
+
+
+def _create_udp_socket() -> socket.socket:
+    """Create a portable wildcard listener; outgoing traffic follows OS routing."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Do not enable address/port reuse: Windows permits overlapping UDP binds.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setblocking(False)
+        sock.bind(("0.0.0.0", DOIP_UDP_PORT))
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
 class _UDPProtocol(asyncio.DatagramProtocol):
     """Validate and dispatch requests received by the shared discovery listener."""
 
@@ -109,6 +131,40 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         self._config = config
         self._transport: asyncio.DatagramTransport | None = None
         self._payload = _announcement_payload(config)
+        self._pending_responses: set[asyncio.TimerHandle] = set()
+
+    def cancel_pending(self) -> None:
+        """Release scheduled replies without sending after transport teardown."""
+        for handle in self._pending_responses:
+            handle.cancel()
+        self._pending_responses.clear()
+
+    def _source_allowed(self, address: str) -> bool:
+        try:
+            source = ipaddress.IPv4Address(address)
+        except ipaddress.AddressValueError:
+            return False
+        if source.is_unspecified or source.is_multicast or int(source) == 0xFFFFFFFF:
+            return False
+        # Directed broadcasts require interface netmasks, not available here.
+        return True
+
+    def _schedule_discovery(self, addr: Tuple[str, int]) -> None:
+        if self._transport is None or len(self._pending_responses) >= _MAX_PENDING_RESPONSES:
+            return
+        transport = self._transport
+        logger.debug("UDPAnnouncer: scheduling identification response to %s", addr)
+        loop = asyncio.get_running_loop()
+
+        def reply() -> None:
+            if handle not in self._pending_responses:
+                return
+            self._pending_responses.discard(handle)
+            if self._transport is transport:
+                self._send(PT_VEHICLE_ID_RESPONSE, self._payload, addr)
+
+        handle = loop.call_later(random.uniform(0.0, 0.5), reply)
+        self._pending_responses.add(handle)
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:  # type: ignore[override]
         self._transport = transport
@@ -128,7 +184,7 @@ class _UDPProtocol(asyncio.DatagramProtocol):
         self._send(PT_HEADER_NACK, bytes([code]), addr)
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
-        if len(data) < 8:
+        if not self._source_allowed(addr[0]) or len(data) < 8:
             # Insufficient header to identify a complete DoIP message.
             return
 
@@ -162,16 +218,17 @@ class _UDPProtocol(asyncio.DatagramProtocol):
             return
         if payload_type == PT_VEHICLE_ID_REQUEST_VIN and data[8:] != self._payload[:17]:
             return
-        logger.debug("UDPAnnouncer: received request 0x%04X from %s", payload_type, addr)
         if payload_type == PT_POWER_MODE_REQUEST:
+            logger.debug("UDPAnnouncer: received power request from %s", addr)
             self._send(PT_POWER_MODE_RESPONSE, bytes([self._config.doip.power_mode]), addr)
         else:
-            self._send(PT_VEHICLE_ID_RESPONSE, self._payload, addr)
+            self._schedule_discovery(addr)
 
     def error_received(self, exc: Exception) -> None:
         logger.warning("UDPAnnouncer: UDP error: %s", exc)
 
     def connection_lost(self, exc: Exception | None) -> None:
+        self.cancel_pending()
         self._transport = None
         logger.debug("UDPAnnouncer: UDP transport closed: %s", exc)
 
@@ -188,34 +245,27 @@ class UDPAnnouncer:
         self._protocol: _UDPProtocol | None = None
 
     async def start(self) -> None:
-        """
-        Send announce_count announcements, then start listening for requests.
-        """
-        loop = asyncio.get_event_loop()
-
-        # Bind UDP socket on 0.0.0.0:13400 with SO_BROADCAST
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        """Start the portable wildcard listener before announcing."""
+        if self._transport is not None:
+            raise RuntimeError("UDPAnnouncer is already started")
+        loop = asyncio.get_running_loop()
+        sock = _create_udp_socket()
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except AttributeError:
-            pass  # not available on all platforms
-        sock.bind(("0.0.0.0", DOIP_UDP_PORT))
-
-        transport, protocol = await loop.create_datagram_endpoint(
-            lambda: _UDPProtocol(self._config),
-            sock=sock,
-        )
+            transport, protocol = await loop.create_datagram_endpoint(
+                lambda: _UDPProtocol(self._config), sock=sock,
+            )
+        except BaseException:
+            sock.close()
+            raise
         self._transport = transport  # type: ignore[assignment]
         self._protocol = protocol  # type: ignore[assignment]
-
-        # Send initial announcements
-        await self._send_announcements()
-
-        logger.info(
-            "UDPAnnouncer: listening on 0.0.0.0:%d", DOIP_UDP_PORT
-        )
+        try:
+            await self._send_announcements()
+        except BaseException:
+            await self.stop()
+            raise
+        logger.info("UDPAnnouncer: listening on 0.0.0.0:%d (all IPv4 interfaces; "
+                    "egress follows OS routing)", DOIP_UDP_PORT)
 
     async def _send_announcements(self) -> None:
         """Broadcast Vehicle Announcement count times."""
@@ -224,6 +274,7 @@ class UDPAnnouncer:
         count = self._config.udp.announce_count
         interval_s = self._config.udp.announce_interval_ms / 1000.0
 
+        await asyncio.sleep(random.uniform(0.0, 0.5))
         for i in range(count):
             if self._transport:
                 self._transport.sendto(frame, ("255.255.255.255", DOIP_UDP_PORT))
@@ -234,5 +285,11 @@ class UDPAnnouncer:
                 await asyncio.sleep(interval_s)
 
     async def stop(self) -> None:
-        if self._transport:
-            self._transport.close()
+        transport, protocol = self._transport, self._protocol
+        self._transport = None
+        self._protocol = None
+        if protocol is not None:
+            protocol.cancel_pending()
+            protocol._transport = None
+        if transport is not None:
+            transport.close()

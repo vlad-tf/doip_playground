@@ -110,8 +110,28 @@ appropriate Header NACK and are discarded without closing the shared UDP listene
 Optional UDP Entity Status (`0x4001`/`0x4002`) is not yet offered: truthful capacity
 and established-socket accounting must be implemented first. Requests receive
 unknown/unsupported payload NACK. Existing TCP status/power handlers are legacy
-behavior, not substitutes for the UDP services. Random discovery-response delay
-and source/interface filtering remain separate pending work.
+behavior, not substitutes for the UDP services.
+
+UDP uses a portable wildcard IPv4 listener (`0.0.0.0:13400`) without Linux-only
+socket options or interface queries. Windows compatibility takes priority over
+UDP interface isolation: `network.tester_interface` and `network.tester_ipv4` do
+not constrain UDP reception or egress. The TCP bind remains configured separately.
+Announcements target `255.255.255.255`; OS routing selects output interfaces and
+reply source addresses. A wildcard bind does not guarantee announcement fan-out
+to every adapter. Firewall and network policy must restrict access where needed.
+Native Windows operation still requires target verification.
+
+Source multicast, unspecified and limited-broadcast addresses are silently
+discarded before validation/logging/replies. Directed-broadcast filtering remains
+deferred because interface netmasks are not collected; off-subnet unicast is allowed.
+This is not an ACL, authentication or a general anti-spoofing guarantee.
+
+The first startup announcement and each matching discovery response wait an
+independently selected random 0–500 ms. Configured announcement count/interval
+remain unchanged. Pending discovery replies are capped at 256; excess requests
+are silently dropped without timers or per-drop logging. Stop/transport loss
+cancels pending replies. Power-mode responses and Header NACKs are immediate.
+Existing per-rejection warning-log flooding remains a separate logging issue.
 
 **TLS (ISO 13400-3):**
 - Port `3496` for TLS connections (both tester-facing and ECU-facing)
