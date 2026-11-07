@@ -71,7 +71,7 @@ _register_layer_bindings()
 # Middleware factory
 # ---------------------------------------------------------------------------
 
-def _build_middleware(mw_configs: list[MiddlewareConfig]) -> list[Middleware]:
+def _build_middleware(mw_configs: list[MiddlewareConfig], *, sink_owner=None) -> list[Middleware]:
     """Instantiate middleware classes from config objects."""
     from middleware.logger import LoggerMiddleware
     from middleware.drop import DropMiddleware
@@ -94,14 +94,26 @@ def _build_middleware(mw_configs: list[MiddlewareConfig]) -> list[Middleware]:
     }
 
     instances: list[Middleware] = []
-    for mw in mw_configs:
-        cls = _CLASS_MAP.get(mw.type)
-        if cls is None:
-            raise ConfigError(f"middleware: unknown type {mw.type!r}")
-        obj = cls(**mw.params)
-        obj.enabled = mw.enabled
-        instances.append(obj)
-        logger.debug("server: loaded middleware %s (enabled=%s)", mw.type, mw.enabled)
+    try:
+        for mw in mw_configs:
+            cls = _CLASS_MAP.get(mw.type)
+            if cls is None:
+                raise ConfigError(f"middleware: unknown type {mw.type!r}")
+            if cls is LoggerMiddleware:
+                # Internal lifecycle arguments must not be overridden by config.
+                params = {k: v for k, v in mw.params.items()
+                          if k not in ("_sink_owner", "_open_sink")}
+                obj = cls(**params, _sink_owner=sink_owner, _open_sink=mw.enabled)
+            else:
+                obj = cls(**mw.params)
+            obj.enabled = mw.enabled
+            instances.append(obj)
+            logger.debug("server: loaded middleware %s (enabled=%s)", mw.type, mw.enabled)
+    except BaseException:
+        for obj in instances:
+            if isinstance(obj, LoggerMiddleware):
+                obj.close()
+        raise
     return instances
 
 
@@ -112,14 +124,10 @@ def _build_middleware(mw_configs: list[MiddlewareConfig]) -> list[Middleware]:
 
 class DoIPServer:
     def __init__(self, config: AppConfig) -> None:
+        from middleware.logger import LogSinkOwner
+
         self._config = config
         self._routing_table = RoutingTable(config.routing_table)
-        # Keep constructor/configuration errors at startup, but never share
-        # these mutable instances with sessions. Log sinks remain path-scoped.
-        _build_middleware(config.middleware)
-        self._executor = ThreadPoolExecutor(
-            max_workers=8, thread_name_prefix="doip-tls"
-        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._registry = SessionRegistry(config.doip.max_connections)
         self._udp_announcer = UDPAnnouncer(config, self._registry)
@@ -133,6 +141,16 @@ class DoIPServer:
         self._closing = False
         self._startup_task: asyncio.Task | None = None
         self._serve_tasks: set[asyncio.Task] = set()
+        self._log_sink_owner = LogSinkOwner()
+        try:
+            # Validate startup parameters; connections borrow these server sinks.
+            _build_middleware(config.middleware, sink_owner=self._log_sink_owner)
+            self._executor = ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="doip-tls"
+            )
+        except BaseException:
+            self._log_sink_owner.close()
+            raise
 
     async def start(self) -> None:
         """Start all servers and run until cancelled."""
@@ -250,9 +268,12 @@ class DoIPServer:
             if sessions:
                 await asyncio.gather(*(session.close() for session in sessions),
                                      return_exceptions=True)
-            if not self._executor_shutdown:
-                self._executor_shutdown = True
-                self._executor.shutdown(wait=True)
+            try:
+                if not self._executor_shutdown:
+                    self._executor_shutdown = True
+                    self._executor.shutdown(wait=True)
+            finally:
+                self._log_sink_owner.close()
 
     async def _handle_connection(
         self,
@@ -302,7 +323,7 @@ class DoIPServer:
 
         try:
             middleware_chain = MiddlewareChain(
-                _build_middleware(self._config.middleware)
+                _build_middleware(self._config.middleware, sink_owner=self._log_sink_owner)
             )
         except Exception:
             logger.exception("DoIPServer: middleware setup failed for %s", peer)

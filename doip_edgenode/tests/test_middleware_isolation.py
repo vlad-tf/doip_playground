@@ -73,7 +73,7 @@ async def connections(configs, use_tls):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        server._executor.shutdown(wait=True)
+        await server.stop()
 
 
 @pytest.mark.parametrize("use_tls", [False, True])
@@ -166,9 +166,7 @@ def test_enabled_order_and_shared_log_sink_are_preserved(tmp_path):
             await close(a)
             assert len(chain_b[0]._logger.handlers) == 2
             sink = chain_b[0]._logger
-        for handler in list(sink.handlers):
-            sink.removeHandler(handler)
-            handler.close()
+        assert sink.handlers == []  # Server shutdown owns handler release.
 
     asyncio.run(scenario())
 
@@ -197,7 +195,7 @@ def test_connection_middleware_failure_closes_writer_and_allows_next_session(use
                 await server._handle_connection(asyncio.StreamReader(), RecordingWriter(), use_tls)
                 run.assert_awaited_once()
         finally:
-            server._executor.shutdown(wait=True)
+            await server.stop()
 
     asyncio.run(scenario())
 
@@ -227,7 +225,7 @@ def test_setup_failure_cleanup_errors_do_not_escape(failure, caplog):
                     assert writer.closed
                     writer.wait_closed.assert_awaited_once()
         finally:
-            server._executor.shutdown(wait=True)
+            await server.stop()
 
     with caplog.at_level("DEBUG", logger="server"):
         asyncio.run(scenario())

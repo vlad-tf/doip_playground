@@ -359,8 +359,20 @@ Each accepted TCP connection owns fresh middleware instances. Replay recordings,
 one-shot replay state, and header-fault cadence are local to that connection
 and reset on reconnect; traffic from one tester must never be replayed through
 another tester's session. Both directions of one connection use its same chain.
-Logger output may share the configured process-wide log sink; session-local
-middleware must not close that shared sink.
+Logger output shares a canonical-path sink leased by its server. Session
+middleware only borrows it; server shutdown releases its leases after draining
+sessions and leaves other owners' leases intact. Standalone LoggerMiddleware
+users must call `close()`. Disabled entries validate without opening a sink.
+Constructor failure rolls back acquired server leases.
+
+Logger middleware rotates at 5 MiB with three backups (about 20 MiB per path,
+with bounded UTF-8/newline record overshoot), caps hex output at 4096 raw bytes
+and records at 16 KiB, marking truncation without changing forwarded packets.
+These are fixed product defaults, not ISO limits or new YAML parameters.
+Pre-existing oversized files rotate on the next write. Same-process ownership
+assumes one event-loop thread; cross-thread/multiprocess rotation is not offered.
+Full packet serialization, synchronous I/O, console rate and module/root warning
+floods remain separate limitations, not bounded by this retention policy.
 
 ### Interface
 

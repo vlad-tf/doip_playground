@@ -83,8 +83,12 @@ doip_edgenode/
   of forwarding.
 - Middleware instances are owned by one accepted TCP connection, not shared
   across sessions. Replay buffers and header-fault counters reset on reconnect;
-  both directions of a connection use its same chain. Logger output can share
-  the path-scoped process logger, which sessions must not close.
+  both directions of a connection use its same chain. Logger output shares a
+  canonical-path sink leased by its server; sessions must not close the sink.
+  Server shutdown releases its leases after draining sessions; other servers or
+  standalone owners on that path retain theirs. Standalone LoggerMiddleware
+  users must call its idempotent `close()`. Disabled logger entries validate
+  parameters without opening files.
 - Middleware parameter bounds: corrupt offsets are nonnegative or `None`, XOR
   masks are `0..255`, address overrides are `0..65535` or `None`, and delay/jitter
   are nonnegative integer milliseconds. Numeric strings (decimal or `0x`) are
@@ -115,7 +119,7 @@ doip_edgenode/
   continue. Discard reads at most 4096 bytes per chunk, yields between chunks and
   has one 2-second deadline. EOF or deadline expiry closes because the next header
   cannot safely be identified. This bounds application discard memory/time, not
-  aggregate traffic, transport buffering or warning-log rate (F18).
+  aggregate traffic, transport buffering or warning-log rate (separate backlog).
 
 ### UDP discovery boundary
 
@@ -144,7 +148,7 @@ doip_edgenode/
   random waits of 0–500 ms. Configured announcement count/interval remain supported.
   At most 256 discovery replies are pending; excess requests are silently dropped
   without new timers/logs. Stop/transport loss cancels pending replies. Power/NACK
-  replies are immediate. Per-rejection WARNING flooding remains F18.
+  replies are immediate. Per-rejection WARNING flooding remains separate backlog.
 - Entity Status `0x4001`/`0x4002` is supported on TCP and UDP with the mandatory
   three-byte payload only: existing `node_type`, configured MCTS `n`, and live
   NCTS (all open initialized/reserve inbound sockets). Do not add the optional
@@ -333,6 +337,18 @@ an empty response or substitute the ECU or EdgeNode node address.
 `DEBUG` every frame + middleware decisions · `INFO` session lifecycle/timers ·
 `WARNING` protocol violations/NACKs/injected faults · `ERROR` TLS/ECU
 failures · `CRITICAL` unhandled exceptions.
+
+Logger middleware uses stdlib rotation at 5 MiB with three backups (roughly
+20 MiB retained per canonical path, allowing bounded UTF-8/newline record
+overshoot). Optional hex shows at most 4096 raw bytes and marks truncation;
+records are capped at 16 KiB. These are product logging defaults, not protocol
+limits or YAML settings. Sinks are private logging.Logger objects, removed from
+our live registry on final release; unrelated/global logging handlers are not
+closed. Ownership assumes construction/teardown on one event-loop thread; this
+is not multiprocess or cross-thread rotation coordination. Existing oversized
+files rotate on the next write, not during construction. Full packet
+serialization, synchronous I/O, console output rate and module/root WARNING
+flooding remain unbounded/deferred; F18 rotation does not fix those concerns.
 
 ### Config validation checklist (`load_config` must reject all of these)
 

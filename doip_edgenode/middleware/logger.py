@@ -78,33 +78,88 @@ def _get_plen(pkt) -> int | None:
         return None
 
 
+# Product logging policy, not an ISO protocol limit.
+_MAX_BYTES = 5 * 1024 * 1024
+_BACKUP_COUNT = 3
+_MAX_HEX_BYTES = 4096
+_MAX_RECORD_BYTES = 16 * 1024
+# Only live sinks are retained here; do not grow logging's global name registry.
+_sinks: dict[str, tuple[logging.Logger, int]] = {}
+
+
+def _sink_path(log_path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(log_path)))
+
+
 def _make_logger(log_path: str) -> logging.Logger:
-    """Create (or retrieve) a logger that writes to file + stdout."""
-    log_name = f"doip.{log_path}"
-    lgr = logging.getLogger(log_name)
-    if lgr.handlers:
-        return lgr  # already configured
-
-    lgr.setLevel(logging.DEBUG)
-
-    # Ensure the log directory exists
-    log_dir = os.path.dirname(log_path)
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-
-    fmt = logging.Formatter("%(message)s")
-
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    lgr.addHandler(file_handler)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(fmt)
-    lgr.addHandler(stream_handler)
-
-    # Prevent propagation to root logger to avoid duplicate output
+    """Acquire one lease on a canonical path's rotating file + stream sink."""
+    path = _sink_path(log_path)
+    if path in _sinks:
+        lgr, references = _sinks[path]
+        _sinks[path] = (lgr, references + 1)
+        return lgr
+    lgr = logging.Logger(f"doip.{path}", logging.DEBUG)
     lgr.propagate = False
+    log_dir = os.path.dirname(path)
+    os.makedirs(log_dir, exist_ok=True)
+    handlers: list[logging.Handler] = []
+    try:
+        handlers.append(logging.handlers.RotatingFileHandler(
+            path, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8"
+        ))
+        handlers.append(logging.StreamHandler())
+        fmt = logging.Formatter("%(message)s")
+        for handler in handlers:
+            handler.setFormatter(fmt)
+            lgr.addHandler(handler)
+    except BaseException:
+        for handler in handlers:
+            lgr.removeHandler(handler)
+            handler.close()
+        raise
+    _sinks[path] = (lgr, 1)
     return lgr
+
+
+def _release_logger(path: str, lgr: logging.Logger) -> None:
+    current = _sinks.get(path)
+    if current is None or current[0] is not lgr:
+        return
+    if current[1] > 1:
+        _sinks[path] = (lgr, current[1] - 1)
+        return
+    del _sinks[path]
+    for handler in list(lgr.handlers):
+        lgr.removeHandler(handler)
+        handler.close()
+
+
+class LogSinkOwner:
+    """One server's leases; session middleware borrows without acquiring refs.
+
+    Construction and shutdown run synchronously on the server's event-loop
+    thread. This registry is not a cross-thread or multiprocess logging service.
+    """
+
+    def __init__(self) -> None:
+        self._loggers: dict[str, logging.Logger] = {}
+        self._closed = False
+
+    def acquire(self, log_path: str) -> logging.Logger:
+        if self._closed:
+            raise RuntimeError("log sink owner is closed")
+        path = _sink_path(log_path)
+        if path not in self._loggers:
+            self._loggers[path] = _make_logger(path)
+        return self._loggers[path]
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        loggers, self._loggers = self._loggers, {}
+        for path, lgr in loggers.items():
+            _release_logger(path, lgr)
 
 
 class LoggerMiddleware(Middleware):
@@ -113,15 +168,36 @@ class LoggerMiddleware(Middleware):
 
     Config params:
         log_path (str):  Path for the log file.  Directory is created on startup.
-        hex_dump (bool): If True, include a full hex dump of the raw packet bytes.
+        hex_dump (bool): If True, include up to 4096 raw bytes, marking truncation.
+
+    Standalone users must call close(); server-created instances borrow sinks
+    released by server shutdown. Rotation retains three 5 MiB backups; records
+    are capped at 16 KiB. Serialization still builds bytes(pkt), so this is not
+    a total CPU/allocation/output-rate bound.
     """
 
-    def __init__(self, log_path: str = "logs/doip.log", hex_dump: bool = True, **_):
+    def __init__(self, log_path: str = "logs/doip.log", hex_dump: bool = True,
+                 *, _sink_owner: LogSinkOwner | None = None,
+                 _open_sink: bool = True, **_):
         if not isinstance(log_path, str) or not log_path.strip():
             raise ValueError("log_path must be a non-empty string")
         self.log_path = log_path
         self.hex_dump = _strict_bool(hex_dump, "hex_dump")
-        self._logger = _make_logger(log_path)
+        self._closed = False
+        self._owns_sink = _open_sink and _sink_owner is None
+        self._sink_path = _sink_path(log_path)
+        self._logger = None
+        if _open_sink:
+            self._logger = (_make_logger(log_path) if _sink_owner is None
+                            else _sink_owner.acquire(log_path))
+
+    def close(self) -> None:
+        """Release standalone ownership only; a session cannot close its server sink."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_sink and self._logger is not None:
+            _release_logger(self._sink_path, self._logger)
 
     async def process(
         self,
@@ -129,6 +205,8 @@ class LoggerMiddleware(Middleware):
         direction: Literal["tester_to_ecu", "ecu_to_tester"],
         session: "DoIPSession",
     ):
+        if self._closed or self._logger is None or not self._logger.handlers:
+            return pkt
         try:
             ptype = _get_ptype(pkt)
             plen = _get_plen(pkt)
@@ -146,11 +224,18 @@ class LoggerMiddleware(Middleware):
             if self.hex_dump:
                 try:
                     raw = bytes(pkt)
-                    hex_str = raw.hex(" ")
+                    hex_str = raw[:_MAX_HEX_BYTES].hex(" ")
                     line += f"\n  hex: {hex_str}"
+                    if len(raw) > _MAX_HEX_BYTES:
+                        line += f" ... [truncated; {len(raw)} total bytes]"
                 except Exception:
                     pass
 
+            # Bound UTF-8 records as well as hex output (including unusual fields).
+            encoded = line.encode("utf-8")
+            if len(encoded) > _MAX_RECORD_BYTES:
+                line = encoded[:_MAX_RECORD_BYTES - 32].decode("utf-8", errors="ignore")
+                line += " ... [record truncated]"
             self._logger.debug(line)
         except Exception:
             # LoggerMiddleware must never throw for a valid packet

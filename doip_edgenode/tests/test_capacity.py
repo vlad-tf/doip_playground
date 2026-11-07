@@ -80,7 +80,9 @@ def test_default_and_bounds_and_shared_status():
 
 def server_fixture(capacity):
     from server import DoIPServer
+    from middleware.logger import LogSinkOwner
     obj = DoIPServer.__new__(DoIPServer)
+    obj._log_sink_owner = LogSinkOwner()
     obj._registry = SessionRegistry(capacity)
     obj._closing = False
     obj._sessions = set()

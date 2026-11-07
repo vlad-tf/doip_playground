@@ -120,6 +120,7 @@ class TestLoggerMiddleware:
         session = FakeSession()
         result = run(lm.process(pkt, "tester_to_ecu", session))
         assert result is pkt  # pass-through
+        lm.close()
 
     def test_does_not_raise_for_any_packet(self, tmp_path):
         from middleware.logger import LoggerMiddleware
@@ -128,6 +129,7 @@ class TestLoggerMiddleware:
         # Deliberately pass a non-packet object; must not raise
         result = run(lm.process(object(), "ecu_to_tester", session))
         assert result is not None
+        lm.close()
 
     def test_writes_to_log_file(self, tmp_path):
         from middleware.logger import LoggerMiddleware
@@ -137,6 +139,7 @@ class TestLoggerMiddleware:
         session = FakeSession()
         run(lm.process(pkt, "tester_to_ecu", session))
         assert log_file.exists()
+        lm.close()
 
 
 # ---------------------------------------------------------------------------
