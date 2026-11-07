@@ -165,7 +165,7 @@ def test_pre_activation_short_alive_response_does_not_reach_scapy(payload):
         session.reader.feed_data(frame(8, payload))
         session.reader.feed_eof()
         await asyncio.wait_for(session.run(), 0.3)
-        assert writer.closed and writer.frames == []
+        assert writer.closed and writer.frames == [frame(0, b"\x04")]
 
     asyncio.run(scenario())
 

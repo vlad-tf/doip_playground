@@ -399,3 +399,81 @@ def test_setblocking_failure_closes_raw_socket():
         assert raw.closed and not conn.connected
 
     asyncio.run(scenario())
+
+
+HEADER_NACK = 0x0000
+
+
+@pytest.mark.parametrize("code", [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xFF])
+def test_ra_ignores_each_valid_header_nack_code_before_valid_response(code):
+    async def scenario():
+        conn = connection()
+        conn._reader = asyncio.StreamReader()
+        conn._writer = RecordingWriter()
+        conn._connected = True
+        conn._reader.feed_data(frame(HEADER_NACK, bytes([code])))
+        conn._reader.feed_data(frame(RA_RESPONSE, ra_payload()))
+
+        await conn._do_routing_activation(TESTER)
+        assert conn._writer.frames == [
+            frame(RA_REQUEST, struct.pack("!HB", TESTER, 0) + b"\0" * 4)
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_background_valid_header_nack_is_ignored_and_diagnostic_is_only_received_frame():
+    async def scenario():
+        conn = connection()
+        conn._reader = asyncio.StreamReader()
+        conn._writer = RecordingWriter()
+        conn._connected = True
+        conn._tester_logical_addr = TESTER
+        diagnostic = frame(DIAGNOSTIC, b"abcde")
+        conn._reader.feed_data(frame(HEADER_NACK, b"\xFE"))
+        conn._reader.feed_data(diagnostic)
+        conn._reader_task = asyncio.create_task(conn._background_reader())
+        try:
+            assert await asyncio.wait_for(conn.recv(), 0.3) == diagnostic
+            assert conn._writer.frames == []
+        finally:
+            await asyncio.wait_for(conn.close(), 0.3)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("payload", [b"", b"\x00\x01"])
+def test_background_malformed_header_nack_is_terminal_without_client_nack(payload):
+    async def scenario():
+        conn = connection()
+        conn._reader = asyncio.StreamReader()
+        conn._writer = RecordingWriter()
+        conn._connected = True
+        conn._reader.feed_data(frame(HEADER_NACK, payload))
+        conn._reader_task = asyncio.create_task(conn._background_reader())
+        await asyncio.wait_for(conn._reader_task, 0.3)
+
+        assert not conn.connected
+        assert conn._writer.frames == []
+        with pytest.raises(ConnectionError):
+            await conn.recv()
+
+    asyncio.run(scenario())
+
+
+def test_three_valid_header_nacks_during_ra_fail_with_bounded_setup_budget():
+    async def scenario():
+        conn = connection()
+        conn._reader = asyncio.StreamReader()
+        conn._writer = RecordingWriter()
+        conn._connected = True
+        for code in (0x00, 0x01, 0xFF):
+            conn._reader.feed_data(frame(HEADER_NACK, bytes([code])))
+
+        with pytest.raises(RuntimeError, match="no Routing Activation Response"):
+            await asyncio.wait_for(conn._do_routing_activation(TESTER), 0.3)
+        assert conn._writer.frames == [
+            frame(RA_REQUEST, struct.pack("!HB", TESTER, 0) + b"\0" * 4)
+        ]
+
+    asyncio.run(scenario())

@@ -76,6 +76,19 @@ PT_DIAGNOSTIC_MESSAGE = 0x8001
 PT_DIAGNOSTIC_POSITIVE_ACK = 0x8002
 PT_DIAGNOSTIC_NEGATIVE_ACK = 0x8003
 
+# Listener-supported types only; response-only/UDP discovery types stay unsupported.
+_TCP_PAYLOAD_LENGTHS = {
+    PT_HEADER_NACK: (1,),
+    PT_ROUTING_ACTIVATION_REQUEST: (7, 11),
+    PT_ALIVE_CHECK_REQUEST: (0,),
+    PT_ALIVE_CHECK_RESPONSE: (2,),
+    PT_ENTITY_STATUS_REQUEST: (0,),  # retained legacy TCP service
+    PT_POWER_MODE_REQUEST: (0,),    # retained legacy TCP service
+    PT_DIAGNOSTIC_MESSAGE: None,    # addresses plus at least one user-data byte
+}
+_TCP_DISCARD_CHUNK_BYTES = 4096
+_TCP_DISCARD_TIMEOUT_S = 2.0
+
 # Alive Check probe timeout (seconds) — how long to wait for the existing
 # tester to respond before considering it dead and evicting its session.
 _ALIVE_PROBE_TIMEOUT_S = 0.5
@@ -207,6 +220,8 @@ class DoIPSession:
     async def _session_loop(self) -> None:
         while True:
             raw = await self._read_frame()
+            if raw is None:
+                continue  # rejected body was consumed without losing framing
             # Only reset the general inactivity timer after activation.
             # Before activation the T_TCP_Initial_Inactivity timer is in charge;
             # resetting here would create a premature general timer and, after
@@ -214,60 +229,58 @@ class DoIPSession:
             # second one — resulting in two concurrent timers.
             if self.activated:
                 self._reset_inactivity_timer()
-            if (not self.activated and int.from_bytes(raw[2:4], "big")
-                    in (PT_ALIVE_CHECK_REQUEST, PT_ALIVE_CHECK_RESPONSE)):
+            ptype = int.from_bytes(raw[2:4], "big")
+            if ptype == PT_HEADER_NACK:
+                await asyncio.sleep(0)
+                continue  # never dissect or answer a valid received Header NACK
+            if not self.activated and ptype in (PT_ALIVE_CHECK_REQUEST, PT_ALIVE_CHECK_RESPONSE):
                 continue
             pkt = self._dissect(raw)
             await self._dispatch(pkt)
 
-    async def _read_frame(self) -> bytes:
-        """
-        Read one complete DoIP frame.  Validates version/inverse bytes
-        and enforces max_payload_bytes.  Sends a Header NACK and raises
-        on any validation failure.
-        """
-        try:
-            header = await self.reader.readexactly(DOIP_HEADER_LEN)
-        except asyncio.IncompleteReadError:
-            raise
-
-        # Validate version pattern
-        ver = header[0]
-        inv = header[1]
+    async def _read_frame(self) -> bytes | None:
+        """Validate wire shape before dissection; None means discard-and-continue."""
+        header = await self.reader.readexactly(DOIP_HEADER_LEN)
+        ver, inv = header[:2]
         if ver not in _VALID_VERSIONS or inv != (0xFF ^ ver):
-            logger.warning(
-                "DoIPSession: invalid header bytes ver=0x%02X inv=0x%02X from %s",
-                ver,
-                inv,
-                self._peer,
-            )
-            await self._send_header_nack(0x00)  # incorrect pattern format
+            await self._send_header_nack(0x00)
             raise DoIPProtocolError("invalid header pattern")
 
-        payload_len = int.from_bytes(header[4:8], "big")
-
-        if payload_len > self.config.doip.max_payload_bytes:
-            logger.warning(
-                "DoIPSession: payload too large (%d > %d) from %s",
-                payload_len,
-                self.config.doip.max_payload_bytes,
-                self._peer,
-            )
-            await self._send_header_nack(0x02)  # message too large
-            raise DoIPProtocolError("payload too large")
-
         ptype = int.from_bytes(header[2:4], "big")
-        if self.activated and ptype in (PT_ALIVE_CHECK_REQUEST, PT_ALIVE_CHECK_RESPONSE):
-            expected = 0 if ptype == PT_ALIVE_CHECK_REQUEST else 2
-            if payload_len != expected:
-                await self._send_header_nack(0x04)
-                raise DoIPProtocolError("invalid alive-check payload length")
+        payload_len = int.from_bytes(header[4:8], "big")
+        if ptype not in _TCP_PAYLOAD_LENGTHS:
+            await self._send_header_nack(0x01)
+            await self._discard_payload(payload_len)
+            return None
+        if payload_len > self.config.doip.max_payload_bytes:
+            await self._send_header_nack(0x02)
+            await self._discard_payload(payload_len)
+            return None
 
-        if payload_len == 0:
-            return header
-
+        lengths = _TCP_PAYLOAD_LENGTHS[ptype]
+        valid_length = payload_len >= 5 if lengths is None else payload_len in lengths
+        if not valid_length:
+            await self._send_header_nack(0x04)
+            raise DoIPProtocolError(f"invalid payload length for 0x{ptype:04X}")
         payload = await self.reader.readexactly(payload_len)
         return header + payload
+
+    async def _discard_payload(self, payload_len: int) -> None:
+        """Stream rejected bytes within one deadline, never allocating their full size."""
+        async def discard() -> None:
+            remaining = payload_len
+            while remaining:
+                size = min(remaining, _TCP_DISCARD_CHUNK_BYTES)
+                await self.reader.readexactly(size)
+                remaining -= size
+                # Buffered hostile streams must not starve timers/other sessions.
+                await asyncio.sleep(0)
+
+        if payload_len:
+            try:
+                await asyncio.wait_for(discard(), timeout=_TCP_DISCARD_TIMEOUT_S)
+            except asyncio.TimeoutError as exc:
+                raise DoIPProtocolError("rejected payload discard timed out") from exc
 
     def _dissect(self, raw: bytes):
         """Dissect raw bytes into a Scapy DoIP packet."""
@@ -288,6 +301,9 @@ class DoIPSession:
             self.activated,
             self._peer,
         )
+
+        if ptype == PT_HEADER_NACK:
+            return  # valid received NACKs never produce another NACK
 
         # Alive requests are generated by the vehicle-side entity, not testers.
         if ptype in (PT_ALIVE_CHECK_REQUEST, PT_ALIVE_CHECK_RESPONSE):
@@ -335,7 +351,9 @@ class DoIPSession:
             "DoIPSession: unhandled payload type 0x%04X from %s", ptype, self._peer
         )
         await self._send_header_nack(0x01)
-        raise DoIPProtocolError(f"unknown payload type 0x{ptype:04X}")
+        # Normal wire input was already discarded in _read_frame. Direct callers
+        # have supplied a complete packet, so no stream bytes remain to consume.
+
 
     # ------------------------------------------------------------------
     # Handlers

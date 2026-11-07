@@ -100,6 +100,22 @@ doip_edgenode/
   needing owned external resources requires an explicit lifecycle design
   before being added to this construction path.
 
+### TCP framing boundary
+
+- Validate listener-supported type and configured cap, then type-specific payload
+  length before Scapy/handlers, independent of activation. Routing requests are
+  7/11 bytes, Header NACKs 1, alive requests/responses 0/2, legacy TCP status/power
+  requests 0, and diagnostic messages at least 5. Response-only and UDP discovery
+  types remain unsupported on the tester TCP listener.
+- Valid received Header NACKs are ignored on both legs, never answered or relayed.
+  ECU setup retains its three-frame budget; malformed ECU input fails that leg
+  without emitting a client Header NACK.
+- TCP errors `0x00`/`0x04` close; `0x01`/`0x02` discard the declared body then
+  continue. Discard reads at most 4096 bytes per chunk, yields between chunks and
+  has one 2-second deadline. EOF or deadline expiry closes because the next header
+  cannot safely be identified. This bounds application discard memory/time, not
+  aggregate traffic, transport buffering or warning-log rate (F18).
+
 ### UDP discovery boundary
 
 - `udp_announcer.py` validates one complete datagram before dispatch: version/
@@ -274,8 +290,11 @@ an empty response or substitute the ECU or EdgeNode node address.
 
 | Condition | Response | Then |
 |---|---|---|
-| Malformed header (bad version/inverse/too large) | Header NACK `0x0000` | close, log WARNING |
-| Unknown payload type | Header NACK `0x01` | close, log WARNING |
+| Bad TCP version/inverse | Header NACK `0x00` | close, log WARNING |
+| Invalid supported TCP payload length | Header NACK `0x04` | close, log WARNING |
+| Unsupported TCP payload type | Header NACK `0x01` | bounded body discard, keep socket if successful |
+| Supported TCP payload exceeds configured cap | Header NACK `0x02` | bounded body discard, keep socket if successful |
+| Valid received Header NACK | none | ignore; no reply/relay |
 | Diagnostic message before Routing Activation | Diag Negative ACK `0x8003` code `0x02` | close, log WARNING |
 | TLS handshake failure | (TLS layer sends its own alert) | close, log ERROR, no DoIP message |
 | No routing entry for the message's target ecu_logical_addr | Diag Negative ACK `0x8003` code `0x03` (unknown target address) | keep tester session open |

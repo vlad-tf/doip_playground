@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 # DoIP frame constants used for the ECU-facing Routing Activation
 _DOIP_VER            = 0x02
+_PT_HEADER_NACK      = 0x0000
 _PT_RA_REQUEST       = 0x0005
 _PT_RA_RESPONSE      = 0x0006
 _PT_ALIVE_CHECK_REQ  = 0x0007
@@ -272,6 +273,8 @@ class ECUConnection:
             raw = await asyncio.wait_for(self._read_frame(), timeout=5.0)
             ptype = struct.unpack("!H", raw[2:4])[0]
 
+            if ptype == _PT_HEADER_NACK:
+                continue  # ignored, but still consumes the bounded setup budget
             if ptype == _PT_ALIVE_CHECK_REQ:
                 # Compatibility: some ECUs probe before returning the RA result.
                 logger.debug("ECUConnection: received early Alive Check Request")
@@ -329,6 +332,10 @@ class ECUConnection:
                 raw = await self._read_frame()
                 ptype = struct.unpack("!H", raw[2:4])[0]
 
+                if ptype == _PT_HEADER_NACK:
+                    # Buffered NACK floods must not monopolize the event loop.
+                    await asyncio.sleep(0)
+                    continue  # never queue/relay or answer a valid received NACK
                 if ptype == _PT_ALIVE_CHECK_REQ:
                     logger.debug(
                         "ECUConnection: received Alive Check Request from ECU — replying"

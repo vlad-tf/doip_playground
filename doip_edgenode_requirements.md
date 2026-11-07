@@ -170,6 +170,24 @@ Existing per-rejection warning-log flooding remains a separate logging issue.
 - **Inverse version byte (byte 1):** `0xFF XOR version`. For v2: `0xFD`. For v3: `0xFC`. Validate on every received frame; send Header NACK `0x00` on mismatch.
 - **Payload length (bytes 4–7):** big-endian uint32. Enforce a maximum value (configurable, default 4096 bytes); send Header NACK `0x02` if exceeded.
 
+Tester-facing TCP validates supported payload type before cap/shape checks and
+before Scapy dissection. Supported request lengths: Routing Activation 7 or 11,
+alive request/response 0/2, retained legacy status/power requests 0, diagnostic
+messages at least 5, and received Header NACK exactly 1 byte. Response-only and
+UDP discovery types remain unsupported on this listener. Validation precedes
+activation policy; malformed pre-activation messages are not dispatched.
+
+TCP Header NACK `0x00` (pattern) and `0x04` (type length) close the connection.
+`0x01` (unsupported type) and `0x02` (configured cap) discard only that message:
+consume its body in at most 4096-byte chunks with cooperative yields and one
+2-second total deadline, then resume framing. EOF/timeout closes the connection
+because stream alignment is not recoverable. No buffer is allocated from the
+rejected declared size. Valid received Header NACKs are ignored on both legs,
+not answered or relayed; ECU setup still has its bounded three-frame budget.
+Malformed ECU input fails the ECU leg without a client-generated Header NACK.
+Transport buffering, warning-log rate limiting and full lifecycle policy remain
+separate work.
+
 ---
 
 ## TLS 1.3 requirements
