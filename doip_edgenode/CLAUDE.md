@@ -100,6 +100,22 @@ doip_edgenode/
   needing owned external resources requires an explicit lifecycle design
   before being added to this construction path.
 
+### UDP discovery boundary
+
+- `udp_announcer.py` validates one complete datagram before dispatch: version/
+  inverse, listener-supported type, configured payload cap, fixed payload shape
+  and exact declared/actual length. Never allocate buffers from declared size.
+- Discovery requests `0x0001`/`0x0002`/`0x0003` accept the default version `0xFF`
+  with inverse `0x00`; other requests accept `0x02`/`0x03`. Responses remain `0x02`.
+- EID/VIN-qualified discovery replies only on exact byte matches. Power request
+  `0x4003` is empty and returns `0x4004` with one configured power-mode byte.
+- Valid received NACKs and announcements are ignored. Short headers are silently
+  discarded; invalid complete messages receive Header NACK without closing the
+  shared listener. UDP has no per-peer stream to drain or connection to close.
+- Optional UDP status awaits truthful socket/capacity accounting; do not copy the
+  existing TCP handler's hardcoded counts into a new UDP response. Random response
+  delay and source/interface filtering are still pending separate fixes.
+
 ### asyncio patterns
 
 - Never use bare `reader.read()` — always `readexactly(n)` for a known

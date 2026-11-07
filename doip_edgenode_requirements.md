@@ -92,9 +92,26 @@ Tester (PC) ──[IPv4 · eth0]──► RPi EdgeNode ──[IPv6 · eth1]─�
 
 | Message type | Code | Notes |
 |---|---|---|
-| Vehicle Identification Request | `0x0001` | Respond with VIN/EID/GID |
-| Vehicle Identification Response | `0x0004` | Broadcast + unicast |
+| Vehicle Identification Request | `0x0001` | Empty payload; respond with VIN/node address/EID/GID |
+| Vehicle Identification Request with EID | `0x0002` | Six-byte EID; respond only on an exact match |
+| Vehicle Identification Request with VIN | `0x0003` | Seventeen-byte VIN; respond only on an exact match |
+| Vehicle Identification Response | `0x0004` | Broadcast + unicast; incoming announcements are not answered |
 | Vehicle Announcement | `0x0004` | Send on startup (configurable count and interval) |
+| Power Mode Info Request/Response | `0x4003` / `0x4004` | Empty request; one configured power-mode byte in unicast response |
+| DoIP Header NACK | `0x0000` | Report malformed/unsupported requests; valid received NACKs are ignored |
+
+The UDP listener requires one complete message per datagram: valid version/inverse,
+exact declared/actual length, supported payload shape and configured payload cap.
+Discovery requests accept the default `0xFF` version with inverse `0x00`; ordinary
+requests accept `0x02`/`0x03`. Responses retain the existing `0x02` version.
+Too-short headers are discarded silently. Invalid complete messages receive the
+appropriate Header NACK and are discarded without closing the shared UDP listener.
+
+Optional UDP Entity Status (`0x4001`/`0x4002`) is not yet offered: truthful capacity
+and established-socket accounting must be implemented first. Requests receive
+unknown/unsupported payload NACK. Existing TCP status/power handlers are legacy
+behavior, not substitutes for the UDP services. Random discovery-response delay
+and source/interface filtering remain separate pending work.
 
 **TLS (ISO 13400-3):**
 - Port `3496` for TLS connections (both tester-facing and ECU-facing)
