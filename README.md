@@ -82,8 +82,9 @@ both — use it when the tester under test actually cares what the ECU says.
 
 The full protocol/behaviour spec is
 [`doip_edgenode_requirements.md`](doip_edgenode_requirements.md).
-Known PoC limitations (single tester connection, no TLS handshake, etc.) are
-listed at the end of [`RASPBERRY_PI_SETUP.md`](RASPBERRY_PI_SETUP.md#10--known-limitations-poc)
+Known PoC limitations (configured multi-tester capacity is supported, TLS handshake
+is a plaintext placeholder and TLS conformance is unclaimed, etc.) are listed
+at the end of [`RASPBERRY_PI_SETUP.md`](RASPBERRY_PI_SETUP.md#10--known-limitations-poc)
 and apply to both the Docker and bare-metal setups.
 
 ---

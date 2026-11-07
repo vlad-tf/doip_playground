@@ -93,6 +93,8 @@ class DoIPConfig:
     #:   tester_addr_list:  explicit individual addresses outside that block
     tester_addr_range: tuple[int, int] = DEFAULT_TESTER_ADDR_RANGE
     tester_addr_list: tuple[int, ...] = ()
+    # One additional socket is reserved for routing-activation decisions.
+    max_connections: int = 8
 
     def is_tester_allowed(self, addr: int) -> bool:
         low, high = self.tester_addr_range
@@ -367,6 +369,9 @@ def _load_doip(raw: dict) -> DoIPConfig:
         ),
         tester_addr_range=tuple(bounds),
         tester_addr_list=tuple(addresses),
+        max_connections=_bounded(
+            raw.get("max_connections", 8), "doip.max_connections", 1, 254
+        ),
     )
 
 

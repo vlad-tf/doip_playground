@@ -45,6 +45,7 @@ import socket
 from typing import Tuple
 
 from config import AppConfig
+from session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ PT_VEHICLE_ID_REQUEST = 0x0001
 PT_VEHICLE_ID_REQUEST_EID = 0x0002
 PT_VEHICLE_ID_REQUEST_VIN = 0x0003
 PT_VEHICLE_ID_RESPONSE = 0x0004
+PT_ENTITY_STATUS_REQUEST = 0x4001
+PT_ENTITY_STATUS_RESPONSE = 0x4002
 PT_POWER_MODE_REQUEST = 0x4003
 PT_POWER_MODE_RESPONSE = 0x4004
 
@@ -68,6 +71,7 @@ _UDP_PAYLOAD_LENGTHS = {
     PT_VEHICLE_ID_REQUEST_VIN: (17,),
     # The final synchronization-status byte is optional on received messages.
     PT_VEHICLE_ID_RESPONSE: (32, 33),
+    PT_ENTITY_STATUS_REQUEST: (0,),
     PT_POWER_MODE_REQUEST: (0,),
 }
 _DISCOVERY_REQUESTS = {
@@ -127,8 +131,9 @@ def _create_udp_socket() -> socket.socket:
 class _UDPProtocol(asyncio.DatagramProtocol):
     """Validate and dispatch requests received by the shared discovery listener."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, registry: SessionRegistry | None = None) -> None:
         self._config = config
+        self._registry = registry if registry is not None else SessionRegistry(config.doip.max_connections)
         self._transport: asyncio.DatagramTransport | None = None
         self._payload = _announcement_payload(config)
         self._pending_responses: set[asyncio.TimerHandle] = set()
@@ -199,9 +204,7 @@ class _UDPProtocol(asyncio.DatagramProtocol):
             return
         lengths = _UDP_PAYLOAD_LENGTHS.get(payload_type)
         if lengths is None:
-            # Optional entity status is unsupported until capacity/socket
-            # accounting can provide truthful values; TCP-only types are not
-            # requests on this listener either.
+            # Response-only and TCP-only types are unsupported on this listener.
             self._reject(0x01, addr)
             return
         payload_length = int.from_bytes(data[4:8], "big")
@@ -218,7 +221,10 @@ class _UDPProtocol(asyncio.DatagramProtocol):
             return
         if payload_type == PT_VEHICLE_ID_REQUEST_VIN and data[8:] != self._payload[:17]:
             return
-        if payload_type == PT_POWER_MODE_REQUEST:
+        if payload_type == PT_ENTITY_STATUS_REQUEST:
+            self._send(PT_ENTITY_STATUS_RESPONSE,
+                       self._registry.status_payload(self._config), addr)
+        elif payload_type == PT_POWER_MODE_REQUEST:
             logger.debug("UDPAnnouncer: received power request from %s", addr)
             self._send(PT_POWER_MODE_RESPONSE, bytes([self._config.doip.power_mode]), addr)
         else:
@@ -239,8 +245,9 @@ class UDPAnnouncer:
     Request/Response ongoing.
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, registry: SessionRegistry | None = None) -> None:
         self._config = config
+        self._registry = registry if registry is not None else SessionRegistry(config.doip.max_connections)
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: _UDPProtocol | None = None
 
@@ -252,7 +259,7 @@ class UDPAnnouncer:
         sock = _create_udp_socket()
         try:
             transport, protocol = await loop.create_datagram_endpoint(
-                lambda: _UDPProtocol(self._config), sock=sock,
+                lambda: _UDPProtocol(self._config, self._registry), sock=sock,
             )
         except BaseException:
             sock.close()

@@ -121,8 +121,8 @@ class DoIPServer:
             max_workers=8, thread_name_prefix="doip-tls"
         )
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._registry = SessionRegistry()
-        self._udp_announcer = UDPAnnouncer(config)
+        self._registry = SessionRegistry(config.doip.max_connections)
+        self._udp_announcer = UDPAnnouncer(config, self._registry)
 
     async def start(self) -> None:
         """Start all servers and run until cancelled."""
@@ -167,7 +167,30 @@ class DoIPServer:
         writer: asyncio.StreamWriter,
         use_tls: bool,
     ) -> None:
-        """Called by asyncio for each new incoming TCP connection."""
+        """Reserve capacity before handshake/setup; overflow gets no DoIP response."""
+        if not self._registry.reserve(writer):
+            try:
+                writer.close()
+            except Exception:
+                logger.debug("DoIPServer: overflow writer cleanup failed", exc_info=True)
+            return
+        try:
+            await self._run_connection(reader, writer, use_tls)
+        finally:
+            # Release synchronously even if session teardown is interrupted.
+            try:
+                writer.close()
+            except Exception:
+                logger.debug("DoIPServer: writer cleanup failed", exc_info=True)
+                self._registry.release(writer)
+            else:
+                self._registry.release(writer)
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+                except Exception:
+                    logger.debug("DoIPServer: writer cleanup failed", exc_info=True)
+
+    async def _run_connection(self, reader, writer, use_tls: bool) -> None:
         peer = writer.get_extra_info("peername")
         logger.info("DoIPServer: new connection from %s (use_tls=%s)", peer, use_tls)
 
@@ -184,11 +207,6 @@ class DoIPServer:
             )
         except Exception:
             logger.exception("DoIPServer: middleware setup failed for %s", peer)
-            try:
-                writer.close()
-                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
-            except Exception:
-                logger.debug("DoIPServer: writer cleanup failed for %s", peer, exc_info=True)
             return
 
         session = DoIPSession(

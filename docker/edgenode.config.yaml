@@ -29,7 +29,7 @@ doip:
   vin:       "1HGBH41JXMN109186"
   eid:       "AABBCCDDEEFF"
   gid:       "000000000000"
-  node_type:         0x01
+  node_type:         0x01          # Existing value preserved: node type 1 (node; gateway is 0)
   node_logical_addr: 0x1234   # VM-specific range, distinct from the ECUs (0x0002/0x0003)
                               # and the tester range (0x0E00-0x0FFF); 0x0000 is ISO/SAE
                               # reserved and rejected by load_config()
@@ -42,6 +42,10 @@ doip:
   # routing_table below). Both are optional; default is the range alone.
   tester_addr_range: [0x0E00, 0x0FFF]
   tester_addr_list: []             # individual extra SAs outside the range
+  # Active registered SA capacity (MCTS); one additional reserve socket is admitted
+  # for initialized/pre-RA setup, so open initialized/reserve NCTS is at most 255.
+  # Strict loader range is 1..254; default is 8.
+  max_connections: 8
 
 timers:
   t_tcp_initial_inactivity_s: 2

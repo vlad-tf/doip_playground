@@ -53,9 +53,51 @@ class SessionRegistry:
       - Unregistered in DoIPSession._cleanup().
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_connections: int = 8) -> None:
+        if type(max_connections) is not int or not 1 <= max_connections <= 254:
+            raise ValueError("max_connections must be an integer in [1, 254]")
+        self.max_connections = max_connections
+        self._open_sockets: dict[object, "DoIPSession | None"] = {}
+        self._capacity_lock: asyncio.Lock | None = None
         self._sessions: dict[int, "DoIPSession"] = {}
         self._activation_locks: dict[int, tuple[asyncio.Lock, int]] = {}
+
+    def reserve(self, writer) -> bool:
+        """Atomically admit up to n+1 initialized/registered inbound sockets."""
+        if writer in self._open_sockets:
+            return True
+        if len(self._open_sockets) >= self.max_connections + 1:
+            return False
+        self._open_sockets[writer] = None
+        return True
+
+    @property
+    def capacity_lock(self) -> asyncio.Lock:
+        """Create the decision lock only inside the running server event loop."""
+        if self._capacity_lock is None:
+            asyncio.get_running_loop()
+            self._capacity_lock = asyncio.Lock()
+        return self._capacity_lock
+
+    def attach(self, writer, session: "DoIPSession") -> None:
+        """Associate a socket, enforcing admission for directly constructed sessions."""
+        if not self.reserve(writer):
+            raise RuntimeError("inbound socket capacity exhausted")
+        self._open_sockets[writer] = session
+
+    def release(self, writer) -> None:
+        """Idempotent release when local transport closure begins."""
+        self._open_sockets.pop(writer, None)
+
+    def open_count(self) -> int:
+        return len(self._open_sockets)
+
+    def registered_sessions(self):
+        return tuple(self._sessions.items())
+
+    def status_payload(self, config) -> bytes:
+        """Live counts include initialized/reserve sockets; capacity excludes reserve."""
+        return bytes((config.doip.node_type, self.max_connections, self.open_count()))
 
     @asynccontextmanager
     async def activation_lock(self, logical_addr: int):

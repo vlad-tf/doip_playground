@@ -152,8 +152,8 @@ def test_power_mode_nonempty_payload_is_invalid() -> None:
     assert_nack(transport, NACK_INVALID_PAYLOAD)
 
 
-def test_entity_status_and_other_non_discovery_types_are_unsupported() -> None:
-    for payload_type in (ENTITY_STATUS_REQ, ENTITY_STATUS_RES, POWER_MODE_RES,
+def test_response_and_other_non_discovery_types_are_unsupported() -> None:
+    for payload_type in (ENTITY_STATUS_RES, POWER_MODE_RES,
                          0x0005, 0x0006, 0x0007, 0x0008, 0x8001, 0x8002, 0x8003,
                          0x1234):
         proto, transport = protocol()

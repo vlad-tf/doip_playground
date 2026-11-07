@@ -268,7 +268,7 @@ def test_cancellation_during_endpoint_creation_closes_raw_socket():
 def test_incoming_endpoint_matrix_does_not_schedule_responses_or_errors():
     proto, transport = protocol()
     ignored = ((0x0000, b"\x01"), (0x0004, b"A" * 32), (0x0004, b"A" * 33))
-    unsupported = ((0x4001, b""), (0x4002, b"\x00\x01\x01"),
+    unsupported = ((0x4002, b"\x00\x01\x01"),
                    (0x4004, b"\x01"), (0x0005, b"\0" * 7),
                    (0x0006, b"\0" * 9), (0x0007, b""), (0x0008, b"\0" * 2),
                    (0x8001, b"\0" * 5), (0x8002, b"\0" * 5), (0x8003, b"\0" * 5))

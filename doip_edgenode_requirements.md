@@ -13,7 +13,10 @@ Tester (PC) ──[IPv4 · eth0]──► RPi EdgeNode ──[IPv6 · eth1]─�
              UDP announce port 13400           UDP announce port 13400
 ```
 
-**Scope:** Proof-of-Concept. A single simultaneous tester connection is sufficient; no connection pooling or multi-tester concurrency is required.
+**Scope:** Proof-of-Concept. The tester-facing server supports a configured
+capacity of active registered SAs (`doip.max_connections`, default 8), plus one
+reserve initialized/pre-RA socket. TLS remains a plaintext placeholder and TLS
+conformance is unclaimed; no SIGHUP reload — see the known limitations below.
 
 ---
 
@@ -59,7 +62,7 @@ Tester (PC) ──[IPv4 · eth0]──► RPi EdgeNode ──[IPv6 · eth1]─�
 | Diagnostic Message | `0x8001` | Bidirectional | Intercept, route, forward |
 | Diagnostic Message Positive ACK | `0x8002` | ECU → Tester | Relay |
 | Diagnostic Message Negative ACK | `0x8003` | ECU → Tester | Relay |
-| Entity Status Request | `0x4001` | Tester → EdgeNode | Respond |
+| Entity Status Request | `0x4001` | Tester → EdgeNode | Respond with mandatory three-byte status (node type, MCTS, live NCTS) |
 | Entity Status Response | `0x4002` | EdgeNode → Tester | Generate |
 | Power Mode Info Request | `0x4003` | Tester → EdgeNode | Respond (static value from config) |
 | Power Mode Info Response | `0x4004` | EdgeNode → Tester | Generate |
@@ -107,15 +110,22 @@ requests accept `0x02`/`0x03`. Responses retain the existing `0x02` version.
 Too-short headers are discarded silently. Invalid complete messages receive the
 appropriate Header NACK and are discarded without closing the shared UDP listener.
 
-Optional UDP Entity Status (`0x4001`/`0x4002`) is not yet offered: truthful capacity
-and established-socket accounting must be implemented first. Requests receive
-unknown/unsupported payload NACK. Existing TCP status/power handlers are legacy
-behavior, not substitutes for the UDP services.
+Optional UDP Entity Status (`0x4001`/`0x4002`) is supported with the mandatory
+three-byte response only: existing `node_type`, configured MCTS `n`, and live
+NCTS (all open initialized/reserve inbound sockets). The optional MDS field is
+not sent because this payload-cap profile is not verified as a logical MDS.
+The server-owned UDP listener shares the TCP socket registry; a standalone UDP
+protocol uses a zero-count independent registry. Incoming UDP `0x4002` remains
+unsupported and receives Header NACK `0x01`, not a discovery response. Legacy
+TCP status/power handlers remain three-byte/status-value behavior as configured.
 
-UDP uses a portable wildcard IPv4 listener (`0.0.0.0:13400`) without Linux-only
-socket options or interface queries. Windows compatibility takes priority over
-UDP interface isolation: `network.tester_interface` and `network.tester_ipv4` do
-not constrain UDP reception or egress. The TCP bind remains configured separately.
+UDP uses a portable wildcard IPv4 listener (`0.0.0.0:13400`) with IPv4
+mandatory on Windows/Linux/macOS. Tester-facing IPv6 TCP/UDP behavior is left
+untouched/deferred; do not infer IPv6 support from the ECU-facing link-local
+path. It does not use Linux-only socket options or interface queries. Windows
+compatibility takes priority over UDP interface isolation: `network.tester_interface`
+and `network.tester_ipv4` do not constrain UDP reception or egress. The TCP bind
+remains configured separately.
 Announcements target `255.255.255.255`; OS routing selects output interfaces and
 reply source addresses. A wildcard bind does not guarantee announcement fan-out
 to every adapter. Firewall and network policy must restrict access where needed.
@@ -248,7 +258,7 @@ class TLSFaultPolicy:
 main()
   ├── UDPAnnouncer          — sends vehicle announcements, handles UDP discovery
   ├── DoIPServer (IPv4)     — asyncio TCP server on eth0:13400 and eth0:3496
-  │     └── single active connection: DoIPSession
+  │     └── shared capacity pool: up to n active SAs plus one reserve socket
   │           ├── TLSBridge (thread pool, port 3496 only)
   │           │     └── TLSServerAutomaton + TLSFaultPolicy (placeholder)
   │           ├── DoIP frame parser (Scapy)
@@ -259,7 +269,17 @@ main()
         └── DoIP frame crafter (Scapy)
 ```
 
-**PoC connection limit:** the server accepts exactly one TCP connection at a time. If a second connection arrives while one is active, close it immediately with a Routing Activation Response code `0x01` (all sockets registered) before teardown, or simply close the socket.
+**Capacity and connection policy:** `doip.max_connections` is a strict integer in
+`1..254`, default 8, and is the maximum active registered SA count (MCTS). Both
+current TCP listeners share one pool. Up to `n + 1` open initialized/reserve
+inbound sockets are admitted, keeping NCTS at most 255; the listening socket and
+outbound ECU sockets are never counted. Overflow is closed immediately without
+an RA response because no SA is known. Before RA, status counts include all
+initialized/reserve inbound sockets. For a new unassigned SA at full capacity,
+probe all registered owners concurrently with a 0.5 s wait: all dead owners are
+closed/evicted and the new RA is accepted; all live owners deny with `0x01` and
+the contender is closed. Same-SA conflict is resolved first: a live owner denies
+with `0x03`; a dead owner is evicted and the new RA succeeds with `0x10`.
 
 ### DoIPSession lifecycle
 
@@ -435,7 +455,7 @@ doip:
   vin:       "1HGBH41JXMN109186"   # 17-char VIN
   eid:       "AABBCCDDEEFF"        # 6-byte entity ID (hex string)
   gid:       "000000000000"        # 6-byte group ID
-  node_type: 0x01                  # DoIP node type: gateway
+  node_type: 0x01                  # Existing value preserved: node type 1 (node; gateway is 0)
   node_logical_addr: 0x1234        # EdgeNode's own logical address (self-diagnostics,
                                     # UDP announcements); 0x0000 is ISO/SAE reserved
                                     # and rejected by load_config()
@@ -447,6 +467,10 @@ doip:
   # diagnostic routing (that's routing_table below, by target address).
   tester_addr_range: [0x0E00, 0x0FFF]
   tester_addr_list: []              # individual extra SAs outside the range
+  # Active registered SA capacity (MCTS); one additional reserve socket is admitted
+  # for initialized/pre-RA setup, so open initialized/reserve NCTS is at most 255.
+  # Loader strictly requires an integer in 1..254; default is 8.
+  max_connections: 8
 
 timers:
   t_tcp_initial_inactivity_s: 2
@@ -648,7 +672,7 @@ No other runtime dependencies. Scapy includes `scapy.contrib.automotive.doip` an
 
 | Item | Status |
 |---|---|
-| Single tester connection only | By design — extend for multi-tester later |
+| Configured tester capacity | `doip.max_connections` active registered SAs (default 8) plus one reserve initialized/pre-RA socket |
 | TLS fault injection not functional | Placeholder only; `TLSFaultPolicy` fields are parsed but not wired |
 | No certificate revocation (CRL/OCSP) | Out of scope for PoC |
 | No SIGHUP hot-reload | Config requires restart to apply changes |

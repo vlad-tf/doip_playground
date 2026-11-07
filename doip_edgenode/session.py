@@ -178,6 +178,8 @@ class DoIPSession:
         self._alive_probe_event: asyncio.Event | None = None
         self._alive_probe_lock = asyncio.Lock()
         self._closing = False
+        if self._registry is not None:
+            self._registry.attach(writer, self)
 
     @property
     def peer(self):
@@ -441,6 +443,16 @@ class DoIPSession:
                 raise DoIPProtocolError("SA already registered on another active socket")
             existing.evict()  # synchronous — no CancelledError propagation
 
+        if self._registry is not None and not self.activated:
+            # Only the full-capacity branch takes the shared lock. Unrelated
+            # below-capacity SA decisions remain concurrent; commits recheck it.
+            if self._registry.count() >= self._registry.max_connections:
+                async with self._registry.capacity_lock:
+                    await self._reclaim_capacity(src_addr)
+            if self._registry.count() >= self._registry.max_connections:
+                await self._send_routing_activation_response(0x01, src_addr)
+                raise DoIPProtocolError("all supported sockets are registered and active")
+
         if self._closing:
             raise DoIPProtocolError("session closed during routing activation")
         self.tester_logical_addr = src_addr
@@ -456,6 +468,36 @@ class DoIPSession:
         )
         # Same-SA reactivation is valid, but must replace the existing timer.
         self._reset_inactivity_timer()
+
+    async def _reclaim_capacity(self, src_addr: int) -> None:
+        """Probe one bounded snapshot; never evict a changed owner or waiting client."""
+        registry = self._registry
+        if self._closing:
+            raise DoIPProtocolError("session closed while waiting for capacity")
+        if registry.count() < registry.max_connections:
+            return
+        owners = registry.registered_sessions()
+        tasks = [asyncio.create_task(owner.probe_alive(_ALIVE_PROBE_TIMEOUT_S))
+                 for _, owner in owners]
+        try:
+            # Existing probe implementations may block in drain or behind a
+            # same-SA probe. Bound this decision as well as each alive wait.
+            done, pending = await asyncio.wait(tasks, timeout=2.0)
+            if self._closing:
+                raise DoIPProtocolError("session closed during capacity probes")
+            for (address, owner), task in zip(owners, tasks):
+                # An unfinished send/queued probe is not proof a tester is dead.
+                if task not in done or task.cancelled():
+                    continue
+                error = task.exception()
+                alive = error is None and task.result()
+                if not alive and registry.lookup(address) is owner:
+                    owner.evict()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle_alive_check_response(self, raw: bytes) -> None:
         """Accept only the registered tester's reply to an outstanding probe."""
@@ -542,6 +584,8 @@ class DoIPSession:
             self.writer.close()
         except Exception:
             pass
+        if self._registry is not None:
+            self._registry.release(self.writer)
         # Unregister immediately so the registry is clean before the new
         # session registers itself.
         if self._registry is not None and self.tester_logical_addr is not None:
@@ -552,20 +596,13 @@ class DoIPSession:
         )
 
     async def _handle_entity_status(self) -> None:
-        """
-        Respond to Entity Status Request (0x4001).
-
-        Response payload (ISO 13400-2):
-          byte 0: node type
-          byte 1: max open sockets (PoC: 1)
-          byte 2: currently open sockets (PoC: 1)
-          bytes 3-6: max data size (big-endian uint32)
-        """
-        payload = bytes([
-            self.config.doip.node_type,
-            0x01,  # max sockets (PoC)
-            0x01,  # open sockets
-        ]) + self.config.doip.max_payload_bytes.to_bytes(4, "big")
+        """Return the mandatory three-byte status, with live inbound socket counts."""
+        if self._registry is None:
+            # A standalone session has one established inbound socket.
+            payload = bytes((self.config.doip.node_type,
+                             self.config.doip.max_connections, 1))
+        else:
+            payload = self._registry.status_payload(self.config)
         await self._send_raw(self._build_frame(PT_ENTITY_STATUS_RESPONSE, payload))
         logger.debug("DoIPSession: sent Entity Status Response to %s", self._peer)
 
@@ -1112,6 +1149,17 @@ class DoIPSession:
             self._initial_timer_task.cancel()
         if self._inactivity_task and not self._inactivity_task.done():
             self._inactivity_task.cancel()
+        # Inbound capacity must not depend on slow ECU teardown or a cancelled
+        # timer's later awaits. Initiate transport close before releasing it.
+        try:
+            self.writer.close()
+        except Exception:
+            pass
+        finally:
+            if self._registry is not None:
+                self._registry.release(self.writer)
+                if self.tester_logical_addr is not None:
+                    self._registry.unregister(self.tester_logical_addr, self)
         for task in self._ecu_read_tasks.values():
             if not task.done():
                 task.cancel()
@@ -1124,14 +1172,9 @@ class DoIPSession:
                 pass
         self._ecu_conns.clear()
         try:
-            self.writer.close()
             await self.writer.wait_closed()
         except Exception:
             pass
-
-        # Unregister from the session registry
-        if self._registry is not None and self.tester_logical_addr is not None:
-            self._registry.unregister(self.tester_logical_addr, self)
 
         logger.info(
             "DoIPSession: closed session for %s (activated=%s)", self._peer, self.activated

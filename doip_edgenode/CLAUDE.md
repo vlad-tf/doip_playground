@@ -11,9 +11,10 @@ style; see `../CLAUDE.md` for why.
 changing behaviour, not just this file.
 
 **Status:** implemented PoC. TLS handshake is not functional (port 3496
-accepts but does not negotiate), single tester connection only, no
-SIGHUP reload — see "Known limitations" in `main.py`'s docstring and
-`../README.md` §10 before "fixing" any of these as if they were bugs.
+accepts but does not negotiate), and TLS conformance is unclaimed. The tester-facing
+capacity defaults to `max_connections: 8` active routing-activated SAs, with one
+additional reserve socket for setup; no SIGHUP reload — see "Known limitations"
+in `main.py`'s docstring and `../README.md` before treating these as bugs.
 
 ---
 
@@ -57,7 +58,7 @@ doip_edgenode/
 ├── ecu_client.py          # ECUConnection — outbound leg to the ECU (IPv6);
 │                           # runs its own background reader task once RA succeeds
 ├── tls_bridge.py          # TLSBridge wrapping Scapy's TLS automatons
-├── udp_announcer.py       # Vehicle Announcement / Identification
+├── udp_announcer.py       # Vehicle Announcement / Identification and node-management
 ├── server.py              # DoIPServer: binds sockets, dispatches sessions,
 │                           # owns the single shared SessionRegistry instance
 ├── main.py                # CLI entry point
@@ -129,7 +130,8 @@ doip_edgenode/
   discarded; invalid complete messages receive Header NACK without closing the
   shared listener. UDP has no per-peer stream to drain or connection to close.
 - UDP uses a portable wildcard IPv4 bind (`0.0.0.0:13400`) on Windows/Linux/macOS,
-  without device binding or primary-address queries. `tester_interface` and
+  with IPv4 mandatory and IPv6 tester-facing support left untouched/deferred. It
+  does not use device binding or primary-address queries. `tester_interface` and
   `tester_ipv4` do not restrict UDP; TCP's configured address bind is unchanged.
   Announcements use limited broadcast; egress and reply source selection follow
   OS routing, not guaranteed per-adapter fan-out. Firewall/network policy controls
@@ -143,8 +145,13 @@ doip_edgenode/
   At most 256 discovery replies are pending; excess requests are silently dropped
   without new timers/logs. Stop/transport loss cancels pending replies. Power/NACK
   replies are immediate. Per-rejection WARNING flooding remains F18.
-- Optional UDP status awaits truthful socket/capacity accounting; do not copy the
-  existing TCP handler's hardcoded counts into a new UDP response.
+- Entity Status `0x4001`/`0x4002` is supported on TCP and UDP with the mandatory
+  three-byte payload only: existing `node_type`, configured MCTS `n`, and live
+  NCTS (all open initialized/reserve inbound sockets). Do not add the optional
+  MDS field because this payload-cap profile is not verified as a logical MDS.
+  UDP status requests are immediate; incoming UDP `0x4002` remains unsupported
+  and receives Header NACK `0x01`, not a discovery response. Standalone UDP
+  protocol instances use a zero-count independent registry.
 
 ### asyncio patterns
 
@@ -159,21 +166,24 @@ doip_edgenode/
   `asyncio.IncompleteReadError`, `DoIPProtocolError`, and bare `Exception`
   (log + close). One session's exception must never crash the server.
 
-### Second-connection / SA-conflict handling (ISO 13400-2 §9.3)
+### Capacity, routing activation, and SA conflicts
 
-A second TCP connection is **not** rejected at the transport level. It is
-accepted, and the conflict is resolved only when its Routing Activation
-Request arrives with a source address (SA) already registered on another
-active session (tracked by `SessionRegistry`, one shared instance owned by
-`DoIPServer` and passed into every `DoIPSession`):
+`doip.max_connections` is a strict integer in `1..254` and defaults to 8. It is
+the maximum number of active registered SAs (MCTS); the server admits at most
+`n + 1` open initialized/reserve inbound sockets so NCTS cannot exceed 255.
+The same registry is shared by both current TCP listeners, including the TLS
+listener (TLS remains a plaintext placeholder and TLS conformance is unclaimed).
+Pre-RA status counts include initialized/reserve inbound sockets, never outbound
+ECU sockets, and the listening socket; UDP uses the shared registry when owned by
+the server. An overflow connection is closed immediately without a Routing
+Activation response, since its SA is not known.
 
-1. Probe the existing session with `await existing.probe_alive(timeout=0.5)` —
-   this sends an Alive Check Request to the *old* tester and awaits its
-   Alive Check Response.
-2. Old session responds (still alive) → deny the new RA with code `0x03`
-   ("SA already registered on different socket").
-3. Old session times out (dead) → call `existing.evict()`, then accept the
-   new RA with `0x10`.
+For a new unassigned SA, capacity decisions probe all registered active owners
+concurrently, with a 0.5 s Alive Check wait. If all owners are dead, close/evict
+them and accept the new RA; if all are alive, deny with RA code `0x01` and close
+the contender. A same-SA conflict is resolved first: probe only that existing
+owner, deny a live owner with `0x03`, or evict a dead owner and accept with
+`0x10`. Capacity probing must not evict a changed owner or a waiting client.
 
 **`evict()` must stay synchronous — never replace it with `await
 existing._cleanup()`.** `_cleanup()` awaits `writer.wait_closed()`; if the old
@@ -322,6 +332,8 @@ failures · `CRITICAL` unhandled exceptions.
 - Sections/entries must be mappings with string keys; routing and middleware
   sections must be lists. Invalid input raises `ConfigError` with its field path.
 - Ports and normal node/route addresses must be integers in `1..65535`;
+  `max_connections` must be a strict integer in `1..254` (default 8); it is the
+  active registered-SA capacity, with one additional reserve initialized socket.
   node type is `0..1`, power mode `0..2`, payload cap `1..4294967295`.
   Tester allow-list/range policy and fault-injection address bounds are unchanged.
 - Timer seconds must be finite and positive; intervals/counts are integers `>=1`.
