@@ -20,3 +20,5 @@ doip_edgenode/certs/*
 
 # Local-only diagram files
 diagram/
+
+outputs/
