@@ -186,15 +186,30 @@ owner, deny a live owner with `0x03`, or evict a dead owner and accept with
 `0x10`. Capacity probing must not evict a changed owner or a waiting client.
 
 **`evict()` must stay synchronous — never replace it with `await
-existing._cleanup()`.** `_cleanup()` awaits `writer.wait_closed()`; if the old
-session's own inactivity-timeout task is concurrently mid-cleanup and gets
-cancelled, the injected `CancelledError` is a `BaseException` and is not
-caught by `_cleanup()`'s `except Exception: pass` guards — it propagates
-through the awaiting caller (the *new* session's `_handle_routing_activation`)
-and kills the new session instead of the old one. `evict()` only cancels
-timers, closes the writer, and unregisters — all non-blocking — and lets the
-old session's own `run()`/`finally` block finish its own `_cleanup()` in its
-own task context.
+existing._cleanup()`.** Eviction initiates tester close, releases capacity and
+owner-safe registration immediately, and schedules that session's single cleanup
+owner without joining it from the competing session. Timer expiry likewise
+schedules cleanup rather than awaiting it from a task cleanup will cancel.
+`close()`/`_cleanup()` join the owner with shielding: repeated caller cancellation
+cannot abandon teardown, and is propagated only after the owner finishes.
+Cancelled/replaced timers and owned ECU setup/receive tasks must be retained until
+drained. Never cancel or await `run()` from session cleanup: `run()`'s `finally`
+joins cleanup, which would create an ownership cycle. The server owns and drains
+connection handlers, including blocked pre-RA setup. Closing guards prevent late
+ECU caching and new timers/sends/replay. ECU-close waits use the existing response
+timeout; tester-close waits use two seconds, assuming cooperative cancellation.
+
+Server startup is single-use and transactional across both current TCP listeners
+and UDP. Stop rejects late accepts, drains startup acquisitions and owned handlers,
+joins session cleanup, and shuts down the executor once. CLI signal callbacks use
+`signal.signal()` for SIGINT/SIGTERM, not Windows-unsupported loop signal APIs;
+only the first signal cancels the lifetime task and previous handlers are restored.
+Neither this lifecycle fix nor mocked signals certify native Windows execution.
+
+Current general inactivity reset remains accepted complete inbound frames after
+activation. ISO 13400-2:2019 §12.6.2 / 3.DoIP-080 calls for established-socket RX/TX
+activity semantics; partial input, discarded bodies and outbound activity remain
+a separate conformance gap, not silently changed during teardown work.
 
 This exact pattern (registry + `probe_alive()` + synchronous `evict()`)
 is mirrored in `echo_ecu.py`'s `ECUSessionRegistry`/`ECUSession` for the

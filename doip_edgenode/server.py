@@ -15,8 +15,8 @@
 """
 DoIP EdgeNode — asyncio TCP server.
 
-Accepts one connection at a time (PoC scope).  A second incoming
-connection is immediately closed if one session is already active.
+Accepts up to the configured tester capacity concurrently.  An additional
+reserve socket is admitted for pre-routing-activation setup.
 
 Starts:
   - Plain TCP server on config.ports.doip_plain (typically 13400)
@@ -123,43 +123,136 @@ class DoIPServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._registry = SessionRegistry(config.doip.max_connections)
         self._udp_announcer = UDPAnnouncer(config, self._registry)
+        self._listeners: set[asyncio.AbstractServer] = set()
+        self._connection_tasks: set[asyncio.Task] = set()
+        self._connection_writers: dict[asyncio.Task, asyncio.StreamWriter] = {}
+        self._sessions: set[DoIPSession] = set()
+        self._started = False
+        self._cleanup_task: asyncio.Task | None = None
+        self._executor_shutdown = False
+        self._closing = False
+        self._startup_task: asyncio.Task | None = None
+        self._serve_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         """Start all servers and run until cancelled."""
+        if self._started or self._closing:
+            raise RuntimeError("DoIPServer is single-use and already started or stopped")
+        self._started = True
         self._loop = asyncio.get_running_loop()
+        self._startup_task = asyncio.create_task(self._start_resources())
+        try:
+            await self._startup_task
+            if self._closing:
+                return
+            self._serve_tasks.update(
+                asyncio.create_task(listener.serve_forever())
+                for listener in self._listeners
+            )
+            await asyncio.gather(*self._serve_tasks)
+        finally:
+            await self.stop()
 
-        # Plain TCP server
+    async def _start_resources(self) -> None:
+        """Acquire startup resources, recording each one before suspension."""
         plain_server = await asyncio.start_server(
-            lambda r, w: self._handle_connection(r, w, use_tls=False),
+            lambda r, w: self._accept_connection(r, w, False),
             host=self._config.network.tester_ipv4,
             port=self._config.ports.doip_plain,
         )
-        logger.info(
-            "DoIPServer: plain TCP listening on %s:%d",
-            self._config.network.tester_ipv4,
-            self._config.ports.doip_plain,
-        )
-
-        # TLS TCP server
+        self._listeners.add(plain_server)
+        logger.info("DoIPServer: plain TCP listening on %s:%d",
+                    self._config.network.tester_ipv4, self._config.ports.doip_plain)
         tls_server = await asyncio.start_server(
-            lambda r, w: self._handle_connection(r, w, use_tls=True),
+            lambda r, w: self._accept_connection(r, w, True),
             host=self._config.network.tester_ipv4,
             port=self._config.ports.doip_tls,
         )
-        logger.info(
-            "DoIPServer: TLS TCP listening on %s:%d",
-            self._config.network.tester_ipv4,
-            self._config.ports.doip_tls,
-        )
-
-        # UDP announcer
+        self._listeners.add(tls_server)
+        logger.info("DoIPServer: TLS TCP listening on %s:%d",
+                    self._config.network.tester_ipv4, self._config.ports.doip_tls)
         await self._udp_announcer.start()
 
-        async with plain_server, tls_server:
-            await asyncio.gather(
-                plain_server.serve_forever(),
-                tls_server.serve_forever(),
-            )
+    def _accept_connection(self, reader, writer, use_tls: bool) -> None:
+        if self._closing:
+            try:
+                writer.close()
+            except Exception:
+                logger.debug("DoIPServer: late accept close failed", exc_info=True)
+            return
+        task = asyncio.create_task(self._handle_connection(reader, writer, use_tls))
+        self._connection_tasks.add(task)
+        self._connection_writers[task] = writer
+        def finished(done):
+            self._connection_tasks.discard(done)
+            self._connection_writers.pop(done, None)
+            if not done.cancelled():
+                error = done.exception()
+                if error is not None:
+                    logger.error("DoIPServer: connection handler failed: %s", error)
+        task.add_done_callback(finished)
+
+    async def stop(self) -> None:
+        """Idempotently stop, shielding shared cleanup from caller cancellation."""
+        self._closing = True
+        # Accepted callbacks can precede the first handler step. Closing here
+        # also releases capacity before listener/UDP teardown can suspend.
+        for writer in tuple(self._connection_writers.values()):
+            try:
+                writer.close()
+            except Exception:
+                logger.debug("DoIPServer: accepted writer close failed", exc_info=True)
+            self._registry.release(writer)
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup())
+        cancelled = False
+        while not self._cleanup_task.done():
+            try:
+                await asyncio.shield(self._cleanup_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._cleanup_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _cleanup(self) -> None:
+        self._closing = True
+        startup = self._startup_task
+        if startup is not None and not startup.done():
+            startup.cancel()
+        if startup is not None:
+            await asyncio.gather(startup, return_exceptions=True)
+        serve_tasks = tuple(self._serve_tasks)
+        self._serve_tasks.clear()
+        for task in serve_tasks:
+            task.cancel()
+        if serve_tasks:
+            await asyncio.gather(*serve_tasks, return_exceptions=True)
+        listeners = tuple(self._listeners)
+        self._listeners.clear()
+        for listener in listeners:
+            try:
+                listener.close()
+            except Exception:
+                logger.debug("DoIPServer: listener close failed", exc_info=True)
+        await asyncio.gather(*(listener.wait_closed() for listener in listeners),
+                              return_exceptions=True)
+        try:
+            await self._udp_announcer.stop()
+        finally:
+            tasks = tuple(self._connection_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            sessions = tuple(self._sessions)
+            self._sessions.clear()
+            if sessions:
+                await asyncio.gather(*(session.close() for session in sessions),
+                                     return_exceptions=True)
+            if not self._executor_shutdown:
+                self._executor_shutdown = True
+                self._executor.shutdown(wait=True)
 
     async def _handle_connection(
         self,
@@ -168,6 +261,12 @@ class DoIPServer:
         use_tls: bool,
     ) -> None:
         """Reserve capacity before handshake/setup; overflow gets no DoIP response."""
+        if self._closing:
+            try:
+                writer.close()
+            finally:
+                self._registry.release(writer)
+            return
         if not self._registry.reserve(writer):
             try:
                 writer.close()
@@ -219,7 +318,12 @@ class DoIPServer:
             executor=self._executor,
             registry=self._registry,
         )
-        await session.run()
+        self._sessions.add(session)
+        try:
+            await session.run()
+        finally:
+            await session.close()
+            self._sessions.discard(session)
 
     async def _do_tls_handshake(
         self,

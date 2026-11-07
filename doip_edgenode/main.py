@@ -19,12 +19,9 @@ Usage:
     python3 main.py [--config config.yaml] [--log-level INFO]
 
 Known limitations (PoC scope):
-    - Single tester connection only; second connection is rejected immediately.
     - TLS fault injection is not functional; TLSFaultPolicy fields are placeholders.
     - No certificate revocation check (CRL/OCSP).
     - Config changes require restart (no SIGHUP hot-reload).
-    - OEM-specific routing activation types (0x02+) are passed through without
-      interpretation.
     - TLS server-side handshake via TLSBridge is a TODO placeholder; port 3496
       currently accepts plaintext connections.
 """
@@ -33,6 +30,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import sys
 
 # Allow running as: python3 main.py from the doip_edgenode/ directory
@@ -40,6 +38,29 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import load_config, ConfigError
 from server import DoIPServer
+
+
+async def _run(server: DoIPServer) -> None:
+    """Install portable signal callbacks around one server lifetime."""
+    loop = asyncio.get_running_loop()
+    startup_task = asyncio.current_task()
+    previous = {}
+    signalled = False
+
+    def on_signal(signum, _frame) -> None:
+        nonlocal signalled
+        if not signalled:
+            signalled = True
+            loop.call_soon_threadsafe(startup_task.cancel)
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, on_signal)
+        await server.start()
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def main() -> None:
@@ -69,7 +90,10 @@ def main() -> None:
     server = DoIPServer(config)
 
     try:
-        asyncio.run(server.start())
+        asyncio.run(_run(server))
+    except asyncio.CancelledError:
+        print("Shutting down.")
+        sys.exit(0)
     except KeyboardInterrupt:
         print("Shutting down.")
         sys.exit(0)

@@ -298,7 +298,24 @@ with `0x03`; a dead owner is evicted and the new RA succeeds with `0x10`.
    d. If not dropped: rewrite addresses per routing table, forward to ECU
    e. Relay ECU response back through middleware, back to tester
 7. Alive checks on the tester-facing leg: send empty `0x0007` requests only to registered connections. Accept `0x0008` responses containing exactly the registered tester SA (two bytes); a matching response completes an outstanding probe. A valid unsolicited response is a one-way client keepalive and resets `T_TCP_General_Inactivity` without generating a reply or creating probe state. Ignore alive traffic before activation and do not reply to tester-originated requests. On the ECU-facing leg, EdgeNode acts as client and answers ECU probes with that connection's tester/client SA.
-8. On `T_TCP_General_Inactivity` expiry, tester disconnect, or ECU disconnect: tear down session, log reason, accept new connections
+8. On initial/general inactivity expiry, tester disconnect, protocol failure, or server shutdown: initiate tester close and release its inbound registration/capacity immediately, then join one owned asynchronous teardown. An ECU disconnect retires that ECU leg; it does not by itself close the tester session.
+
+Session teardown is idempotent. Timer expiry and synchronous eviction schedule the
+same cleanup owner; they do not await cleanup from a timer that cleanup cancels.
+Cancelled/replaced timers, pending ECU setup and owned receive tasks are drained.
+A closing session cannot cache a late ECU connection or start new sends, reads,
+replay work or timers. ECU-close waits use `ecu_response_timeout_s`; tester-close
+waits use a two-second engineering bound. Cancellation of a cleanup caller does
+not abort the owner; the caller receives cancellation after teardown completes.
+These bounds assume cancellation-cooperative asyncio transports/tasks, not forced
+termination of arbitrary middleware or worker threads.
+
+Server startup is single-use and rolls back partially acquired listeners and UDP
+on failure or cancellation. Shutdown rejects new accepts, closes listeners/UDP,
+cancels and drains owned connection handlers (including pre-activation setup),
+joins session teardown, and shuts down its executor. CLI `SIGINT`/`SIGTERM`
+callbacks use portable Python signal handling; repeated signals do not interrupt
+the first shutdown. TLS remains a plaintext placeholder, not a working handshake.
 
 ### Inactivity timers
 
@@ -307,7 +324,11 @@ with `0x03`; a dead owner is evicted and the new RA succeeds with `0x10`.
 | `T_TCP_Initial_Inactivity` | 2 s | From TCP connect until Routing Activation received | Close TCP connection, log |
 | `T_TCP_General_Inactivity` | 300 s | From successful Routing Activation; reset by any received message | Close TCP connection, log |
 
-Both timers are configurable in `config.yaml`.
+Both timers are configurable in `config.yaml`. Current implementation refreshes
+the general timer on accepted complete inbound frames after activation; discarded
+`0x01`/`0x02` bodies do not refresh it. Broader established-socket RX/TX byte-activity
+semantics remain a separate conformance gap; F17 teardown does not change that
+policy or claim complete inactivity-timer conformance.
 
 ### Routing table
 

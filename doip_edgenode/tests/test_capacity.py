@@ -78,10 +78,20 @@ def test_default_and_bounds_and_shared_status():
     run(scenario())
 
 
+def server_fixture(capacity):
+    from server import DoIPServer
+    obj = DoIPServer.__new__(DoIPServer)
+    obj._registry = SessionRegistry(capacity)
+    obj._closing = False
+    obj._sessions = set()
+    obj._connection_tasks = set()
+    return obj
+
+
 def test_server_reserves_n_plus_one_and_releases_all_exit_paths():
     from server import DoIPServer
     async def scenario():
-        obj = DoIPServer.__new__(DoIPServer); obj._registry = SessionRegistry(1)
+        obj = server_fixture(1)
         obj._run_connection = AsyncMock(side_effect=RuntimeError("setup"))
         w = Writer()
         with pytest.raises(RuntimeError): await obj._handle_connection(None, w, False)
@@ -207,7 +217,7 @@ def test_cancelling_capacity_contender_drains_probes_without_eviction():
 def test_server_overflow_is_closed_before_handshake_on_both_listener_paths():
     from server import DoIPServer
     async def scenario():
-        obj = DoIPServer.__new__(DoIPServer); obj._registry = SessionRegistry(1)
+        obj = server_fixture(1)
         entered = asyncio.Event(); release = asyncio.Event()
         async def hold(*args): entered.set(); await release.wait()
         obj._run_connection = hold
@@ -224,7 +234,7 @@ def test_server_overflow_is_closed_before_handshake_on_both_listener_paths():
 def test_handshake_middleware_and_constructor_failures_release_capacity():
     from server import DoIPServer
     async def scenario():
-        obj = DoIPServer.__new__(DoIPServer); obj._registry = SessionRegistry(1)
+        obj = server_fixture(1)
         obj._config = _make_app_config(); obj._loop = asyncio.get_running_loop()
         obj._routing_table = RoutingTable(obj._config.routing_table)
         obj._executor = None
@@ -245,7 +255,7 @@ def test_real_ephemeral_tcp_and_udp_status_share_registry_counts():
     from udp_announcer import _UDPProtocol, _build_frame, PT_ENTITY_STATUS_REQUEST
     async def scenario():
         from server import DoIPServer
-        obj = DoIPServer.__new__(DoIPServer); obj._registry = SessionRegistry(2)
+        obj = server_fixture(2)
         entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
         async def hold(*args): entered.set(); await release.wait()
         obj._run_connection = hold

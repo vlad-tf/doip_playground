@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 from config import AppConfig
@@ -178,6 +179,12 @@ class DoIPSession:
         self._alive_probe_event: asyncio.Event | None = None
         self._alive_probe_lock = asyncio.Lock()
         self._closing = False
+        self._cleanup_task: asyncio.Task | None = None
+        self._timer_tasks: set[asyncio.Task] = set()
+        self._connect_tasks: set[asyncio.Task] = set()
+        self._ecu_close_tasks = weakref.WeakKeyDictionary()
+        self._retirement_tasks: set[asyncio.Task] = set()
+        self._transport_closed = False
         if self._registry is not None:
             self._registry.attach(writer, self)
 
@@ -194,6 +201,9 @@ class DoIPSession:
         Main session loop.  Returns when the session should be torn down.
         All exceptions are caught here; the caller (server) sees a clean return.
         """
+        if self._closing:
+            await self._cleanup()
+            return
         logger.info("DoIPSession: new connection from %s", self._peer)
         self._start_initial_timer()
         try:
@@ -221,6 +231,8 @@ class DoIPSession:
 
     async def _session_loop(self) -> None:
         while True:
+            if self._closing:
+                return
             raw = await self._read_frame()
             if raw is None:
                 continue  # rejected body was consumed without losing framing
@@ -292,6 +304,8 @@ class DoIPSession:
 
     async def _dispatch(self, pkt) -> None:
         """Route an incoming packet to the appropriate handler."""
+        if self._closing:
+            return
         ptype = getattr(pkt, _TYPE_FIELD, None)
         if ptype is None:
             await self._send_header_nack(0x01)  # unknown payload type
@@ -554,42 +568,8 @@ class DoIPSession:
             self._alive_probe_event = None
 
     def evict(self) -> None:
-        """
-        Non-blocking eviction of this session by a competing session.
-
-        WHY non-blocking (not async):
-          Calling `await existing._cleanup()` from within the new session's
-          _handle_routing_activation() causes a CancelledError propagation bug:
-          if the old session's inactivity task is mid-cleanup, cancelling it
-          injects CancelledError into `await self.writer.wait_closed()` inside
-          _cleanup().  Because CancelledError is a BaseException, it is NOT
-          caught by `except Exception: pass`, and propagates up through
-          `await existing._cleanup()` into the new session's context, causing
-          the new session's run() to exit.
-
-        Fix:
-          evict() is synchronous.  It cancels timers and closes the writer
-          (which causes the old session's reader to raise IncompleteReadError
-          on its next read).  The old session's run() finally block then
-          calls _cleanup() in its own context — no cross-session awaiting.
-        """
-        self._closing = True
-        if self._alive_probe_event is not None:
-            self._alive_probe_event.set()
-        if self._initial_timer_task and not self._initial_timer_task.done():
-            self._initial_timer_task.cancel()
-        if self._inactivity_task and not self._inactivity_task.done():
-            self._inactivity_task.cancel()
-        try:
-            self.writer.close()
-        except Exception:
-            pass
-        if self._registry is not None:
-            self._registry.release(self.writer)
-        # Unregister immediately so the registry is clean before the new
-        # session registers itself.
-        if self._registry is not None and self.tester_logical_addr is not None:
-            self._registry.unregister(self.tester_logical_addr, self)
+        """Initiate owner-safe eviction without joining teardown from a contender."""
+        self._schedule_cleanup()
         logger.info(
             "DoIPSession: evicted session for %s (SA=0x%04X)",
             self._peer, self.tester_logical_addr or 0,
@@ -727,7 +707,7 @@ class DoIPSession:
             await self._send_diag_nack(exc.nack_code, raw_bytes)
             return
 
-        if processed is None:
+        if processed is None or self._closing:
             logger.debug("DoIPSession: diagnostic packet dropped by middleware")
             return
 
@@ -771,6 +751,8 @@ class DoIPSession:
         The session loop admits one normal diagnostic exchange at a time.
         This is not cross-tester ECU arbitration or replay-response isolation.
         """
+        if self._closing:
+            return
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.config.timers.ecu_pending_max_wait_s
         request_sid = sent_bytes[12] if len(sent_bytes) >= 13 else None
@@ -781,7 +763,7 @@ class DoIPSession:
         pending_seen = False
         try:
             await asyncio.wait_for(ecu_conn.send(sent_bytes), timeout=max(0, deadline - loop.time()))
-            while True:
+            while not self._closing:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     logger.warning("DoIPSession: ECU exchange budget exhausted")
@@ -845,6 +827,8 @@ class DoIPSession:
     async def _retire_ecu_connection(self, target: int, ecu_conn) -> None:
         """Finish retirement even if the exchange is cancelled during cleanup."""
         cleanup = asyncio.create_task(self._retire_ecu_leg(target, ecu_conn))
+        self._retirement_tasks.add(cleanup)
+        cleanup.add_done_callback(self._retirement_tasks.discard)
         cancelled = False
         while not cleanup.done():
             try:
@@ -868,10 +852,29 @@ class DoIPSession:
                 await asyncio.gather(task, return_exceptions=True)
         # Still close the old transport if ownership changed, but never touch
         # a replacement's cache/read state.
-        try:
-            await asyncio.wait_for(ecu_conn.close(), self.config.timers.ecu_response_timeout_s)
-        except Exception as exc:
-            logger.warning("DoIPSession: failed to close retired ECU leg: %s", exc)
+        await self._close_ecu_once(ecu_conn)
+
+    async def _close_ecu_once(self, ecu_conn) -> None:
+        """Share one bounded close across exchange retirement and session shutdown."""
+        owner = self._ecu_close_tasks.get(ecu_conn)
+        if owner is None:
+            async def close_owned():
+                try:
+                    await asyncio.wait_for(ecu_conn.close(),
+                                           self.config.timers.ecu_response_timeout_s)
+                except Exception as exc:
+                    logger.warning("DoIPSession: failed to close ECU leg: %s", exc)
+            owner = asyncio.create_task(close_owned())
+            self._ecu_close_tasks[ecu_conn] = owner
+        cancelled = False
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError:
+                cancelled = True
+        owner.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _recv_ecu_frame(self, target_ecu_addr: int, ecu_conn, timeout: float):
         """
@@ -887,6 +890,8 @@ class DoIPSession:
         ECU it is concurrently talking to) and awaited again on the next
         call instead.
         """
+        if self._closing:
+            return None
         task = self._ecu_read_tasks.get(target_ecu_addr)
         if task is not None and self._ecu_read_owners.get(target_ecu_addr) is not ecu_conn:
             raise RuntimeError("ECU receive task belongs to a different connection")
@@ -931,6 +936,8 @@ class DoIPSession:
 
     async def _relay_ecu_frame(self, ecu_raw: bytes) -> None:
         """Run one ECU frame through the ecu_to_tester middleware and send to tester."""
+        if self._closing:
+            return
         ecu_pkt = self._dissect(ecu_raw)
         try:
             resp = await self.middleware_chain.run(ecu_pkt, "ecu_to_tester", self)
@@ -960,6 +967,8 @@ class DoIPSession:
           - entry exists but the TCP connect to the ECU failed -> NACK 0x06
             (target unreachable) — ISO 13400-2 Table 26 distinguishes these.
         """
+        if self._closing:
+            return None
         from ecu_client import ECUConnection
         from tls_bridge import TLSFaultPolicy
 
@@ -981,18 +990,43 @@ class DoIPSession:
             fault_policy=TLSFaultPolicy(),
             max_payload_bytes=self.config.doip.max_payload_bytes,
         )
-        try:
-            await conn.connect(tester_logical_addr=self.tester_logical_addr or 0x0E00)
-        except Exception as exc:
-            logger.error(
-                "DoIPSession: failed to connect to ECU 0x%04X for tester 0x%04X: %s",
-                target_ecu_addr, self.tester_logical_addr, exc,
-            )
-            await self._send_diag_nack(0x06, raw_bytes)  # target unreachable
-            return None
+        async def connect_owned():
+            try:
+                await conn.connect(tester_logical_addr=self.tester_logical_addr or 0x0E00)
+                if self._closing:
+                    await self._close_ecu_once(conn)
+                    return None
+                self._ecu_conns[target_ecu_addr] = conn
+                return conn
+            except BaseException:
+                # ECUConnection owns failed setup; a successfully returned late
+                # setup still needs closing if this child was cancelled afterward.
+                if conn.connected:
+                    await self._close_ecu_once(conn)
+                raise
 
-        self._ecu_conns[target_ecu_addr] = conn
-        return conn
+        connect_task = asyncio.create_task(connect_owned())
+        self._connect_tasks.add(connect_task)
+        connect_task.add_done_callback(self._connect_tasks.discard)
+        try:
+            return await asyncio.shield(connect_task)
+        except asyncio.CancelledError:
+            connect_task.cancel()
+            # Retain ownership until the child has released its setup resources.
+            while not connect_task.done():
+                try:
+                    await asyncio.shield(connect_task)
+                except asyncio.CancelledError:
+                    pass
+            if not connect_task.cancelled():
+                connect_task.exception()
+            raise
+        except Exception as exc:
+            if not self._closing:
+                logger.error("DoIPSession: failed to connect to ECU 0x%04X: %s",
+                             target_ecu_addr, exc)
+                await self._send_diag_nack(0x06, raw_bytes)
+            return None
 
     # ------------------------------------------------------------------
     # Public helper for ReplayMiddleware
@@ -1007,6 +1041,8 @@ class DoIPSession:
         opens one.
         """
         raw = bytes(pkt)
+        if self._closing:
+            return
         if len(raw) < 12:
             logger.warning(
                 "DoIPSession.send_to_ecu: packet too short to read target address"
@@ -1024,7 +1060,8 @@ class DoIPSession:
                 "DoIPSession.send_to_ecu: no ECU connection for target 0x%04X", tgt
             )
             return
-        await ecu_conn.send(raw)
+        if not self._closing:
+            await ecu_conn.send(raw)
 
     # ------------------------------------------------------------------
     # Frame builders
@@ -1044,6 +1081,8 @@ class DoIPSession:
 
     async def _send_raw(self, data: bytes) -> None:
         """Write raw bytes to the tester socket."""
+        if self._closing:
+            return
         self.writer.write(data)
         await self.writer.drain()
 
@@ -1104,9 +1143,24 @@ class DoIPSession:
     # ------------------------------------------------------------------
 
     def _start_initial_timer(self) -> None:
-        self._initial_timer_task = asyncio.create_task(
+        if self._closing:
+            return
+        self._initial_timer_task = self._new_timer(
             self._initial_inactivity_timeout()
         )
+
+    def _new_timer(self, coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        self._timer_tasks.add(task)
+        task.add_done_callback(self._timer_tasks.discard)
+        return task
+
+    def _schedule_cleanup(self) -> asyncio.Task:
+        self._closing = True
+        self._close_transport_and_registry()
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_impl())
+        return self._cleanup_task
 
     async def _initial_inactivity_timeout(self) -> None:
         try:
@@ -1115,14 +1169,16 @@ class DoIPSession:
                 "DoIPSession: T_TCP_Initial_Inactivity expired for %s (no RA received)",
                 self._peer,
             )
-            await self._cleanup()
+            self._schedule_cleanup()
         except asyncio.CancelledError:
             pass  # normal: RA arrived before timeout
 
     def _reset_inactivity_timer(self) -> None:
         if self._inactivity_task and not self._inactivity_task.done():
             self._inactivity_task.cancel()
-        self._inactivity_task = asyncio.create_task(
+        if self._closing:
+            return
+        self._inactivity_task = self._new_timer(
             self._general_inactivity_timeout()
         )
 
@@ -1132,7 +1188,7 @@ class DoIPSession:
             logger.info(
                 "DoIPSession: T_TCP_General_Inactivity expired for %s", self._peer
             )
-            await self._cleanup()
+            self._schedule_cleanup()
         except asyncio.CancelledError:
             pass  # timer was reset; normal
 
@@ -1141,41 +1197,80 @@ class DoIPSession:
     # ------------------------------------------------------------------
 
     async def _cleanup(self) -> None:
-        """Tear down the session: cancel timers, close all ECU conns, close tester socket."""
-        self._closing = True
+        """Join one cleanup owner and preserve caller cancellation."""
+        cleanup = self._schedule_cleanup()
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def close(self) -> None:
+        """Initiate and await idempotent session shutdown."""
+        await self._cleanup()
+
+    def _close_transport_and_registry(self) -> None:
+        if self._transport_closed:
+            return
+        self._transport_closed = True
         if self._alive_probe_event is not None:
             self._alive_probe_event.set()
-        if self._initial_timer_task and not self._initial_timer_task.done():
-            self._initial_timer_task.cancel()
-        if self._inactivity_task and not self._inactivity_task.done():
-            self._inactivity_task.cancel()
-        # Inbound capacity must not depend on slow ECU teardown or a cancelled
-        # timer's later awaits. Initiate transport close before releasing it.
+        for task in (self._initial_timer_task, self._inactivity_task):
+            if task is not None and not task.done():
+                task.cancel()
         try:
             self.writer.close()
         except Exception:
             pass
-        finally:
-            if self._registry is not None:
-                self._registry.release(self.writer)
-                if self.tester_logical_addr is not None:
-                    self._registry.unregister(self.tester_logical_addr, self)
-        for task in self._ecu_read_tasks.values():
+        if self._registry is not None:
+            self._registry.release(self.writer)
+            if self.tester_logical_addr is not None:
+                self._registry.unregister(self.tester_logical_addr, self)
+
+    async def _cleanup_impl(self) -> None:
+        """Own teardown; never cancel or await the session run task."""
+        self._closing = True
+        self._close_transport_and_registry()
+        timers = tuple(self._timer_tasks)
+        for task in timers:
             if not task.done():
                 task.cancel()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
+        self._timer_tasks.clear()
+        connects = tuple(self._connect_tasks)
+        for task in connects:
+            if not task.done():
+                task.cancel()
+        if connects:
+            await asyncio.gather(*connects, return_exceptions=True)
+        self._connect_tasks.clear()
+        read_tasks = tuple(self._ecu_read_tasks.values())
+        for task in read_tasks:
+            if not task.done():
+                task.cancel()
+        if read_tasks:
+            await asyncio.gather(*read_tasks, return_exceptions=True)
         self._ecu_read_tasks.clear()
         self._ecu_read_owners.clear()
-        for conn in self._ecu_conns.values():
-            try:
-                await conn.close()
-            except Exception:
-                pass
+        conns = tuple(self._ecu_conns.values())
         self._ecu_conns.clear()
+        await asyncio.gather(*(self._close_ecu_once(conn) for conn in conns))
+        retirements = tuple(self._retirement_tasks)
+        if retirements:
+            await asyncio.gather(*retirements, return_exceptions=True)
+        # An exchange may already have detached its leg for retirement.
+        closes = tuple(self._ecu_close_tasks.values())
+        if closes:
+            await asyncio.gather(*closes, return_exceptions=True)
         try:
-            await self.writer.wait_closed()
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
         except Exception:
             pass
-
         logger.info(
             "DoIPSession: closed session for %s (activated=%s)", self._peer, self.activated
         )
