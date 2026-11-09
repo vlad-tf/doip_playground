@@ -20,7 +20,8 @@ in `main.py`'s docstring and `../README.md` before treating these as bugs.
 
 ## Stack & dependencies
 
-- Python 3.11+ (aarch64 Raspberry Pi OS target), `asyncio`, `scapy`, `pyyaml`.
+- Python 3.10+ (aarch64 Raspberry Pi OS target; 3.11 is what that OS ships, but nothing
+  requires it), `asyncio`, `scapy`, `pyyaml`.
 - DoIP framing and TLS automaton come from Scapy
   (`scapy.contrib.automotive.doip`, `scapy.layers.tls.automaton_*`). Field
   names and automaton constructor signatures vary across Scapy versions —

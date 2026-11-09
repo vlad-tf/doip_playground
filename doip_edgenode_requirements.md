@@ -23,7 +23,7 @@ conformance is unclaimed; no SIGHUP reload — see the known limitations below.
 ## Hardware target
 
 - **Platform**: Raspberry Pi 4 (Linux, aarch64)
-- **OS**: Raspberry Pi OS (Debian-based), Python 3.11+
+- **OS**: Raspberry Pi OS (Debian-based), Python 3.10+ (3.11 is what the OS ships)
 - **Network interfaces**:
   - `eth0` — tester-facing, static IPv4 (e.g. `192.168.1.1/24`)
   - `eth1` — ECU-facing (IVN), IPv6 only, link-local (`fe80::…`)

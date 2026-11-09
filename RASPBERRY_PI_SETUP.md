@@ -53,7 +53,7 @@ Tester ──RA(0x0E00)──► EdgeNode ──RA(0x0E00)──► ECU
 
 ### Raspberry Pi 4 (EdgeNode)
 - Raspberry Pi OS (Debian Bookworm or Bullseye), 64-bit recommended
-- Python 3.11 or newer
+- Python 3.10 or newer (Raspberry Pi OS Bookworm ships 3.11)
 - Two network interfaces: `eth0` (onboard, tester side) and `eth1` (USB-Ethernet adapter or HAT, ECU/IVN side)
 - Run as root or with `CAP_NET_RAW` + `CAP_NET_BIND_SERVICE`
 
