@@ -20,7 +20,7 @@ import asyncio
 import os
 import struct
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -287,6 +287,149 @@ def test_real_asyncio_loopback_handles_bad_then_healthy_request() -> None:
             assert discovery[8:] == _UDPProtocol(config)._payload
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(queue.get(), timeout=0.05)
+        finally:
+            if client_transport is not None:
+                client_transport.close()
+            server_transport.close()
+            await asyncio.sleep(0)
+
+    asyncio.run(exercise())
+
+
+# ---------------------------------------------------------------------------
+# Header NACK matrix per datagram.
+#
+# Expected datagrams are hex literals, independent of the production builder.
+# Each rejection answers exactly one NACK to the sending address and nothing
+# else: no stream drain, no pause of reading, no close of the shared transport.
+# ---------------------------------------------------------------------------
+
+POWER_REQ_WIRE = bytes.fromhex("02fd 4003 00000000")
+POWER_RES_WIRE = bytes.fromhex("02fd 4004 00000001 01")
+STATUS_REQ_WIRE = bytes.fromhex("02fd 4001 00000000")
+DISCOVERY_WIRE = bytes.fromhex("02fd 0001 00000000")
+OTHER_ADDR = ("198.51.100.7", 40000)
+NACK_WIRE = {
+    code: bytes.fromhex(f"02fd 0000 00000001 {code:02x}") for code in (0, 1, 2, 4)
+}
+
+REJECTED_DATAGRAMS = [
+    # (id, datagram, expected NACK code)
+    ("pattern-low-version", bytes.fromhex("01fe 4003 00000000"), 0),
+    ("pattern-high-version", bytes.fromhex("04fb 4003 00000000"), 0),
+    ("pattern-inverse-zero", bytes.fromhex("0200 0001 00000000"), 0),
+    ("pattern-v3-wrong-inverse", bytes.fromhex("03fd 0001 00000000"), 0),
+    ("pattern-ff-on-power", bytes.fromhex("ff00 4003 00000000"), 0),
+    ("pattern-ff-bad-inverse", bytes.fromhex("ff01 0001 00000000"), 0),
+    ("unsupported-response-only", bytes.fromhex("02fd 4004 00000001 01"), 1),
+    ("unsupported-tcp-only", bytes.fromhex("02fd 0005 00000007") + b"\0" * 7, 1),
+    ("unsupported-unknown", bytes.fromhex("02fd 1234 00000000"), 1),
+    ("unsupported-body-not-present", bytes.fromhex("02fd 8001 000003e8"), 1),
+    ("unsupported-huge-declared", bytes.fromhex("02fd 4002 ffffffff"), 1),
+    ("over-cap-power-request", bytes.fromhex("02fd 4003 00001001"), 2),
+    ("over-cap-discovery-huge", bytes.fromhex("02fd 0001 ffffffff"), 2),
+    ("over-cap-with-body", bytes.fromhex("02fd 4001 00001001") + b"\0" * 4097, 2),
+    ("shape-power-with-body", bytes.fromhex("02fd 4003 00000001 00"), 4),
+    ("shape-status-with-body", bytes.fromhex("02fd 4001 00000002 0000"), 4),
+    ("shape-discovery-with-body", bytes.fromhex("02fd 0001 00000001 00"), 4),
+    ("shape-declared-more-than-present", bytes.fromhex("02fd 4003 00000004 00"), 4),
+    ("shape-trailing-bytes", bytes.fromhex("02fd 4003 00000000 00"), 4),
+    ("shape-two-coalesced-requests", POWER_REQ_WIRE + POWER_REQ_WIRE, 4),
+    ("shape-nack-without-code", bytes.fromhex("02fd 0000 00000000"), 4),
+    ("shape-nack-two-codes", bytes.fromhex("02fd 0000 00000002 0001"), 4),
+]
+
+
+@pytest.mark.parametrize("name,datagram,code", REJECTED_DATAGRAMS,
+                         ids=[row[0] for row in REJECTED_DATAGRAMS])
+def test_matrix_udp_each_rejection_is_one_nack_to_sender_and_listener_stays_usable(
+        name, datagram, code) -> None:
+    proto, transport = protocol()
+    proto.datagram_received(datagram, OTHER_ADDR)
+    # Exactly one datagram, to the sender, carrying the matching code; nothing
+    # else was done to the transport (no close, no read pause, no abort).
+    assert transport.method_calls == [call.sendto(NACK_WIRE[code], OTHER_ADDR)]
+
+    # A healthy request right after is answered, to its own sender.
+    proto.datagram_received(POWER_REQ_WIRE, ADDR)
+    assert transport.method_calls[1:] == [call.sendto(POWER_RES_WIRE, ADDR)]
+
+
+@pytest.mark.parametrize("name,datagram,code", REJECTED_DATAGRAMS,
+                         ids=[row[0] for row in REJECTED_DATAGRAMS])
+def test_matrix_udp_rejection_keeps_no_per_peer_state(name, datagram, code) -> None:
+    proto, transport = protocol()
+    for _ in range(3):
+        proto.datagram_received(datagram, OTHER_ADDR)
+    # Repeated rejection from one peer never changes the outcome: each datagram
+    # is judged alone, so there is no escalation, silence or close.
+    assert transport.method_calls == [call.sendto(NACK_WIRE[code], OTHER_ADDR)] * 3
+    transport.reset_mock()
+    proto.datagram_received(STATUS_REQ_WIRE, OTHER_ADDR)
+    assert len(transport.method_calls) == 1
+    sent_data = transport.sendto.call_args.args[0]
+    assert sent_data[:4] == bytes.fromhex("02fd 4002")
+    assert transport.sendto.call_args.args[1] == OTHER_ADDR
+
+
+def test_matrix_udp_rejections_from_two_senders_are_answered_independently() -> None:
+    proto, transport = protocol()
+    proto.datagram_received(bytes.fromhex("01fe 4003 00000000"), ADDR)
+    proto.datagram_received(bytes.fromhex("02fd 4004 00000001 01"), OTHER_ADDR)
+    proto.datagram_received(bytes.fromhex("02fd 4003 00000001 00"), ADDR)
+    assert transport.method_calls == [
+        call.sendto(NACK_WIRE[0], ADDR),
+        call.sendto(NACK_WIRE[1], OTHER_ADDR),
+        call.sendto(NACK_WIRE[4], ADDR),
+    ]
+
+
+@pytest.mark.parametrize("datagram", [
+    b"", bytes.fromhex("02"), bytes.fromhex("02fd 4003 000000"),  # 7 bytes
+])
+def test_matrix_udp_datagram_shorter_than_header_is_silent(datagram) -> None:
+    proto, transport = protocol()
+    proto.datagram_received(datagram, OTHER_ADDR)
+    assert transport.method_calls == []
+    proto.datagram_received(POWER_REQ_WIRE, OTHER_ADDR)
+    assert transport.method_calls == [call.sendto(POWER_RES_WIRE, OTHER_ADDR)]
+
+
+def test_matrix_udp_real_loopback_every_code_then_healthy_request() -> None:
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        config = _make_app_config()
+        queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue()
+
+        class Client(asyncio.DatagramProtocol):
+            def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+                queue.put_nowait((data, addr))
+
+        server_transport, _ = await loop.create_datagram_endpoint(
+            lambda: _UDPProtocol(config), local_addr=("127.0.0.1", 0))
+        client_transport = None
+        try:
+            client_transport, _ = await loop.create_datagram_endpoint(
+                Client, local_addr=("127.0.0.1", 0))
+            server_addr = server_transport.get_extra_info("sockname")
+            cases = (
+                (bytes.fromhex("01fe 4003 00000000"), NACK_WIRE[0]),
+                (bytes.fromhex("02fd 1234 00000000"), NACK_WIRE[1]),
+                (bytes.fromhex("02fd 4003 00001001"), NACK_WIRE[2]),
+                (bytes.fromhex("02fd 4003 00000001 00"), NACK_WIRE[4]),
+            )
+            for datagram, nack in cases:
+                client_transport.sendto(datagram, server_addr)
+                got, source = await asyncio.wait_for(queue.get(), timeout=1.0)
+                assert got == nack
+                assert source == server_addr
+                # The shared listener answers the next, valid datagram.
+                client_transport.sendto(POWER_REQ_WIRE, server_addr)
+                got, _ = await asyncio.wait_for(queue.get(), timeout=1.0)
+                assert got == POWER_RES_WIRE
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(queue.get(), timeout=0.05)
+            assert not server_transport.is_closing()
         finally:
             if client_transport is not None:
                 client_transport.close()
