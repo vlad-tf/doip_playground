@@ -664,7 +664,9 @@ class EcuSession:
             )
             await self._send_response(
                 PT_HEADER_NACK, bytes([NACK_GENERIC_INVALID_PAYLOAD_LENGTH]))
-            return
+            # A frame whose length is wrong for its type means the peer's
+            # framing cannot be trusted any more: close after the NACK.
+            raise _CloseConnection()
 
         src_addr = struct.unpack("!H", payload[0:2])[0]
         activation_type = payload[2]
@@ -868,7 +870,9 @@ class EcuSession:
             )
             await self._send_response(
                 PT_HEADER_NACK, bytes([NACK_GENERIC_INVALID_PAYLOAD_LENGTH]))
-            return
+            # Same reasoning as the short Routing Activation Request: nothing
+            # after the NACK on this stream is trusted, so close.
+            raise _CloseConnection()
 
         src, tgt = struct.unpack("!HH", payload[0:4])
         uds = bytes(payload[4:])

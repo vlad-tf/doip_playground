@@ -314,7 +314,12 @@ class TestLifecycle:
 
         assert run(with_server(scenario))
 
-    def test_truncated_diagnostic_message_gets_generic_nack(self):
+    def test_truncated_diagnostic_message_gets_generic_nack_then_close(self):
+        # Changed expectation: this test used to send the NACK and then
+        # require a healthy ACK for a valid request on the SAME socket. A
+        # length that is wrong for its payload type means the stream can no
+        # longer be trusted, so the entity must close after the NACK; the
+        # follow-up now goes over a fresh connection.
         async def scenario(port):
             client = await Client.connect(port)
             await client.activate()
@@ -327,10 +332,19 @@ class TestLifecycle:
             ptype, payload = await client.recv()
             assert ptype == PT_HEADER_NACK
             assert payload == b"\x04"    # invalid payload length
-            # Not a spoofing/addressing violation, so the socket stays open.
-            ptype, payload = await client.diagnostic(b"\x3E\x00")
-            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            # The socket is closed right after the NACK: EOF, never a frame.
+            with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError)):
+                await client.recv(timeout=1.0)
             await client.close()
+            await asyncio.sleep(0.05)   # let server-side cleanup finish
+
+            fresh = await Client.connect(port)
+            ptype, payload = await fresh.activate()
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+            ptype, payload = await fresh.diagnostic(b"\x3E\x00")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            await fresh.close()
             return True
 
         assert run(with_server(scenario))
@@ -414,6 +428,153 @@ class TestRoutingActivationValidation:
             with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError,
                                 asyncio.TimeoutError)):
                 await client.recv(timeout=1.0)
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+
+async def read_until_eof(client, timeout=2.0):
+    """Everything the server sends before it closes the connection."""
+    return await asyncio.wait_for(client.reader.read(-1), timeout=timeout)
+
+
+class TestShortPayloadNackClosesConnection:
+    """
+    A Routing Activation Request or Diagnostic Message whose payload is
+    shorter than its fixed minimum gets Header NACK 0x04 and then the TCP
+    connection is closed: the stream cannot be trusted after a framing
+    mismatch. Expected bytes below are written out by hand rather than built
+    with the production codec.
+    """
+
+    #: Header NACK frame: version 02/FD, type 0000, length 1, code 04.
+    NACK_04 = bytes.fromhex("02FD000000000001" "04")
+    #: Diagnostic Message with a 3-byte payload (below the 5-byte minimum).
+    SHORT_DIAG = bytes.fromhex("02FD8001" "00000003" "0E0000")
+    #: Routing Activation Request with a 3-byte payload (below the 7-byte minimum).
+    SHORT_RA = bytes.fromhex("02FD0005" "00000003" "0E0000")
+    #: A valid TesterPresent (0x3E 0x00) from 0x0E00 to 0x0002, 6-byte payload.
+    VALID_DIAG = bytes.fromhex("02FD8001" "00000006" "0E000002" "3E00")
+
+    @staticmethod
+    def _spy_plugin(calls):
+        class Spy(Plugin):
+            name = "Spy"
+
+            @on_service(0x3E)
+            async def seen(self, req, ctx):
+                calls.append(req.raw)
+                return None
+
+        return Spy()
+
+    def test_short_diagnostic_message_on_activated_session_nacks_then_closes(self):
+        calls = []
+
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate()
+            assert payload[4] == 0x10
+            # The short frame and a valid one in the same TCP segment: only
+            # the NACK may come back, and the second frame is never served.
+            client.writer.write(self.SHORT_DIAG + self.VALID_DIAG)
+            await client.writer.drain()
+            data = await read_until_eof(client)
+            assert data == self.NACK_04
+            await client.close()
+            await asyncio.sleep(0.05)   # let server-side cleanup finish
+            assert calls == []          # nothing reached UDS dispatch
+            return True
+
+        assert run(with_server(scenario, plugins=[self._spy_plugin(calls)]))
+
+    def test_short_routing_activation_before_activation_nacks_then_closes(self):
+        async def scenario(port):
+            client = await Client.connect(port)
+            client.writer.write(self.SHORT_RA)
+            await client.writer.drain()
+            data = await read_until_eof(client)
+            assert data == self.NACK_04
+            await client.close()
+            await asyncio.sleep(0.05)   # let server-side cleanup finish
+
+            # The rejected request activated nothing and left nothing
+            # registered: a valid activation for the same SA on a fresh
+            # connection is accepted straight away.
+            fresh = await Client.connect(port)
+            ptype, payload = await fresh.activate()
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+            await fresh.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_short_diagnostic_close_releases_the_registered_session(self):
+        # With capacity for one session, a leaked registry entry would make
+        # the next tester's activation fail with 0x01 (all sockets in use).
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate(tester=TESTER_ADDR)
+            assert payload[4] == 0x10
+            client.writer.write(self.SHORT_DIAG)
+            await client.writer.drain()
+            assert await read_until_eof(client) == self.NACK_04
+            await client.close()
+            await asyncio.sleep(0.05)   # let server-side cleanup finish
+
+            other = await Client.connect(port)
+            ptype, payload = await other.activate(tester=TESTER_ADDR + 1)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10
+            await other.close()
+            return True
+
+        assert run(with_server(scenario, {"doip": {"max_concurrent_sessions": 1}}))
+
+    @pytest.mark.parametrize("length", [0, 1, 2, 3, 4])
+    def test_every_diagnostic_length_below_the_minimum_is_nacked_and_closed(self, length):
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            body = b"\x0E\x00\x00\x02"[:length]
+            client.writer.write(struct.pack("!BBHI", 0x02, 0xFD, 0x8001, length) + body)
+            await client.writer.drain()
+            assert await read_until_eof(client) == self.NACK_04
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    @pytest.mark.parametrize("length", [0, 1, 2, 3, 4, 5, 6])
+    def test_every_routing_activation_length_below_the_minimum_is_nacked_and_closed(
+            self, length):
+        async def scenario(port):
+            client = await Client.connect(port)
+            body = b"\x0E\x00\x00\x00\x00\x00\x00"[:length]
+            client.writer.write(struct.pack("!BBHI", 0x02, 0xFD, 0x0005, length) + body)
+            await client.writer.drain()
+            assert await read_until_eof(client) == self.NACK_04
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_minimum_length_diagnostic_message_is_still_served_on_an_open_socket(self):
+        # 5-byte payload (SA + TA + one UDS byte) is the smallest valid shape:
+        # it must be acknowledged and the connection must stay open.
+        async def scenario(port):
+            client = await Client.connect(port)
+            await client.activate()
+            await client.send(PT_DIAGNOSTIC_MESSAGE,
+                              struct.pack("!HH", TESTER_ADDR, ECU_ADDR) + b"\x3E")
+            ptype, payload = await client.recv()
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
+            ptype, payload = await client.recv()     # the UDS answer, not a close
+            assert ptype == PT_DIAGNOSTIC_MESSAGE
+            ptype, payload = await client.diagnostic(b"\x3E\x00")
+            assert ptype == PT_DIAGNOSTIC_POSITIVE_ACK
             await client.close()
             return True
 
