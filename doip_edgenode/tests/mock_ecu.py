@@ -91,8 +91,16 @@ def _ptype(raw: bytes) -> int:
 class MockECU:
     """Minimal DoIP ECU stub.  Runs on loopback; no Scapy required."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        logical_addr: int = 0x0000,
+    ) -> None:
         self._host = host
+        # Logical address the mock reports as its own in the Routing
+        # Activation Response; the default keeps the historical 0x0000.
+        self._logical_addr = logical_addr
         self._port = port          # 0 = let the OS pick an ephemeral port
         self._server: asyncio.Server | None = None
         self.received_packets: list[bytes] = []
@@ -137,7 +145,7 @@ class MockECU:
                     # Routing Activation Response: success (0x10)
                     resp_payload = (
                         struct.pack("!H", src_addr)   # tester logical addr
-                        + b"\x00\x00"                  # EdgeNode logical addr
+                        + struct.pack("!H", self._logical_addr)  # ECU logical addr
                         + bytes([0x10])                # response code: success
                         + b"\x00" * 4                  # reserved
                         + b"\x00" * 4                  # OEM-specific

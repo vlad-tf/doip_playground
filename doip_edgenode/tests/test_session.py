@@ -15,7 +15,9 @@
 """
 Tests for DoIPSession state machine.
 
-Uses MockECU (loopback IPv4, no root required) and raw asyncio clients.
+Uses MockECU (loopback, no root required) and raw asyncio clients.  The
+tester side is IPv4 loopback; the ECU side of the lifecycle test is IPv6
+loopback because the routing entry advertises ::1.
 No Scapy required for the raw-bytes client side; the session under test
 uses Scapy internally.
 
@@ -35,6 +37,7 @@ All tests use ephemeral ports so they can run in parallel.
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 import sys
 import os
@@ -138,6 +141,24 @@ def _make_app_config(initial_s: float = 2.0, general_s: float = 300.0):
     )
 
 
+def _require_ipv6_loopback() -> None:
+    """Skip the calling test when this host cannot bind an IPv6 loopback socket.
+
+    The routing entry built by _make_app_config() advertises ::1 and the
+    production ECU client always connects over IPv6, so the mock ECU has to
+    listen there.  Only tests that start such a mock call this.
+    """
+    if not socket.has_ipv6:
+        pytest.skip("IPv6 loopback (::1) unavailable: Python built without IPv6")
+    probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        probe.bind(("::1", 0))
+    except OSError as exc:
+        pytest.skip(f"IPv6 loopback (::1) unavailable: {exc}")
+    finally:
+        probe.close()
+
+
 async def _run_session_server(config, routing_table, middleware_chain, loop, executor):
     """Return (server, port) for a plain-TCP session server."""
     from session import DoIPSession
@@ -174,8 +195,10 @@ async def test_full_lifecycle():
     from middleware import MiddlewareChain
     from concurrent.futures import ThreadPoolExecutor
 
-    # Start mock ECU
-    ecu = MockECU()
+    # Start mock ECU on the address and logical address the routing entry
+    # advertises (::1, 0x0001)
+    _require_ipv6_loopback()
+    ecu = MockECU(host="::1", logical_addr=0x0001)
     ecu_server = await ecu.start()
     ecu_port = ecu.port
 
