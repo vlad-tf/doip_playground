@@ -388,10 +388,24 @@ def _load_doip(raw: dict) -> DoipConfig:
             "doip.max_payload_bytes: %d is not a usable payload limit "
             "(1..16777216)" % cfg.max_payload_bytes
         )
+    if cfg.power_mode not in (0x00, 0x01, 0x02):
+        raise ConfigError(
+            "doip.power_mode: %d is not one of 0 (not ready), 1 (ready), "
+            "2 (not supported); the other byte values are reserved and would "
+            "be advertised verbatim" % cfg.power_mode
+        )
     if cfg.max_concurrent_sessions <= 0:
         raise ConfigError(
             "doip.max_concurrent_sessions: %d must be a positive count "
             "(0 would deny every Routing Activation)" % cfg.max_concurrent_sessions
+        )
+    # The Entity Status response carries this limit in one byte, so a larger
+    # value could be enforced but never advertised truthfully; reject it
+    # instead of letting the status reply quietly report 255.
+    if cfg.max_concurrent_sessions > 0xFF:
+        raise ConfigError(
+            "doip.max_concurrent_sessions: %d does not fit the one-byte "
+            "Entity Status field (1..255)" % cfg.max_concurrent_sessions
         )
     if cfg.alive_check_timeout_ms <= 0:
         raise ConfigError(

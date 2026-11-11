@@ -325,7 +325,56 @@ class TestShippedConfig:
         assert parsed.dids[0xF186].dynamic
         assert parsed.routines[0x0201].results == b"\x00\x01"
 
+    def test_the_docker_virtualecu_config_loads(self):
+        """The container config is a second shipped example and must stay valid."""
+        docker_config = os.path.join(os.path.dirname(REPO_VIRTUAL_ECU),
+                                     "docker", "virtecu.config.yaml")
+        if not os.path.isfile(docker_config):
+            pytest.skip("docker/virtecu.config.yaml is not available here "
+                        "(standalone VirtualEcu checkout)")
+        parsed = load_config(docker_config)
+        assert parsed.doip.ecu_logical_addr == 0x0003
+        assert parsed.doip.power_mode == 0x01
+        assert parsed.doip.max_concurrent_sessions == 8
+
     def test_missing_file_raises_config_error(self):
         with pytest.raises(ConfigError) as exc:
             load_config(os.path.join(REPO_VIRTUAL_ECU, "nope.yaml"))
         assert "not found" in str(exc.value)
+
+
+# Literal boundary tables: the accepted/rejected values are written out here
+# rather than derived from the loader's own constants.
+POWER_MODE_VALID = [0, 1, 2]
+POWER_MODE_INVALID = [3, 255, 256, -1]
+MAX_SESSIONS_VALID = [1, 255]
+MAX_SESSIONS_INVALID = [256, 1000]
+
+
+class TestAdvertisedValueLimits:
+    @pytest.mark.parametrize("value", POWER_MODE_VALID)
+    def test_power_mode_valid_values_are_accepted(self, value):
+        assert cfg({"doip": {"power_mode": value}}).doip.power_mode == value
+
+    @pytest.mark.parametrize("value", POWER_MODE_INVALID)
+    def test_power_mode_invalid_values_are_rejected(self, value):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"power_mode": value}})
+        assert "doip.power_mode" in str(exc.value)
+
+    def test_power_mode_hex_string_is_checked_too(self):
+        assert cfg({"doip": {"power_mode": "0x02"}}).doip.power_mode == 2
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"power_mode": "0xFF"}})
+        assert "doip.power_mode" in str(exc.value)
+
+    @pytest.mark.parametrize("value", MAX_SESSIONS_VALID)
+    def test_max_concurrent_sessions_valid_values_are_accepted(self, value):
+        assert cfg({"doip": {"max_concurrent_sessions": value}}
+                   ).doip.max_concurrent_sessions == value
+
+    @pytest.mark.parametrize("value", MAX_SESSIONS_INVALID)
+    def test_max_concurrent_sessions_above_255_is_rejected(self, value):
+        with pytest.raises(ConfigError) as exc:
+            cfg({"doip": {"max_concurrent_sessions": value}})
+        assert "doip.max_concurrent_sessions" in str(exc.value)

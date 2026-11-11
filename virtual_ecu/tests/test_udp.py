@@ -142,6 +142,34 @@ def test_power_mode_info_request_gets_a_response():
     assert frame_payload(raw) == b"\x01"            # power_mode (default config)
 
 
+@pytest.mark.parametrize("sessions", [1, 2, 255])
+def test_entity_status_wire_bytes_report_the_configured_session_limit(sessions):
+    # Request 02 FD 40 01 00 00 00 00; response header 02 FD 40 02 00 00 00 07
+    # followed by node type, max sockets, open sockets and max data size.
+    protocol, transport = _protocol(
+        {"doip": {"max_concurrent_sessions": sessions}}, max_sockets=sessions)
+    protocol.datagram_received(bytes.fromhex("02FD400100000000"), ADDR)
+
+    assert len(transport.sent) == 1
+    raw, addr = transport.sent[0]
+    assert addr == ADDR
+    assert raw == (bytes.fromhex("02FD4002" "00000007")
+                   + bytes([0x01, sessions, 0x00])      # node type, max, open
+                   + bytes.fromhex("00001000"))          # max data size 4096
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_power_mode_wire_bytes_report_the_configured_mode(mode):
+    # Request 02 FD 40 03 00 00 00 00; response 02 FD 40 04 00 00 00 01 <mode>.
+    protocol, transport = _protocol({"doip": {"power_mode": mode}})
+    protocol.datagram_received(bytes.fromhex("02FD400300000000"), ADDR)
+
+    assert len(transport.sent) == 1
+    raw, addr = transport.sent[0]
+    assert addr == ADDR
+    assert raw == bytes.fromhex("02FD4004" "00000001") + bytes([mode])
+
+
 def test_self_originated_datagram_is_ignored():
     # On Linux the announcer's own broadcast/multicast announcements loop back
     # to its bound socket; since the announcement payload type (0x0004) isn't a
