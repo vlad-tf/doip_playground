@@ -157,10 +157,14 @@ class EcuCore:
         #: ``maybe_drop_session_state`` keeps only non-default ones around
         #: past their socket closing.
         self._session_states: Dict[int, "SessionState"] = {}
+        #: Set once ``shutdown()`` has run, so a second call is a no-op;
+        #: ``startup()`` clears it again so the same core can be restarted.
+        self._shut_down = False
 
     # -- lifecycle ---------------------------------------------------------
 
     async def startup(self) -> None:
+        self._shut_down = False
         for plugin in self.plugins:
             try:
                 await plugin.setup(self)
@@ -171,6 +175,25 @@ class EcuCore:
                     raise
 
     async def shutdown(self) -> None:
+        """
+        Close every retained per-tester state, then tear the plugins down.
+
+        Retained states are closed first so that no S3 timer can fire (and
+        touch ``_session_states``) while a plugin teardown is running or
+        after shutdown has returned. ``SessionState.close()`` only cancels,
+        so the cancelled timer tasks are awaited here. Safe to call twice.
+        """
+        if self._shut_down:
+            return
+        self._shut_down = True
+        states = list(self._session_states.values())
+        self._session_states.clear()
+        timers = [state._s3_task for state in states
+                  if state._s3_task is not None and not state._s3_task.done()]
+        for state in states:
+            state.close()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
         for plugin in self.plugins:
             try:
                 await plugin.teardown(self)

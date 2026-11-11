@@ -66,3 +66,36 @@ def test_unscoped_ipv6_bind_uses_zero_scope_id(monkeypatch, host):
     VirtualEcuServer(ecu)._build_socket()
 
     assert captured["address"] == (host, ecu.config.listen.port, 0, 0)
+
+
+@pytest.mark.parametrize("family", ["ipv4", "ipv6"])
+@pytest.mark.parametrize("failing_step", ["bind", "listen"])
+def test_build_socket_closes_the_socket_when_bind_or_listen_fails(
+        monkeypatch, family, failing_step):
+    closed = []
+    failure = OSError("address in use")
+
+    class FakeSocket:
+        def setsockopt(self, *args):
+            pass
+
+        def bind(self, address):
+            if failing_step == "bind":
+                raise failure
+
+        def listen(self, backlog):
+            if failing_step == "listen":
+                raise failure
+
+        def close(self):
+            closed.append(1)
+
+    monkeypatch.setattr(socket, "socket", lambda *args: FakeSocket())
+    ecu = make_ecu({"listen": {"host": "127.0.0.1" if family == "ipv4" else "::1",
+                               "family": family}})
+
+    with pytest.raises(OSError) as raised:
+        VirtualEcuServer(ecu)._build_socket()
+
+    assert raised.value is failure
+    assert closed == [1]
