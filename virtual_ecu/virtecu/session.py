@@ -216,6 +216,10 @@ class EcuSession:
         # Alive Check probe support (used when a competing session checks us)
         self._alive_probe_pending: bool = False
         self._alive_probe_event: Optional[asyncio.Event] = None
+        #: The in-flight probe, if any. One probe at a time per session:
+        #: every ``probe_alive`` caller that arrives meanwhile awaits this
+        #: same task, so the pending/event pair above has a single writer.
+        self._alive_probe_task: Optional[asyncio.Future] = None
 
         #: Validated Diagnostic Messages waiting for ``_uds_worker`` (pump /
         #: UDS executor split — see the module docstring). The pump only
@@ -595,8 +599,19 @@ class EcuSession:
 
             elif pt == PT_ALIVE_CHECK_RESPONSE:
                 logger.debug("Alive Check Response from %s", self._peer)
-                if self._alive_probe_pending and self._alive_probe_event is not None:
-                    self._alive_probe_event.set()
+                # Only a response that carries exactly the 2-byte source
+                # address registered on this socket proves the tester is
+                # alive. Anything else is ignored here (no NACK); the frame
+                # already counted as traffic for the inactivity timer above.
+                if (len(pload) == 2
+                        and struct.unpack("!H", pload)[0] == self.tester_addr):
+                    if self._alive_probe_pending and self._alive_probe_event is not None:
+                        self._alive_probe_event.set()
+                else:
+                    logger.debug(
+                        "Ignoring Alive Check Response from %s: %d bytes, "
+                        "not the registered source address", self._peer, len(pload),
+                    )
 
             else:
                 # Covers truly unknown payload types and the two ISO 13400-2
@@ -619,7 +634,18 @@ class EcuSession:
 
         Called by a *competing* session to decide whether this connection is
         still live before evicting it.  True = responded, False = considered dead.
+
+        Single-flight: while a probe is running, further callers share its
+        result (and its timeout) instead of starting another one, so the
+        probe state is set up and torn down exactly once per probe. The
+        probe runs as its own task, so cancelling one waiting caller does
+        not cancel the others or leave the state half-cleaned.
         """
+        if self._alive_probe_task is None:
+            self._alive_probe_task = asyncio.ensure_future(self._probe_alive_once(timeout))
+        return await asyncio.shield(self._alive_probe_task)
+
+    async def _probe_alive_once(self, timeout: float) -> bool:
         self._alive_probe_event = asyncio.Event()
         self._alive_probe_pending = True
         try:
@@ -637,6 +663,7 @@ class EcuSession:
         finally:
             self._alive_probe_pending = False
             self._alive_probe_event = None
+            self._alive_probe_task = None
 
     async def _handle_routing_activation(self, payload: bytes) -> None:
         """

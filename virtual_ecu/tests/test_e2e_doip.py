@@ -1381,3 +1381,290 @@ class TestPumpWorkerSplit:
             return True
 
         assert run(with_server(scenario, plugins=[self._slow_plugin()]))
+
+
+# ---------------------------------------------------------------------------
+# Alive-check responses: which ones count as "the owner is alive"
+# ---------------------------------------------------------------------------
+
+#: Hand-written Alive Check Response frames (header 02 FD 00 08 <len32>).
+#: The owner in these tests is registered as 0x0E00.
+ALIVE_RESP_VALID = bytes.fromhex("02FD0008" "00000002" "0E00")
+ALIVE_RESP_EMPTY = bytes.fromhex("02FD0008" "00000000")
+ALIVE_RESP_ONE_BYTE = bytes.fromhex("02FD0008" "00000001" "0E")
+ALIVE_RESP_THREE_BYTES = bytes.fromhex("02FD0008" "00000003" "0E0000")
+ALIVE_RESP_WRONG_SA = bytes.fromhex("02FD0008" "00000002" "0BAD")
+
+#: Responses that must NOT complete a pending probe.
+ALIVE_RESP_REJECTED = [
+    pytest.param(ALIVE_RESP_EMPTY, id="empty"),
+    pytest.param(ALIVE_RESP_ONE_BYTE, id="one-byte"),
+    pytest.param(ALIVE_RESP_THREE_BYTES, id="three-bytes"),
+    pytest.param(ALIVE_RESP_WRONG_SA, id="wrong-sa"),
+]
+
+#: Short probe timeout so a "dead owner" outcome shows up quickly.
+ALIVE_TIMING = {"doip": {"alive_check_timeout_ms": 150}}
+
+
+class ScriptedOwner(Client):
+    """
+    A registered tester whose answer to an Alive Check Request is a fixed
+    raw frame chosen by the scenario (or silence), optionally delayed.
+
+    Counts the probes it receives. Like ``PumpingClient`` it owns the
+    socket's only reader; everything that is not an Alive Check Request is
+    queued for ``recv()``.
+    """
+
+    def __init__(self, reader, writer, reply=ALIVE_RESP_VALID, delay=0.0):
+        super().__init__(reader, writer)
+        self.reply = reply
+        self.delay = delay
+        self.probes = 0
+        self._queue: "asyncio.Queue[tuple]" = asyncio.Queue()
+        self._pending: list = []
+        self._pump_task = asyncio.ensure_future(self._pump())
+
+    @classmethod
+    async def connect(cls, port, host="::1", reply=ALIVE_RESP_VALID, delay=0.0):
+        reader, writer = await asyncio.open_connection(host, port)
+        return cls(reader, writer, reply=reply, delay=delay)
+
+    async def _answer(self):
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        self.writer.write(self.reply)
+        await self.writer.drain()
+
+    async def _pump(self):
+        while True:
+            raw = await read_frame(self.reader)
+            pt = struct.unpack("!H", raw[2:4])[0]
+            if pt == PT_ALIVE_CHECK_REQUEST:
+                self.probes += 1
+                if self.reply is not None:
+                    self._pending.append(asyncio.ensure_future(self._answer()))
+                continue
+            await self._queue.put((pt, raw[8:]))
+
+    async def recv(self, timeout=2.0):
+        return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+
+    async def close(self):
+        for task in [self._pump_task] + self._pending:
+            task.cancel()
+        for task in [self._pump_task] + self._pending:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await super().close()
+
+
+async def _with_server_handle(scenario, extra=None):
+    """Like ``with_server`` but passes the ``VirtualEcuServer`` itself, so a
+    scenario can reach the session registry."""
+    ecu = make_ecu(merge(CONFIG, extra), [])
+    wrapper = VirtualEcuServer(ecu)
+    server = await wrapper.start(serve_forever=False)
+    try:
+        return await scenario(wrapper)
+    finally:
+        server.close()
+        try:
+            await server.wait_closed()
+        except Exception:
+            pass
+        await wrapper.stop()
+
+
+class TestAliveCheckResponseValidation:
+    """
+    Only an Alive Check Response whose payload is exactly the 2-byte source
+    address registered on that socket proves the owner alive. Anything else
+    is ignored (no NACK) and the owner is treated as dead once the probe
+    times out.
+    """
+
+    def test_a_matching_response_keeps_the_owner_and_denies_the_contender(self):
+        async def scenario(port):
+            owner = await ScriptedOwner.connect(port)
+            ptype, payload = await owner.activate()
+            assert payload[4] == 0x10
+
+            contender = await Client.connect(port)
+            ptype, payload = await contender.activate(tester=TESTER_ADDR)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x03    # SA already registered and alive
+            assert owner.probes == 1
+            await contender.close()
+            await owner.close()
+            return True
+
+        assert run(with_server(scenario, extra=ALIVE_TIMING))
+
+    @pytest.mark.parametrize("reply", ALIVE_RESP_REJECTED)
+    def test_a_non_matching_response_does_not_keep_the_owner_alive(self, reply):
+        async def scenario(port):
+            owner = await ScriptedOwner.connect(port, reply=reply)
+            ptype, payload = await owner.activate()
+            assert payload[4] == 0x10
+
+            contender = await Client.connect(port)
+            ptype, payload = await contender.activate(tester=TESTER_ADDR)
+            assert ptype == PT_ROUTING_ACT_RESPONSE
+            assert payload[4] == 0x10    # owner timed out, was evicted
+            assert owner.probes == 1
+            await contender.close()
+            await owner.close()
+            return True
+
+        assert run(with_server(scenario, extra=ALIVE_TIMING))
+
+    @pytest.mark.parametrize("frame", [
+        pytest.param(ALIVE_RESP_VALID, id="valid"),
+        *ALIVE_RESP_REJECTED,
+    ])
+    def test_an_unsolicited_response_is_ignored_without_a_nack(self, frame):
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate()
+            assert payload[4] == 0x10
+
+            # No probe is pending: nothing may come back for this frame, and
+            # the socket stays open and in service.
+            client.writer.write(frame)
+            await client.writer.drain()
+            await client.send(PT_ALIVE_CHECK_REQUEST, b"")
+            ptype, payload = await client.recv()
+            assert ptype == PT_ALIVE_CHECK_RESPONSE
+            assert struct.unpack("!H", payload)[0] == ECU_ADDR
+            await client.close()
+            return True
+
+        assert run(with_server(scenario))
+
+    def test_a_non_matching_response_still_counts_as_traffic(self):
+        # Wrong-length / wrong-SA responses are discarded as probe answers but
+        # are still received data, so they push the general timer forward.
+        timers = {"doip": {"general_inactivity_ms": 250}}
+
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate()
+            assert payload[4] == 0x10
+            for _ in range(4):
+                client.writer.write(ALIVE_RESP_WRONG_SA)
+                await client.writer.drain()
+                await asyncio.sleep(0.1)
+            # 400 ms in, well past the 250 ms timer: still open.
+            await client.send(PT_ALIVE_CHECK_REQUEST, b"")
+            ptype, _ = await client.recv()
+            assert ptype == PT_ALIVE_CHECK_RESPONSE
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=timers))
+
+
+class TestConcurrentAliveProbes:
+    """
+    Two contenders for the same registered SA probe the same owner at the
+    same moment. One probe is in flight; both contenders get its result.
+    The owner answers 60 ms after each request so that the second contender
+    is certain to arrive while the first probe is still running.
+    """
+
+    REPLY_DELAY_S = 0.06
+
+    def test_two_contenders_share_one_probe_of_a_live_owner(self):
+        async def scenario(port):
+            owner = await ScriptedOwner.connect(port, delay=self.REPLY_DELAY_S)
+            ptype, payload = await owner.activate()
+            assert payload[4] == 0x10
+
+            first = await Client.connect(port)
+            second = await Client.connect(port)
+            (pt1, p1), (pt2, p2) = await asyncio.gather(
+                first.activate(tester=TESTER_ADDR),
+                second.activate(tester=TESTER_ADDR),
+            )
+            assert (pt1, pt2) == (PT_ROUTING_ACT_RESPONSE, PT_ROUTING_ACT_RESPONSE)
+            assert p1[4] == 0x03
+            assert p2[4] == 0x03
+            assert owner.probes == 1
+
+            # The probe state did not leak: a later contender is probed
+            # again and gets the same answer.
+            third = await Client.connect(port)
+            ptype, payload = await third.activate(tester=TESTER_ADDR)
+            assert payload[4] == 0x03
+            assert owner.probes == 2
+
+            for client in (first, second, third, owner):
+                await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=ALIVE_TIMING))
+
+    def test_two_contenders_share_one_probe_of_a_dead_owner(self):
+        async def scenario(port):
+            owner = await ScriptedOwner.connect(
+                port, reply=ALIVE_RESP_WRONG_SA, delay=self.REPLY_DELAY_S)
+            ptype, payload = await owner.activate()
+            assert payload[4] == 0x10
+
+            first = await Client.connect(port)
+            second = await Client.connect(port)
+            (pt1, p1), (pt2, p2) = await asyncio.gather(
+                first.activate(tester=TESTER_ADDR),
+                second.activate(tester=TESTER_ADDR),
+            )
+            assert (pt1, pt2) == (PT_ROUTING_ACT_RESPONSE, PT_ROUTING_ACT_RESPONSE)
+            assert p1[4] == 0x10
+            assert p2[4] == 0x10
+            assert owner.probes == 1
+
+            for client in (first, second, owner):
+                await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=ALIVE_TIMING))
+
+    def test_probe_state_is_clean_after_concurrent_probes(self):
+        async def scenario(wrapper):
+            port = wrapper.port
+            owner = await ScriptedOwner.connect(
+                port, reply=ALIVE_RESP_WRONG_SA, delay=self.REPLY_DELAY_S)
+            ptype, payload = await owner.activate()
+            assert payload[4] == 0x10
+            session = wrapper._registry.lookup(TESTER_ADDR)
+            assert session is not None
+
+            # Two direct concurrent probes, no answer that counts: both time
+            # out, and exactly one request went on the wire.
+            results = await asyncio.gather(session.probe_alive(0.1),
+                                           session.probe_alive(0.1))
+            assert results == [False, False]
+            assert owner.probes == 1
+            assert not session._alive_probe_pending
+            assert session._alive_probe_event is None
+
+            # The owner starts answering properly: the next probe succeeds.
+            owner.reply = ALIVE_RESP_VALID
+            assert await session.probe_alive(0.5) is True
+            assert owner.probes == 2
+            assert not session._alive_probe_pending
+            assert session._alive_probe_event is None
+
+            # And two concurrent probes of a live owner both succeed on one
+            # request.
+            results = await asyncio.gather(session.probe_alive(0.5),
+                                           session.probe_alive(0.5))
+            assert results == [True, True]
+            assert owner.probes == 3
+            await owner.close()
+            return True
+
+        assert run(_with_server_handle(scenario, extra=ALIVE_TIMING))
