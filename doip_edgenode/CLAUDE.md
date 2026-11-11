@@ -494,22 +494,18 @@ relying on CI here:
   `node_logical_addr=0x1234` — not `0x0000`, which is now rejected by
   `load_config()` as ISO/SAE reserved; see the 2026-10-03 address
   renumbering above).
-- **`test_full_lifecycle` still can't complete**: `tests/mock_ecu.py`'s
-  `MockECU` binds plain IPv4 (`127.0.0.1`), but `_make_app_config()`'s
-  routing entry points `ecu_client.py`'s `ECUConnection.connect()` at IPv6
-  (`ecu_ipv6="::1"`) — and `connect()` always opens an `AF_INET6` socket
-  with a scope id from `socket.if_nametoindex(entry.ecu_interface)`
-  regardless of whether the address is link-local or loopback, so it can
-  never reach an IPv4-only `MockECU`. (The interface-name part is also
-  platform-specific: `"lo"` doesn't exist on macOS, only `"lo0"`.) Needs
-  either an IPv6-capable `MockECU`, or a `connect()` path that skips the
-  scope-id lookup for non-link-local addresses — not decided here.
-- **5 `test_middleware.py` failures**: `patch.object(header_fault, "DoIP",
-  ...)` fails because `header_fault.py` imports Scapy's `DoIP` lazily inside
-  a method rather than at module scope, so there's no module-level `DoIP`
-  attribute for `patch.object` to replace. Fix is either to patch at the
-  import site actually used, or hoist the import to module scope if nothing
-  about the lazy-import rationale (if any) depends on deferring it.
+- **`test_full_lifecycle` — resolved.** The test now starts its `MockECU` on
+  IPv6 loopback (`::1`, via the mock's optional `host`/`logical_addr`
+  arguments) so it matches the IPv6 routing entry, and it skips only itself
+  when `::1` is unavailable on the machine. `ecu_client.py`'s
+  `ECUConnection.connect()` is unchanged: it still opens an `AF_INET6` socket
+  with a scope id from `socket.if_nametoindex(entry.ecu_interface)` (and
+  `"lo"` does not exist on macOS, only `"lo0"`).
+- **`test_middleware.py` seam failures — resolved.** The five tests that patched
+  a module-level `DoIP` in the middleware modules were removed; the Scapy
+  header-fault and corrupt behaviour is now covered in
+  `tests/test_middleware_validation.py` with real Scapy and hand-written byte
+  literals. The lazy Scapy import in `header_fault.py` is unchanged.
 - **`pytest-asyncio` policy contradiction**: this file and the root
   `CLAUDE.md` both say "no `pytest-asyncio`", and `requirements.txt` doesn't
   list it, but `pytest.ini` sets `asyncio_mode = auto` and every test in

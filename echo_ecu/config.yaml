@@ -7,7 +7,7 @@ listen:
 
 doip:
   ecu_logical_addr:  0x0002   # must match ecu_logical_addr in EdgeNode routing table
-  node_type:         0x01     # 0x01 = gateway
+  node_type:         0x01     # 0x00 = gateway, 0x01 = node
   power_mode:        0x01     # 0x00 = not ready, 0x01 = ready, 0x02 = not supported
   max_payload_bytes: 4096
   vin:  "1HGBH41JXMN109186"   # 17-char VIN included in Vehicle Announcement
