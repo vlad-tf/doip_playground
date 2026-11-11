@@ -1668,3 +1668,184 @@ class TestConcurrentAliveProbes:
             return True
 
         assert run(_with_server_handle(scenario, extra=ALIVE_TIMING))
+
+
+def _hexb(text):
+    """Hand-written wire bytes from a spaced hex literal."""
+    return bytes.fromhex(text)
+
+
+class TestErrorPrecedence:
+    """
+    A request that carries two defects at once is answered for the first
+    defect in the order this entity actually evaluates them:
+
+      frame-level problems (declared length over the cap, version/inverse
+      mismatch, payload type this socket does not accept)
+        > payload too short for a Diagnostic Message
+        > source address not the one activated on this socket
+        > unknown target address
+        > diagnostic payload larger than the supported maximum.
+
+    Every request and every expected response below is a hand-written byte
+    literal (not built by the production codec). Closed-socket cases check the
+    complete byte stream until EOF, so a second (lower-precedence) answer
+    would fail the comparison; each rejected request also carries a trailing
+    valid frame that must never be served. Open-socket cases prove the socket
+    is still usable with a follow-up request. Nothing rejected may reach UDS
+    dispatch.
+    """
+
+    SMALL_MAX = {"doip": {"max_payload_bytes": 64}}
+
+    #: Header NACK frames: pattern 00, unknown payload type 01, too large 02,
+    #: invalid length 04.
+    HDR_00 = _hexb("02FD 0000 00000001 00")
+    HDR_01 = _hexb("02FD 0000 00000001 01")
+    HDR_02 = _hexb("02FD 0000 00000001 02")
+    HDR_04 = _hexb("02FD 0000 00000001 04")
+    #: Diagnostic NACK frames (ECU 0002 -> tester): wrong SA 0E01 / 0E00 as
+    #: sent by the request, codes 02 (invalid SA), 03 (unknown TA), 04 (too big).
+    DIAG_02_SA_0E01 = _hexb("02FD 8003 00000005 0002 0E01 02")
+    DIAG_02_SA_0E00 = _hexb("02FD 8003 00000005 0002 0E00 02")
+    DIAG_03 = _hexb("02FD 8003 00000005 0002 0E00 03")
+    DIAG_04 = _hexb("02FD 8003 00000005 0002 0E00 04")
+    #: A valid TesterPresent 0E00 -> 0002 and its two answers.
+    VALID = _hexb("02FD 8001 00000006 0E00 0002 3E00")
+    VALID_ACK = _hexb("02FD 8002 00000005 0002 0E00 00")
+    VALID_RESP = _hexb("02FD 8001 00000006 0002 0E00 7E00")
+
+    #: 65 UDS bytes: one over the 64-byte limit of SMALL_MAX.
+    OVER = "3E" + "00" * 64
+
+    @staticmethod
+    def _spy_plugin(calls):
+        class Spy(Plugin):
+            name = "PrecedenceSpy"
+
+            @on_service()
+            async def seen(self, req, ctx):
+                calls.append(req.raw)
+                return None
+
+        return Spy()
+
+    # (id, activate first?, request frame, expected stream until EOF, config)
+    CLOSING = [
+        # --- header error first, then a source-address problem ---
+        ("bad-inverse+wrong-SA+unknown-TA", True,
+         "02FC 8001 00000005 0E01 0BAD 3E", HDR_00, None),
+        ("bad-inverse+never-activated", False,
+         "02FC 8001 00000005 0E00 0002 3E", HDR_00, None),
+        ("unsupported-version+wrong-SA", True,
+         "04FB 8001 00000005 0E01 0BAD 3E", HDR_00, None),
+        ("hostile-length+wrong-SA", True,
+         "02FD 8001 FFFFFFFF 0E01 0BAD 3E", HDR_02, None),
+        ("hostile-length+never-activated", False,
+         "02FD 8001 FFFFFFFF 0E00 0BAD 3E", HDR_02, None),
+        # --- too-short payload first, then SA / TA problems ---
+        ("short+wrong-SA", True,
+         "02FD 8001 00000004 0E01 0002", HDR_04, None),
+        ("short+never-activated", False,
+         "02FD 8001 00000004 0E00 0002", HDR_04, None),
+        ("short+unknown-TA", True,
+         "02FD 8001 00000004 0E00 0BAD", HDR_04, None),
+        # --- wrong SA first, then TA / size problems ---
+        ("wrong-SA+unknown-TA", True,
+         "02FD 8001 00000005 0E01 0BAD 3E", DIAG_02_SA_0E01, None),
+        ("never-activated+unknown-TA", False,
+         "02FD 8001 00000005 0E00 0BAD 3E", DIAG_02_SA_0E00, None),
+        ("wrong-SA+unknown-TA+oversize", True,
+         "02FD 8001 00000045 0E01 0BAD " + OVER, DIAG_02_SA_0E01, SMALL_MAX),
+        ("wrong-SA+known-TA+oversize", True,
+         "02FD 8001 00000045 0E01 0002 " + OVER, DIAG_02_SA_0E01, SMALL_MAX),
+        # --- single-defect controls: each answer is unchanged ---
+        ("single:bad-inverse", True,
+         "02FC 8001 00000005 0E00 0002 3E", HDR_00, None),
+        ("single:hostile-length", True,
+         "02FD 8001 FFFFFFFF 0E00 0002 3E", HDR_02, None),
+        ("single:short", True,
+         "02FD 8001 00000004 0E00 0002", HDR_04, None),
+        ("single:wrong-SA", True,
+         "02FD 8001 00000005 0E01 0002 3E", DIAG_02_SA_0E01, None),
+        ("single:never-activated", False,
+         "02FD 8001 00000005 0E00 0002 3E", DIAG_02_SA_0E00, None),
+    ]
+
+    @pytest.mark.parametrize("activate,request_hex,expected,extra",
+                             [c[1:] for c in CLOSING], ids=[c[0] for c in CLOSING])
+    def test_first_defect_is_answered_and_the_socket_is_closed(
+            self, activate, request_hex, expected, extra):
+        calls = []
+
+        async def scenario(port):
+            client = await Client.connect(port)
+            if activate:
+                ptype, payload = await client.activate()
+                assert payload[4] == 0x10
+            client.writer.write(_hexb(request_hex) + self.VALID)
+            await client.writer.drain()
+            # Exactly the one answer for the first defect, then EOF.
+            assert await read_until_eof(client) == expected
+            await client.close()
+            await asyncio.sleep(0.05)   # let server-side cleanup finish
+            assert calls == []          # nothing reached UDS dispatch
+            return True
+
+        assert run(with_server(scenario, extra=extra,
+                               plugins=[self._spy_plugin(calls)]))
+
+    # (id, request frame, expected answer, config)
+    STAYING_OPEN = [
+        # Unknown payload type outranks the diagnostic-shaped body it carries
+        # (wrong SA + unknown TA): only Header NACK 01, socket stays open.
+        ("unknown-type+wrong-SA+unknown-TA",
+         "02FD 8FFF 00000005 0E01 0BAD 3E", HDR_01, None),
+        ("single:unknown-type",
+         "02FD 8FFF 00000005 0E00 0002 3E", HDR_01, None),
+        # Right SA: unknown TA outranks oversize.
+        ("unknown-TA+oversize",
+         "02FD 8001 00000045 0E00 0BAD " + OVER, DIAG_03, SMALL_MAX),
+        ("single:unknown-TA",
+         "02FD 8001 00000005 0E00 0BAD 3E", DIAG_03, None),
+        # Known (physical or functional) TA: only the size check is left.
+        ("single:oversize-physical",
+         "02FD 8001 00000045 0E00 0002 " + OVER, DIAG_04, SMALL_MAX),
+        ("single:oversize-functional",
+         "02FD 8001 00000045 0E00 1FFF " + OVER, DIAG_04, SMALL_MAX),
+    ]
+
+    @pytest.mark.parametrize("request_hex,expected,extra",
+                             [c[1:] for c in STAYING_OPEN],
+                             ids=[c[0] for c in STAYING_OPEN])
+    def test_first_defect_is_answered_and_the_socket_stays_open(
+            self, request_hex, expected, extra):
+        calls = []
+
+        async def scenario(port):
+            client = await Client.connect(port)
+            ptype, payload = await client.activate()
+            assert payload[4] == 0x10
+            client.writer.write(_hexb(request_hex))
+            await client.writer.drain()
+            got = await asyncio.wait_for(
+                client.reader.readexactly(len(expected)), timeout=2.0)
+            assert got == expected
+            assert calls == []          # the rejected request was not dispatched
+
+            # The socket is still usable: a valid request is ACKed and
+            # answered, in order, with nothing else queued in between.
+            client.writer.write(self.VALID)
+            await client.writer.drain()
+            got = await asyncio.wait_for(
+                client.reader.readexactly(len(self.VALID_ACK)), timeout=2.0)
+            assert got == self.VALID_ACK
+            got = await asyncio.wait_for(
+                client.reader.readexactly(len(self.VALID_RESP)), timeout=2.0)
+            assert got == self.VALID_RESP
+            assert calls == [b"\x3E\x00"]
+            await client.close()
+            return True
+
+        assert run(with_server(scenario, extra=extra,
+                               plugins=[self._spy_plugin(calls)]))
