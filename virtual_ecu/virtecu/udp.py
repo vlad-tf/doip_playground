@@ -24,6 +24,7 @@ that was not a Vehicle Identification Request.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import socket
 import struct
@@ -78,6 +79,26 @@ _UDP_NEVER_NACK_TYPES = (
 )
 
 logger = logging.getLogger("virtecu.udp")
+
+_V4_LIMITED_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+
+
+def _is_multicast_or_broadcast_source(host: str) -> bool:
+    """True if ``host`` is an IPv4/IPv6 multicast or IPv4 limited-broadcast address.
+
+    A scope suffix (``%eth0``) is ignored and an IPv4-mapped IPv6 address is
+    judged as the IPv4 address it wraps. A string that is not an IP literal
+    is *not* classified as such (returns False) and so is handled normally.
+    Directed (subnet-specific) broadcast needs the interface netmask and is
+    deliberately not recognised here.
+    """
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_multicast or ip == _V4_LIMITED_BROADCAST
 
 
 def _stagger_delay_ms(key: tuple, max_ms: int) -> int:
@@ -233,6 +254,13 @@ class _UDPProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         if len(data) < 8:
+            return
+
+        # A multicast or limited-broadcast source address is never a valid
+        # requester: drop silently (no reply, no Header NACK) so a spoofed or
+        # misrouted datagram cannot make this entity answer a group address.
+        if _is_multicast_or_broadcast_source(addr[0]):
+            logger.debug("UDP: ignoring datagram from multicast/broadcast source %s", addr)
             return
 
         # A datagram whose source is this entity's own discovery socket is one

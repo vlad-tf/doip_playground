@@ -25,6 +25,7 @@ driven through ``run()``.
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 
 import pytest
@@ -468,3 +469,281 @@ def test_short_datagram_is_ignored():
     protocol.datagram_received(b"\x02\xfd\x40", ADDR)
 
     assert transport.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Source-address filter: datagrams that claim a multicast or limited-broadcast
+# source are discarded without any reply (not even a Header NACK).  Frames and
+# expected replies below are hand-written wire bytes.
+# ---------------------------------------------------------------------------
+
+_VIR = bytes.fromhex("02FD000100000000")                    # Vehicle Identification Request
+_ENTITY_STATUS_REQ = bytes.fromhex("02FD400100000000")
+_POWER_MODE_REQ = bytes.fromhex("02FD400300000000")
+_BAD_VERSION_REQ = bytes.fromhex("01FE400100000000")        # would get Header NACK 0x00
+_UNKNOWN_TYPE_REQ = bytes.fromhex("02FD00FF00000000")       # would get Header NACK 0x01
+
+#: Vehicle Identification Response for BASE_CONFIG: header + VIN + logical
+#: address 0x0002 + EID + GID + further action + sync status.
+_BASE_VIR_RESPONSE = (bytes.fromhex("02FD000400000021")
+                      + b"1HGBH41JXMN109186"
+                      + bytes.fromhex("0002" "AABBCCDDEEFF" "000000000000" "0000"))
+
+_FILTERED_SOURCES = [
+    ("224.0.0.1", 54321),
+    ("239.255.255.250", 54321),
+    ("255.255.255.255", 54321),
+    ("ff02::1", 54321, 0, 0),
+    ("ff02::1%eth0", 54321, 0, 0),
+    ("::ffff:255.255.255.255", 54321, 0, 0),
+    ("::ffff:224.0.0.1", 54321, 0, 0),
+]
+
+
+def _feed_and_settle(protocol, data, addr) -> None:
+    """Deliver one datagram, then let any deferred reply run before returning."""
+    async def scenario():
+        protocol.datagram_received(data, addr)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("source", _FILTERED_SOURCES,
+                         ids=[repr(s[0]) for s in _FILTERED_SOURCES])
+@pytest.mark.parametrize("frame", [_VIR, _ENTITY_STATUS_REQ, _POWER_MODE_REQ,
+                                   _BAD_VERSION_REQ, _UNKNOWN_TYPE_REQ],
+                         ids=["vehicle_id", "entity_status", "power_mode",
+                              "bad_version", "unknown_type"])
+def test_multicast_or_broadcast_source_gets_no_reply_and_no_nack(frame, source):
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+    _feed_and_settle(protocol, frame, source)
+
+    assert transport.sent == []
+    assert protocol._tasks == set()        # no deferred reply was even scheduled
+
+
+@pytest.mark.parametrize("source", [
+    ("192.0.2.10", 54321),
+    ("::1", 54321, 0, 0),
+    ("fe80::1%eth0", 54321, 0, 0),
+    ("::ffff:192.0.2.10", 54321, 0, 0),
+], ids=["ipv4_unicast", "ipv6_loopback", "ipv6_link_local_scoped", "ipv4_mapped_unicast"])
+def test_unicast_sources_are_still_answered(source):
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+    _feed_and_settle(protocol, _VIR, source)
+
+    assert transport.sent == [(_BASE_VIR_RESPONSE, source)]
+
+
+def test_unicast_source_still_gets_requests_other_than_identification():
+    protocol, transport = _protocol()
+    source = ("192.0.2.10", 54321)
+    protocol.datagram_received(_ENTITY_STATUS_REQ, source)
+    protocol.datagram_received(_POWER_MODE_REQ, source)
+
+    assert transport.sent == [
+        (bytes.fromhex("02FD4002" "00000007" "01" "01" "00" "00001000"), source),
+        (bytes.fromhex("02FD4004" "00000001" "01"), source),
+    ]
+
+
+def test_unicast_source_with_bad_header_still_gets_a_header_nack():
+    protocol, transport = _protocol()
+    source = ("192.0.2.10", 54321)
+    protocol.datagram_received(_BAD_VERSION_REQ, source)
+    protocol.datagram_received(_UNKNOWN_TYPE_REQ, source)
+
+    assert transport.sent == [
+        (bytes.fromhex("02FD0000" "00000001" "00"), source),
+        (bytes.fromhex("02FD0000" "00000001" "01"), source),
+    ]
+
+
+def test_directed_broadcast_source_is_not_filtered_current_behaviour():
+    # Documented limitation: a subnet-directed broadcast address (here
+    # 10.255.255.255) cannot be told apart from a unicast host without the
+    # interface netmask, so such a source is answered like any other peer.
+    # This pins today's behaviour; it is not a statement that it is correct.
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+    source = ("10.255.255.255", 54321)
+    _feed_and_settle(protocol, _VIR, source)
+
+    assert transport.sent == [(_BASE_VIR_RESPONSE, source)]
+
+
+@pytest.mark.parametrize("host", ["not-an-ip", "", "999.1.1.1", "ff02::1::2"])
+def test_unparsable_source_host_does_not_raise_and_is_not_filtered(host):
+    # Policy: only a source that parses as a multicast/limited-broadcast IP is
+    # dropped; any other string falls through to normal handling.
+    protocol, transport = _protocol({"udp": {"announce_wait_ms": 0}})
+    source = (host, 54321)
+    _feed_and_settle(protocol, _VIR, source)
+
+    assert transport.sent == [(_BASE_VIR_RESPONSE, source)]
+
+
+def test_multicast_source_filter_runs_after_the_length_check_only():
+    # A datagram shorter than a DoIP header is ignored either way; the filter
+    # does not change that, and a filtered full-length datagram stays silent.
+    protocol, transport = _protocol()
+    protocol.datagram_received(b"\x02\xfd\x00", ("224.0.0.1", 54321))
+    protocol.datagram_received(_BAD_VERSION_REQ, ("224.0.0.1", 54321))
+    assert transport.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Startup announcement sequence: count, spacing, frame content.  No sockets and
+# no real waiting: the module's ``socket`` and ``asyncio`` names are swapped
+# for thin shims that fake the bind/endpoint and record ``sleep`` delays.
+# ---------------------------------------------------------------------------
+
+class _FakeSock:
+    def __init__(self, *args, **kwargs) -> None:
+        self.closed = False
+
+    def setsockopt(self, *args) -> None:
+        pass
+
+    def bind(self, addr) -> None:
+        pass
+
+    def fileno(self) -> int:
+        return -1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ClosableFakeTransport(_FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+
+class _SocketShim:
+    """Real ``socket`` constants/functions, but ``socket.socket`` is inert."""
+    socket = _FakeSock
+
+    def __getattr__(self, name):
+        return getattr(socket, name)
+
+
+class _AsyncioShim:
+    """Real ``asyncio`` except ``sleep`` records its delay and only yields."""
+
+    def __init__(self, delays: list) -> None:
+        self._delays = delays
+
+    async def sleep(self, delay, *args, **kwargs):
+        self._delays.append(delay)
+        await asyncio.sleep(0)
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
+
+def _drive_announcer(monkeypatch, config) -> tuple:
+    """Run ``run_announcer`` until every startup announcement is out, then cancel.
+
+    Returns ``(recorded_sleep_delays, sent_datagrams, transport)``.
+    """
+    delays: list = []
+    transport = _ClosableFakeTransport()
+    monkeypatch.setattr(udp_module, "socket", _SocketShim())
+    monkeypatch.setattr(udp_module, "asyncio", _AsyncioShim(delays))
+    monkeypatch.setattr(udp_module, "_local_ips", lambda: set())
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+
+        async def fake_endpoint(factory, sock=None, **kwargs):
+            protocol = factory()
+            protocol.connection_made(transport)
+            return transport, protocol
+
+        monkeypatch.setattr(loop, "create_datagram_endpoint", fake_endpoint)
+        task = asyncio.ensure_future(udp_module.run_announcer(config))
+        for _ in range(200):                       # bounded; real yields only
+            if len(transport.sent) >= config.udp.announce_count:
+                break
+            await asyncio.sleep(0)
+        for _ in range(5):                         # let it reach "idle, listening"
+            await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+    return delays, list(transport.sent), transport
+
+
+def test_announcer_default_config_sends_three_announcements_500ms_apart(monkeypatch):
+    config = parse_config(merge(BASE_CONFIG, {"udp": {"enabled": True}}))
+    delays, sent, transport = _drive_announcer(monkeypatch, config)
+
+    assert len(sent) == 3
+    # Whatever the initial wait is (zero or one sleep), it is bounded by the
+    # configured maximum; the two gaps between announcements are 0.5 s each.
+    assert delays[-2:] == [0.5, 0.5]
+    head = delays[:-2]
+    assert len(head) <= 1
+    assert all(0 <= d <= 0.5 for d in head)
+    assert transport.closed
+
+
+def test_announcer_overridden_count_and_interval(monkeypatch):
+    config = parse_config(merge(BASE_CONFIG, {"udp": {
+        "enabled": True, "announce_count": 2, "announce_interval_ms": 200,
+        "announce_wait_ms": 100}}))
+    delays, sent, _ = _drive_announcer(monkeypatch, config)
+
+    assert len(sent) == 2
+    assert delays[-1:] == [0.2]
+    head = delays[:-1]
+    assert len(head) <= 1
+    assert all(0 <= d <= 0.1 for d in head)
+
+
+def test_announcer_without_initial_wait_only_sleeps_between_announcements(monkeypatch):
+    config = parse_config(merge(BASE_CONFIG, {"udp": {
+        "enabled": True, "announce_wait_ms": 0}}))
+    delays, sent, _ = _drive_announcer(monkeypatch, config)
+
+    assert len(sent) == 3
+    assert delays == [0.5, 0.5]
+
+
+def test_announcer_single_announcement_has_no_inter_send_sleep(monkeypatch):
+    config = parse_config(merge(BASE_CONFIG, {"udp": {
+        "enabled": True, "announce_count": 1, "announce_wait_ms": 0}}))
+    delays, sent, _ = _drive_announcer(monkeypatch, config)
+
+    assert len(sent) == 1
+    assert delays == []
+
+
+def test_announcer_frames_are_vehicle_announcements_with_configured_identity(monkeypatch):
+    config = parse_config(merge(BASE_CONFIG, {
+        "doip": {"ecu_logical_addr": 0x0E80, "vin": "WVWZZZ1JZXW000001",
+                 "eid": "0A0B0C0D0E0F", "gid": "112233445566"},
+        "udp": {"enabled": True, "announce_wait_ms": 0},
+    }))
+    _, sent, _ = _drive_announcer(monkeypatch, config)
+
+    expected = (bytes.fromhex("02FD000400000021")
+                + b"WVWZZZ1JZXW000001"
+                + bytes.fromhex("0E80" "0A0B0C0D0E0F" "112233445566" "0000"))
+    assert len(sent) == 3
+    for frame, dest in sent:
+        assert frame == expected
+        assert dest[0] == "ff02::1"             # default discovery family: IPv6 multicast
