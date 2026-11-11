@@ -97,6 +97,7 @@ class HeaderFaultMiddleware(Middleware):
     def _apply_fault(self, pkt):
         """Return a copy of pkt with the header field corrupted."""
         from scapy.contrib.automotive.doip import DoIP  # type: ignore[import]
+        from scapy.packet import Raw  # type: ignore[import]
 
         # Work on a copy so we don't mutate the original
         corrupted = DoIP(bytes(pkt))
@@ -108,7 +109,16 @@ class HeaderFaultMiddleware(Middleware):
         elif self.fault == "bad_length":
             setattr(corrupted, _LEN_FIELD, 0xFFFFFFFF)
         elif self.fault == "unknown_type":
+            # Once the type is no longer a known one, Scapy stops treating
+            # the body as the dissected layer and would re-emit only the
+            # layer's inner payload, silently dropping the leading body
+            # bytes while the length field still counts them.  Re-attach the
+            # original body verbatim so only the type bytes differ.
+            body = bytes(pkt)[8:]
             setattr(corrupted, _TYPE_FIELD, 0xDEAD)
+            corrupted.remove_payload()
+            if body:
+                corrupted.add_payload(Raw(body))
 
         return corrupted
 

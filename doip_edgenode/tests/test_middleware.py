@@ -215,40 +215,8 @@ class TestDelayMiddleware:
 # ---------------------------------------------------------------------------
 
 class TestCorruptMiddleware:
-    def test_flips_specified_byte(self):
-        """Verify that the byte at byte_offset is XOR-flipped by flip_mask."""
-        # We can't import Scapy, so we patch DoIP with FakePacket's rebuild
-        import unittest.mock as mock
-
-        import middleware.corrupt as corrupt_mod
-
-        original_import = corrupt_mod.__builtins__  # save
-
-        # Patch the DoIP import inside corrupt.py
-        fake_doip_class = lambda raw: _RawPacket(raw)
-
-        with mock.patch.dict("sys.modules", {"scapy.contrib.automotive.doip": mock.MagicMock()}):
-            with mock.patch("middleware.corrupt.CorruptMiddleware.__module__"):
-                pass  # just ensuring import works
-
-        # Build a packet with known payload
-        pkt = FakePacket(payload_bytes=b"\x00\x00\x00\x00\x00")
-
-        cm = corrupt_mod.CorruptMiddleware(byte_offset=0, flip_mask=0xFF)
-        cm_none = corrupt_mod.CorruptMiddleware(byte_offset=0, flip_mask=0xFF)
-
-        # Manually call the logic without Scapy by mocking it
-        with mock.patch("middleware.corrupt.DoIP", side_effect=lambda raw: _RawPacket(raw)):
-            # Manually import inside mock context
-            import importlib
-            session = FakeSession()
-            # Since we can't fully mock Scapy here, just verify the offset logic
-            # by checking the bytearray manipulation
-            raw = bytearray(bytes(pkt))
-            payload = raw[8:]
-            original = payload[0]
-            payload[0] ^= 0xFF
-            assert payload[0] == (original ^ 0xFF)
+    # The exact-byte flip against a real Scapy packet lives in
+    # test_middleware_validation.py; this module stays Scapy-free.
 
     def test_empty_payload_passthrough(self):
         """Empty payload → no corruption, packet passed through unchanged."""
@@ -267,14 +235,6 @@ class TestCorruptMiddleware:
         session = FakeSession()
         result = run(cm.process(pkt, "tester_to_ecu", session))
         assert result is pkt  # passed through unchanged
-
-
-class _RawPacket:
-    """Helper for CorruptMiddleware test — wraps raw bytes."""
-    def __init__(self, raw: bytes) -> None:
-        self._raw = raw
-    def __bytes__(self) -> bytes:
-        return bytes(self._raw)
 
 
 # ---------------------------------------------------------------------------
@@ -352,60 +312,11 @@ class TestAddressMiddleware:
 
 class TestHeaderFaultMiddleware:
     """
-    Tests for each of the four fault modes.
-    These verify that the correct field is mutated.
+    Cadence, direction and constructor tests for HeaderFaultMiddleware.
 
-    Because Scapy isn't available, we test only the internal _apply_fault()
-    logic by monkeypatching the DoIP import inside header_fault.py.
+    The per-mode wire bytes need a real Scapy packet, so those vectors live
+    in test_middleware_validation.py; this module stays Scapy-free.
     """
-
-    def _apply(self, fault: str, pkt: FakePacket) -> FakePacket:
-        import unittest.mock as mock
-        from middleware.header_fault import HeaderFaultMiddleware
-
-        mw = HeaderFaultMiddleware(
-            fault=fault, direction="both", inject_on_nth=1
-        )
-
-        # Patch the DoIP import so _apply_fault rebuilds using FakePacket-like
-        class _ScapyDoIPMock:
-            def __init__(self, raw: bytes) -> None:
-                self.ver = raw[0]
-                self.inv_ver = raw[1]
-                self.type = int.from_bytes(raw[2:4], "big")
-                self.len = int.from_bytes(raw[4:8], "big")
-                self._raw = raw
-
-            def __bytes__(self) -> bytes:
-                return (
-                    bytes([self.ver, self.inv_ver])
-                    + self.type.to_bytes(2, "big")
-                    + self.len.to_bytes(4, "big")
-                    + self._raw[8:]
-                )
-
-        with mock.patch("middleware.header_fault.DoIP", side_effect=_ScapyDoIPMock):
-            return mw._apply_fault(pkt)
-
-    def test_wrong_version(self):
-        pkt = FakePacket(ver=0x02)
-        result = self._apply("wrong_version", pkt)
-        assert result.ver == 0xFF
-
-    def test_bad_inverse(self):
-        pkt = FakePacket(inv_ver=0xFD)
-        result = self._apply("bad_inverse", pkt)
-        assert result.inv_ver == 0x00
-
-    def test_bad_length(self):
-        pkt = FakePacket()
-        result = self._apply("bad_length", pkt)
-        assert result.len == 0xFFFFFFFF
-
-    def test_unknown_type(self):
-        pkt = FakePacket(type=0x8001)
-        result = self._apply("unknown_type", pkt)
-        assert result.type == 0xDEAD
 
     def test_inject_on_nth(self):
         """inject_on_nth=3: first two calls pass through, third injects."""

@@ -182,6 +182,89 @@ def test_header_default_fault_serializes_without_mutating_original():
     assert bytes(pkt) == original
 
 
+# Hand-written reference frame: header 02 fd 80 01, length 5, then source
+# 0e00, target 0002 and one data byte 3e.
+_REFERENCE_FRAME = bytes.fromhex("02fd8001" "00000005" "0e0000023e")
+
+
+def test_reference_frame_literal_round_trips_through_scapy():
+    assert bytes(DoIP(_REFERENCE_FRAME)) == _REFERENCE_FRAME
+
+
+@pytest.mark.parametrize("fault, expected_hex", [
+    ("wrong_version", "fffd8001" "00000005" "0e0000023e"),
+    ("bad_inverse", "02008001" "00000005" "0e0000023e"),
+    ("bad_length", "02fd8001" "ffffffff" "0e0000023e"),
+])
+def test_header_fault_modes_change_only_the_documented_header_bytes(fault, expected_hex):
+    pkt = DoIP(_REFERENCE_FRAME)
+    middleware = HeaderFaultMiddleware(fault=fault, direction="both", inject_on_nth=1)
+    result = asyncio.run(middleware.process(pkt, "tester_to_ecu", None))
+    assert result is not pkt
+    assert bytes(result) == bytes.fromhex(expected_hex)
+    assert bytes(pkt) == _REFERENCE_FRAME
+
+
+# Hand-written (input, expected) pairs: only bytes 2-3 become de ad; the
+# version bytes, the length field and the whole body are carried over as is.
+_UNKNOWN_TYPE_VECTORS = [
+    pytest.param(  # diagnostic message with a one-byte UDS request
+        "02fd8001" "00000005" "0e0000023e",
+        "02fddead" "00000005" "0e0000023e",
+        id="diagnostic-short",
+    ),
+    pytest.param(  # diagnostic message with a longer UDS request
+        "02fd8001" "00000009" "0e000003" "22f190f186",
+        "02fddead" "00000009" "0e000003" "22f190f186",
+        id="diagnostic-long",
+    ),
+    pytest.param(  # header only, no body at all
+        "02fd0007" "00000000",
+        "02fddead" "00000000",
+        id="header-only",
+    ),
+    pytest.param(  # alive check response: a body that is not a diagnostic one
+        "02fd0008" "00000002" "0e00",
+        "02fddead" "00000002" "0e00",
+        id="alive-check-response",
+    ),
+    pytest.param(  # routing-activation-request-shaped body
+        "02fd0005" "00000007" "0e00" "00" "00000000",
+        "02fddead" "00000007" "0e00" "00" "00000000",
+        id="routing-activation-request",
+    ),
+]
+
+
+@pytest.mark.parametrize("input_hex, expected_hex", _UNKNOWN_TYPE_VECTORS)
+def test_header_fault_unknown_type_changes_only_the_type_bytes(input_hex, expected_hex):
+    original = bytes.fromhex(input_hex)
+    pkt = DoIP(original)
+    middleware = HeaderFaultMiddleware(fault="unknown_type", direction="both", inject_on_nth=1)
+    result = asyncio.run(middleware.process(pkt, "tester_to_ecu", None))
+    out = bytes(result)
+    assert result is not pkt
+    assert out == bytes.fromhex(expected_hex)
+    # The frame stays self-consistent: the length field still counts the body.
+    assert int.from_bytes(out[4:8], "big") == len(out) - 8
+    # The input packet is left alone.
+    assert bytes(pkt) == original
+
+
+@pytest.mark.parametrize("offset, mask, expected_hex", [
+    (0, 0xFF, "02fd8001" "00000005" "f10000023e"),
+    (2, 0x80, "02fd8001" "00000005" "0e0080023e"),
+    (4, 0x0F, "02fd8001" "00000005" "0e00000231"),
+])
+def test_corrupt_flips_exactly_one_payload_byte_to_literal_value(offset, mask, expected_hex):
+    pkt = DoIP(_REFERENCE_FRAME)
+    middleware = CorruptMiddleware(byte_offset=offset, flip_mask=mask)
+    result = asyncio.run(middleware.process(pkt, "tester_to_ecu", None))
+    assert result is not pkt
+    assert bytes(result) == bytes.fromhex(expected_hex)
+    assert bytes(pkt) == _REFERENCE_FRAME
+
+
 def test_delay_uses_fixed_delay_plus_patched_jitter():
     async def scenario():
         with patch("middleware.delay.random.randint", return_value=7) as randint, patch(
