@@ -160,10 +160,8 @@ class Harness:
         if self._read_task is None:
             self._read_task = asyncio.ensure_future(self.conn.recv())
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(self._read_task), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
+            await asyncio.wait({self._read_task}, timeout=timeout)
+            return self._read_task.result() if self._read_task.done() else None
         finally:
             if self._read_task is not None and self._read_task.done():
                 self._read_task = None

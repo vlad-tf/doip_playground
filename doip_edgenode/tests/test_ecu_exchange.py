@@ -15,6 +15,7 @@
 """F06: exercise the production exchange, not a copied receive-loop harness."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -431,4 +432,169 @@ def test_direct_pending_then_recv_error_does_not_invent_ack_or_nack():
             assert_retired(session, ecu)
         finally:
             await session._cleanup()
+    asyncio.run(scenario())
+
+
+class TimedECU(QueueECU):
+    """QueueECU whose Nth read returns a frame after a fixed delay.
+
+    ``timed`` maps a 1-based read number to ``(delay_s, frame)``. With
+    ``stall_s`` set, such a read also schedules one blocking callback 5 ms
+    after it starts; the whole event loop freezes for ``stall_s`` seconds, so
+    the read completion and the per-frame timer both become due together.
+    """
+
+    def __init__(self, timed, frames=(), stall_s=0.0, error_at=None):
+        super().__init__(frames, error_at=error_at)
+        self.timed = timed
+        self.stall_s = stall_s
+        self.stalled = asyncio.Event()
+
+    def _stall(self):
+        time.sleep(self.stall_s)
+        self.stalled.set()
+
+    async def recv(self):
+        number = len(self.reads) + 1
+        if number not in self.timed:
+            return await super().recv()
+        delay, frame = self.timed[number]
+        self.reads.append(asyncio.current_task())
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.receiving.set()
+        try:
+            if self.stall_s:
+                asyncio.get_running_loop().call_later(0.005, self._stall)
+            await asyncio.sleep(delay)
+            return frame
+        finally:
+            self.active -= 1
+
+
+@pytest.mark.parametrize("prefix", [[], [ACK]])
+def test_final_ready_with_the_per_frame_timeout_is_relayed(prefix):
+    async def scenario():
+        # The final frame is ready 19 ms into a 20 ms wait and the loop stalls
+        # for 50 ms, so read completion and timeout expire in one iteration.
+        ecu = TimedECU({len(prefix) + 2: (0.019, FINAL)}, prefix + [PENDING],
+                       stall_s=0.05)
+        session, writer = await setup(ecu, per_frame=0.02, budget=0.4)
+        try:
+            await exchange(session)
+            assert ecu.stalled.is_set()
+            assert writer.frames == prefix + [PENDING, FINAL]
+            assert len(ecu.reads) == len(prefix) + 2
+            assert ecu.max_active == 1
+            assert not ecu.closed
+            assert session._ecu_conns[1] is ecu
+            assert not session._ecu_read_tasks
+            assert not session._ecu_read_owners
+        finally:
+            await session._cleanup()
+    asyncio.run(scenario())
+
+
+def test_recv_frame_finished_with_the_timeout_is_returned_then_read_is_reused():
+    async def scenario():
+        ecu = TimedECU({1: (0.019, FINAL)})
+        session, _ = await setup(ecu)
+        try:
+            frame_task = asyncio.create_task(session._recv_ecu_frame(1, ecu, 0.02))
+            await ecu.receiving.wait()
+            time.sleep(0.05)  # freeze the loop: read and timeout both due
+            assert await frame_task == FINAL
+            assert len(ecu.reads) == 1
+            assert not session._ecu_read_tasks
+            assert not session._ecu_read_owners
+
+            # A real timeout still returns None and keeps the same read alive.
+            assert await session._recv_ecu_frame(1, ecu, 0.01) is None
+            assert len(ecu.reads) == 2
+            kept = session._ecu_read_tasks[1]
+            assert kept is ecu.reads[1]
+            assert not kept.done()
+            assert session._ecu_read_owners[1] is ecu
+
+            ecu.queue.put_nowait(PENDING)
+            assert await session._recv_ecu_frame(1, ecu, 0.5) == PENDING
+            assert len(ecu.reads) == 2
+            assert kept.done() and not kept.cancelled()
+            assert not session._ecu_read_tasks
+            assert not session._ecu_read_owners
+            assert ecu.max_active == 1
+        finally:
+            await session._cleanup()
+    asyncio.run(scenario())
+
+
+def test_recv_frame_propagates_a_read_error_and_forgets_the_read():
+    async def scenario():
+        ecu = QueueECU(error_at=1)
+        session, _ = await setup(ecu)
+        try:
+            with pytest.raises(ConnectionResetError):
+                await session._recv_ecu_frame(1, ecu, 0.5)
+            assert not session._ecu_read_tasks
+            assert not session._ecu_read_owners
+        finally:
+            await session._cleanup()
+    asyncio.run(scenario())
+
+
+def test_cancelling_the_caller_keeps_the_shared_read_alive():
+    async def scenario():
+        ecu = QueueECU()
+        session, _ = await setup(ecu)
+        try:
+            caller = asyncio.create_task(session._recv_ecu_frame(1, ecu, 5.0))
+            await ecu.receiving.wait()
+            read = session._ecu_read_tasks[1]
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            assert not read.done()
+            assert session._ecu_read_tasks[1] is read
+            assert session._ecu_read_owners[1] is ecu
+            assert ecu.active == 1
+
+            ecu.queue.put_nowait(FINAL)
+            assert await session._recv_ecu_frame(1, ecu, 0.5) == FINAL
+            assert len(ecu.reads) == 1
+            assert read.done() and not read.cancelled()
+            assert not session._ecu_read_tasks
+        finally:
+            await session._cleanup()
+    asyncio.run(scenario())
+
+
+def test_final_frame_is_never_lost_across_a_sweep_of_ready_times():
+    # Final-frame ready times 240.0 .. 260.0 ms in 0.5 ms steps (41 runs) around
+    # the multiples of the 20 ms per-frame wait. All runs share one event loop
+    # and execute concurrently, so the sweep costs about one run (~0.3 s).
+    delays = [0.240 + 0.0005 * i for i in range(41)]
+
+    async def one(delay):
+        ecu = QueueECU([ACK, PENDING])
+        session, writer = await setup(ecu, per_frame=0.02, budget=0.6)
+
+        async def final():
+            await asyncio.sleep(delay)
+            ecu.queue.put_nowait(FINAL)
+        producer = asyncio.create_task(final())
+        try:
+            await asyncio.wait_for(session._dispatch(session._dissect(
+                _diagnostic_message(0x0E00, 1, b"\x22\xf1\x90"))), 1.0)
+            return writer.frames == [ACK, PENDING, FINAL] and not ecu.closed
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            await session._cleanup()
+
+    async def scenario():
+        results = await asyncio.gather(*(one(d) for d in delays))
+        lost = [round(d * 1000, 1) for d, ok in zip(delays, results) if not ok]
+        assert lost == [], "final frame lost at ready times (ms): %s" % lost
     asyncio.run(scenario())

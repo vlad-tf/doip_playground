@@ -900,9 +900,11 @@ class DoIPSession:
             self._ecu_read_tasks[target_ecu_addr] = task
             self._ecu_read_owners[target_ecu_addr] = ecu_conn
         try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
+            # ``wait`` never cancels ``task`` and never discards a finished
+            # one: a read that completes in the same loop iteration as the
+            # timeout is still returned instead of being lost.
+            await asyncio.wait({task}, timeout=timeout)
+            return task.result() if task.done() else None
         finally:
             if task.done() and self._ecu_read_tasks.get(target_ecu_addr) is task:
                 self._ecu_read_tasks.pop(target_ecu_addr)
