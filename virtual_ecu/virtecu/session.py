@@ -1115,8 +1115,10 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
     Run the dispatcher, emitting ``7F <sid> 78`` while it is still working.
 
     Without this a slow plugin handler blows the tester's P2 timeout.
-    ``shield`` inside ``wait_for`` is the point: the timeout must observe the
-    handler, never cancel it.
+    ``asyncio.wait`` is the point: its timeout observes the handler, never
+    cancels it, and the decision is taken from the task, not from the timer --
+    a handler that finishes in the very loop iteration in which the window
+    expires has its result returned, with no extra 0x78 and no give-up.
 
     ``uds.max_response_pending`` caps how many 0x78 frames one request may
     generate. A handler that never returns would otherwise make this emit
@@ -1125,8 +1127,8 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
     hung handler into a permanent frame flood on an immortal connection. Once
     the cap is hit, this gives up: cancels ``task``, sends a final NRC 0x10
     (generalReject), and stops waiting. Cancelling (not detaching) matters —
-    ``shield`` only protects the handler from the P2 timeout, never from
-    teardown, and plugin code is already expected to be cancellable
+    the P2 window only ever observes the handler, never teardown, and plugin
+    code is already expected to be cancellable
     (``dispatcher.py`` re-raises ``CancelledError`` rather than isolating
     it) — otherwise the abandoned task outlives the connection for good and
     can still call ``responder()`` whenever it eventually wakes up.
@@ -1136,15 +1138,15 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
     *was* the connection's own task, so there was nothing else to cancel it
     out from under. The split introduced a second cancellation source --
     ``EcuSession._stop_uds_worker`` / ``evict()`` cancelling the worker task
-    on teardown -- that lands on the exact same ``shield``ed ``await`` as the
-    P2 timeout does, but outside the ``except asyncio.TimeoutError`` branch
-    below, so the give-up branch's ``task.cancel()`` never ran for it: the
-    shielded ``task`` kept running detached until it finished on its own,
-    able to call ``responder()`` well after the connection was gone. Verified
-    by closing a connection mid-handler and observing the dispatch task still
-    alive afterward. The outer ``except CancelledError`` below closes this
-    for any cancellation source, present or future, not just the one this
-    function already knew how to name.
+    on teardown -- that lands on the same ``await`` as the P2 window does,
+    outside the give-up branch below, so the give-up branch's
+    ``task.cancel()`` never ran for it: the handler task kept running
+    detached until it finished on its own, able to call ``responder()`` well
+    after the connection was gone. Verified by closing a connection
+    mid-handler and observing the dispatch task still alive afterward. The
+    outer ``except CancelledError`` below closes this for any cancellation
+    source, present or future, not just the one this function already knew
+    how to name.
     """
     uds_cfg = ecu.uds
     task = asyncio.ensure_future(ecu.dispatcher.dispatch(request, state, responder))
@@ -1155,39 +1157,42 @@ async def _dispatch_with_p2(ecu: Any, state: Any, request: UdsRequest,
         window = uds_cfg.p2_server_ms / 1000.0
         pending_sent = 0
         while True:
-            try:
-                return await asyncio.wait_for(asyncio.shield(task), timeout=window)
-            except asyncio.TimeoutError:
-                if uds_cfg.max_response_pending and pending_sent >= uds_cfg.max_response_pending:
-                    logger.warning(
-                        "%s: handler still running after %d ResponsePending frames "
-                        "— giving up with NRC 0x10 (uds.max_response_pending)",
-                        request.describe(), pending_sent,
-                    )
-                    # Cancel rather than detach: shield only protects the handler
-                    # from the P2 timeout, not from teardown — plugin code is
-                    # already expected to be cancellable (dispatcher.py re-raises
-                    # CancelledError instead of isolating it), cancelling runs its
-                    # finally blocks, and a merely-slow handler that outlives the
-                    # cap must not wake up later and ctx.send() a stray frame onto
-                    # a connection the tester has moved on from.
-                    task.cancel()
-                    task.add_done_callback(_log_abandoned_dispatch)
-                    await responder(bytes([0x7F, request.sid & 0xFF, NRC_GENERAL_REJECT]))
-                    return NO_RESPONSE
-                logger.debug("P2 elapsed for %s — sending ResponsePending",
-                             request.describe())
-                await responder(bytes([0x7F, request.sid & 0xFF, NRC_RESPONSE_PENDING]))
-                pending_sent += 1
-                window = (uds_cfg.p2_star_server_ms / 1000.0) * 0.9
+            # ``wait`` neither cancels ``task`` nor discards a finished one, so
+            # the P2 window can never kill the handler. Decide from the task:
+            # a handler that completed in the iteration in which the window
+            # timer fired is done here, whatever woke this coroutine.
+            await asyncio.wait({task}, timeout=window)
+            if task.done():
+                return task.result()
+            if uds_cfg.max_response_pending and pending_sent >= uds_cfg.max_response_pending:
+                logger.warning(
+                    "%s: handler still running after %d ResponsePending frames "
+                    "— giving up with NRC 0x10 (uds.max_response_pending)",
+                    request.describe(), pending_sent,
+                )
+                # Cancel rather than detach: a merely-slow handler that
+                # outlives the cap must not wake up later and ctx.send() a
+                # stray frame onto a connection the tester has moved on from
+                # — plugin code is already expected to be cancellable
+                # (dispatcher.py re-raises CancelledError instead of isolating
+                # it), and cancelling runs its finally blocks.
+                task.cancel()
+                task.add_done_callback(_log_abandoned_dispatch)
+                await responder(bytes([0x7F, request.sid & 0xFF, NRC_GENERAL_REJECT]))
+                return NO_RESPONSE
+            logger.debug("P2 elapsed for %s — sending ResponsePending",
+                         request.describe())
+            await responder(bytes([0x7F, request.sid & 0xFF, NRC_RESPONSE_PENDING]))
+            pending_sent += 1
+            window = (uds_cfg.p2_star_server_ms / 1000.0) * 0.9
     except asyncio.CancelledError:
         # This coroutine itself was cancelled (worker teardown on connection
         # close/eviction is the known case today) -- not the P2-timeout path
         # above, which handles its own give-up separately and returns rather
-        # than raising. ``task`` is still shielded from *that* cancellation
-        # by definition, so it must be cancelled explicitly here too, or it
-        # outlives the connection exactly like the give-up branch was written
-        # to prevent. Cancelling a ``task`` the give-up branch already
+        # than raising. ``asyncio.wait`` does not propagate a cancellation of
+        # its caller to ``task``, so it must be cancelled explicitly here, or
+        # it outlives the connection exactly like the give-up branch was
+        # written to prevent. Cancelling a ``task`` the give-up branch already
         # cancelled is a safe no-op.
         if not task.done():
             task.cancel()
